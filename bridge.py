@@ -51,6 +51,8 @@ HEARTBEAT_INTERVAL = 60  # seconds (hub timeout is 90s)
 MAX_RECONNECT_DELAY = 60
 MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "3"))
 MAX_TRACKED_SESSIONS = 1000  # cap session map to prevent memory leak
+TOOL_CONCURRENCY_RETRIES = 5  # retries when Claude API returns 400 for tool concurrency
+TOOL_CONCURRENCY_BASE_DELAY = 3  # seconds between retries
 
 # UUID pattern for input validation
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
@@ -165,51 +167,68 @@ async def run_claude_code(
 ) -> tuple[int, str, str | None]:
     """Spawn a Claude Code CLI session and collect output.
 
+    Retries automatically on tool-use concurrency errors (HTTP 400) which
+    happen when another Claude Code session is actively using tools.
+
     Args:
         prompt: The message to send.
         session_id: If provided, resumes this session (multi-turn conversation).
 
     Returns (exit_code, output_text, session_id).
     """
-    cmd = [
-        "claude",
-        "-p", prompt,
-        "--output-format", "json",
-    ]
-    if session_id:
-        cmd.extend(["--resume", session_id])
+    for attempt in range(1, TOOL_CONCURRENCY_RETRIES + 1):
+        cmd = [
+            "claude",
+            "-p", prompt,
+            "--output-format", "json",
+        ]
+        if session_id:
+            cmd.extend(["--resume", session_id])
 
-    logger.info(f"Spawning Claude Code in {WORK_DIR} (session={session_id or 'new'})")
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=WORK_DIR,
-    )
+        logger.info(f"Spawning Claude Code in {WORK_DIR} (session={session_id or 'new'}, attempt={attempt})")
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=WORK_DIR,
+        )
 
-    stdout, stderr = await process.communicate()
-    exit_code = process.returncode or 0
-    raw_output = stdout.decode("utf-8", errors="replace")
+        stdout, stderr = await process.communicate()
+        exit_code = process.returncode or 0
+        raw_output = stdout.decode("utf-8", errors="replace")
 
-    if stderr:
-        stderr_text = stderr.decode("utf-8", errors="replace")
-        if stderr_text.strip():
-            logger.warning(f"Claude Code stderr: {stderr_text[:1000]}")
+        if stderr:
+            stderr_text = stderr.decode("utf-8", errors="replace")
+            if stderr_text.strip():
+                logger.warning(f"Claude Code stderr: {stderr_text[:1000]}")
 
-    # Parse JSON output to extract result and session_id
-    output_text = raw_output
-    returned_session_id = session_id
-    try:
-        data = json.loads(raw_output)
-        output_text = data.get("result", raw_output)
-        returned_session_id = data.get("session_id", session_id)
-    except (json.JSONDecodeError, TypeError):
-        pass  # Fall back to raw output
+        # Parse JSON output to extract result and session_id
+        output_text = raw_output
+        returned_session_id = session_id
+        try:
+            data = json.loads(raw_output)
+            output_text = data.get("result", raw_output)
+            returned_session_id = data.get("session_id", session_id)
+        except (json.JSONDecodeError, TypeError):
+            pass  # Fall back to raw output
 
-    if exit_code != 0:
-        logger.error(f"Claude Code FAILED (exit={exit_code}): {output_text[:500]}")
-    else:
-        logger.info(f"Claude Code OK (session={returned_session_id}, len={len(output_text)})")
+        # Retry on tool-use concurrency error
+        if exit_code != 0 and "concurrency" in output_text.lower():
+            if attempt < TOOL_CONCURRENCY_RETRIES:
+                delay = TOOL_CONCURRENCY_BASE_DELAY * attempt
+                logger.warning(f"Tool concurrency conflict, retrying in {delay}s (attempt {attempt}/{TOOL_CONCURRENCY_RETRIES})")
+                await asyncio.sleep(delay)
+                continue
+            else:
+                logger.error(f"Tool concurrency conflict persisted after {TOOL_CONCURRENCY_RETRIES} attempts")
+
+        if exit_code != 0:
+            logger.error(f"Claude Code FAILED (exit={exit_code}): {output_text[:500]}")
+        else:
+            logger.info(f"Claude Code OK (session={returned_session_id}, len={len(output_text)})")
+        return exit_code, output_text, returned_session_id
+
+    # Should not reach here, but just in case
     return exit_code, output_text, returned_session_id
 
 
@@ -226,6 +245,8 @@ class Bridge:
         self._ws_jwt: str | None = None
         # Map task_id -> Claude Code session_id for multi-turn conversations
         self._task_sessions: dict[str, str] = {}
+        # Per-task lock to serialize messages in the same conversation
+        self._task_locks: dict[str, asyncio.Lock] = {}
 
     def _next_id(self) -> str:
         self._msg_counter += 1
@@ -357,17 +378,24 @@ class Bridge:
         if len(self._active_tasks) >= MAX_CONCURRENT_TASKS:
             logger.warning(f"At max concurrent tasks ({MAX_CONCURRENT_TASKS}), queuing...")
 
+        # Per-task lock: serialize messages in the same conversation so
+        # we don't try to --resume a Claude Code session that's still running
+        if task_id not in self._task_locks:
+            self._task_locks[task_id] = asyncio.Lock()
+        task_lock = self._task_locks[task_id]
+
         async with self._semaphore:
-            self._active_tasks.add(task_id)
-            try:
-                if agent_task_id and company_id:
-                    # AgentOrg trigger flow — full context + Claude Code spawn
-                    await self._execute_agentorg_task(task_id, company_id, agent_task_id)
-                else:
-                    # Chat flow — direct message, respond via Claude Code
-                    await self._execute_chat_task(task_id, user_text)
-            finally:
-                self._active_tasks.discard(task_id)
+            async with task_lock:
+                self._active_tasks.add(task_id)
+                try:
+                    if agent_task_id and company_id:
+                        # AgentOrg trigger flow — full context + Claude Code spawn
+                        await self._execute_agentorg_task(task_id, company_id, agent_task_id)
+                    else:
+                        # Chat flow — direct message, respond via Claude Code
+                        await self._execute_chat_task(task_id, user_text)
+                finally:
+                    self._active_tasks.discard(task_id)
 
     async def _execute_chat_task(self, task_id: str, user_text: str):
         """Handle a direct chat message — spawn Claude Code and return response.
