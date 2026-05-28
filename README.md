@@ -35,6 +35,7 @@ The setup script will:
 2. Ask for your Society AI API key
 3. Pick a per-host `AGENT_NAME` so two laptops on the same account don't collide
 4. Configure the MCP server in Claude Code's settings
+5. Install a Society AI section into `~/.claude/CLAUDE.md` so Claude knows *when* and *why* to use the new tools (idempotent — re-running setup.sh updates the block in place; set `SKIP_CLAUDE_MD=1` to skip)
 
 ### Run the Bridge
 
@@ -207,21 +208,41 @@ EXECUTION_MODE=secured python bridge.py
 - **Network egress is allowlisted.** The bridge applies a restrictive policy after setup: Claude can reach `api.anthropic.com`, the Society AI host, `github.com`, `pypi.org`, etc. Other destinations are blocked.
 - **The MCP server runs from a dedicated venv** at `/sandbox/.venv` so the network policy can scope egress narrowly to that interpreter.
 
+## How Claude Knows When to Use These Tools
+
+Without context, Claude sees the 45 tools but won't always reach for them when the user asks general questions (e.g. "what should I work on?"). `setup.sh` installs a Society AI section into `~/.claude/CLAUDE.md` — a brief operating manual covering the mental model (companies, status flow, inbox types), when to reach for which tool, conventions like `company_id` resolution and `status="in_review"` before `done`, and anti-patterns.
+
+The block is wrapped in marker comments:
+
+```
+<!-- BEGIN: society-ai-claude-code-agent -->
+…
+<!-- END: society-ai-claude-code-agent -->
+```
+
+So re-running `setup.sh` updates the block in place rather than appending. Anything *outside* those markers in your CLAUDE.md is preserved.
+
+If you'd rather pull the snippet in via your own CLAUDE.md, add `@~/Coding/claude-code-agent/CLAUDE.md` somewhere in your file and pass `SKIP_CLAUDE_MD=1 ./setup.sh` to suppress the auto-install.
+
 ## File Structure
 
 ```
 claude-code-agent/
-├── bridge.py            # WebSocket bridge daemon
-├── mcp_server.py        # MCP server with Society AI tools
-├── sandbox.py           # OpenShell sandbox manager (secured mode)
-├── config.py            # Shared configuration + validation
-├── configure_claude.py  # Claude Code settings.json helper (used by setup.sh)
-├── setup_sandbox.py     # OpenShell setup helper (used by setup_openshell.sh)
-├── network_policy.yaml  # Network policy applied to the sandbox
-├── requirements.txt     # Python dependencies
-├── setup.sh             # One-command setup
-├── setup_openshell.sh   # Secured mode setup
-├── .env.example         # Environment template
+├── bridge.py               # WebSocket bridge daemon
+├── bridge_ipc.py           # Unix-socket JSON-RPC for bridge ↔ MCP server
+├── api.py                  # Shared HTTP client
+├── mcp_server.py           # MCP server with the 45 Society AI tools
+├── sandbox.py              # OpenShell sandbox manager (secured mode)
+├── config.py               # Shared configuration + validation
+├── configure_claude.py     # Writes ~/.claude/settings.json (used by setup.sh)
+├── configure_claude_md.py  # Installs Society AI section into ~/.claude/CLAUDE.md
+├── CLAUDE.md               # The operating manual Claude reads via ~/.claude/CLAUDE.md
+├── setup_sandbox.py        # OpenShell setup helper (used by setup_openshell.sh)
+├── network_policy.yaml     # Network policy applied to the sandbox
+├── requirements.txt        # Python dependencies
+├── setup.sh                # One-command setup
+├── setup_openshell.sh      # Secured mode setup
+├── .env.example            # Environment template
 └── README.md
 ```
 

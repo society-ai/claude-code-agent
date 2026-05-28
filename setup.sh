@@ -107,7 +107,7 @@ fi
 
 # 4. Configure Claude Code MCP server
 echo ""
-echo "[4/5] Configuring Claude Code MCP server..."
+echo "[4/6] Configuring Claude Code MCP server..."
 
 # Load env vars for the config script (set -a exports them)
 set -a
@@ -125,9 +125,22 @@ fi
 # Use a dedicated Python script to safely handle paths with special characters
 python3 "$REPO_DIR/configure_claude.py"
 
-# 5. Done
+# 5. Install Society AI section into ~/.claude/CLAUDE.md so Claude knows
+# *when* and *why* to use the new tools — the MCP layer alone only tells
+# it *what* each tool does. Idempotent (marker-wrapped); skips on
+# SKIP_CLAUDE_MD=1 for advanced users who manage CLAUDE.md by hand.
 echo ""
-echo "[5/5] Setup complete!"
+echo "[5/6] Installing Society AI section into ~/.claude/CLAUDE.md..."
+
+if [ "${SKIP_CLAUDE_MD:-}" = "1" ]; then
+    echo "  Skipped (SKIP_CLAUDE_MD=1)"
+else
+    python3 "$REPO_DIR/configure_claude_md.py" "$REPO_DIR/CLAUDE.md"
+fi
+
+# 6. Done
+echo ""
+echo "[6/6] Setup complete!"
 echo ""
 echo "========================================"
 echo "  Next steps:"
