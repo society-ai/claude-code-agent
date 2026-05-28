@@ -63,7 +63,9 @@ WORK_DIR = os.getenv("WORK_DIR", os.getcwd())
 HEARTBEAT_INTERVAL = 60  # seconds (hub timeout is 90s)
 MAX_RECONNECT_DELAY = 60
 MAX_CONCURRENT_TASKS = max(1, int(os.getenv("MAX_CONCURRENT_TASKS", "3")))
-MAX_TRACKED_SESSIONS = 1000  # cap session/lock maps to prevent memory leak
+MAX_TRACKED_SESSIONS = 1000  # cap history/lock maps to prevent memory leak
+MAX_CHAT_HISTORY_TURNS = 10  # how many (user, assistant) pairs we keep per task
+MAX_HISTORY_CHARS_PER_TURN = 8000  # per-side trim before stuffing into the next prompt
 MAX_RESULT_CHARS = max(1000, int(os.getenv("MAX_RESULT_CHARS", "16000")))
 TOOL_CONCURRENCY_RETRIES = 5  # retries when Claude API returns 400 for tool concurrency
 TOOL_CONCURRENCY_BASE_DELAY = 3  # seconds between retries
@@ -329,8 +331,13 @@ class Bridge:
         self._semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
         self._msg_counter = 0
         self._ws_jwt: str | None = None
-        # Map task_id -> Claude Code session_id for multi-turn conversations
-        self._task_sessions: dict[str, str] = {}
+        # Per-task chat conversation history. Each entry is a list of
+        # {"user": str, "assistant": str} dicts. We maintain history ourselves
+        # and inline it into the next prompt rather than using `claude --resume`,
+        # because resuming a session that contains extended-thinking blocks
+        # trips the Anthropic API's "thinking blocks cannot be modified"
+        # integrity check on multi-turn replay.
+        self._chat_history: dict[str, list[dict[str, str]]] = {}
         # Per-task lock to serialize messages in the same conversation
         self._task_locks: dict[str, asyncio.Lock] = {}
 
@@ -653,7 +660,7 @@ class Bridge:
         logger.info("Message: %s", user_text[:200])
 
         # Per-task lock: serialize messages in the same conversation so
-        # we don't try to --resume a Claude Code session that's still running
+        # appends to chat_history happen in the same order the user sent them.
         if task_id not in self._task_locks:
             self._task_locks[task_id] = asyncio.Lock()
         task_lock = self._task_locks[task_id]
@@ -684,55 +691,101 @@ class Bridge:
                 finally:
                     self._active_tasks.discard(task_id)
 
-    def _record_session(self, task_id: str, session_id: str | None) -> None:
-        """Track a Claude Code session_id for a task, with bounded memory."""
-        if not session_id:
+    def _record_chat_turn(self, task_id: str, user_msg: str, assistant_msg: str) -> None:
+        """Append a (user, assistant) pair to a task's chat history.
+
+        Trims each side to MAX_HISTORY_CHARS_PER_TURN, caps total turns at
+        MAX_CHAT_HISTORY_TURNS, and prunes oldest tasks if we cross
+        MAX_TRACKED_SESSIONS distinct conversations — keeping locks in
+        lockstep so the lock map can't leak past the history map.
+        """
+        if not assistant_msg:
             return
-        self._task_sessions[task_id] = session_id
-        if len(self._task_sessions) > MAX_TRACKED_SESSIONS:
-            # Drop the oldest half of session AND lock entries together so the
-            # two maps stay aligned and neither leaks unbounded memory.
-            drop = list(self._task_sessions.keys())[: MAX_TRACKED_SESSIONS // 2]
+        history = self._chat_history.setdefault(task_id, [])
+        history.append({
+            "user": user_msg[:MAX_HISTORY_CHARS_PER_TURN],
+            "assistant": assistant_msg[:MAX_HISTORY_CHARS_PER_TURN],
+        })
+        if len(history) > MAX_CHAT_HISTORY_TURNS:
+            self._chat_history[task_id] = history[-MAX_CHAT_HISTORY_TURNS:]
+        if len(self._chat_history) > MAX_TRACKED_SESSIONS:
+            # Drop the oldest half of history AND lock entries together.
+            drop = list(self._chat_history.keys())[: MAX_TRACKED_SESSIONS // 2]
             for k in drop:
-                self._task_sessions.pop(k, None)
+                self._chat_history.pop(k, None)
                 self._task_locks.pop(k, None)
 
-    async def _execute_chat_task(self, task_id: str, user_text: str):
-        """Handle a direct chat message — spawn Claude Code and return response.
+    def _build_chat_prompt(self, user_text: str, history: list[dict[str, str]]) -> str:
+        """Construct a single-shot prompt that inlines prior conversation.
 
-        Uses --resume for follow-up messages in the same conversation (same task_id).
+        We deliberately don't use `claude --resume` because reloading a session
+        with extended-thinking blocks fails Anthropic's integrity check
+        (HTTP 400: "thinking blocks cannot be modified"). Inlining the
+        cleaned (user, assistant) pairs preserves the conversational
+        context without that hazard.
         """
-        existing_session = self._task_sessions.get(task_id)
-        is_followup = existing_session is not None
-        logger.info("Chat task %s: %s (followup=%s)", task_id, user_text[:100], is_followup)
-
-        if is_followup:
-            prompt = user_text
-        elif self._sandbox:
-            prompt = f"""You received a direct message from a user on Society AI.
-
-User message: {user_text}
-
-Respond helpfully. You are running inside an isolated sandbox and do not have access
-to the user's local files; use the Society AI MCP tools and any cloud APIs you've
-been granted to do your work."""
+        if self._sandbox:
+            env_note = (
+                "You are running inside an isolated sandbox. You do not have access "
+                "to the user's local files; use the Society AI MCP tools and any "
+                "cloud APIs you've been granted to do the work."
+            )
         else:
-            prompt = f"""You received a direct message from a user on Society AI.
+            env_note = (
+                "You are running on the user's machine in their working directory. "
+                "You may read and modify files there as part of the answer if helpful."
+            )
 
-User message: {user_text}
+        if not history:
+            return (
+                "You received a direct message from a user on Society AI.\n\n"
+                f"Environment: {env_note}\n\n"
+                f"User message: {user_text}\n\n"
+                "Respond helpfully."
+            )
 
-Respond helpfully. You have access to the codebase in the current working directory.
-If they ask about code, read files and answer. If they ask you to make changes, do so."""
+        history_block = "\n\n".join(
+            f"User: {turn['user']}\nYou: {turn['assistant']}"
+            for turn in history
+        )
+        return (
+            "You are continuing a conversation with a user on Society AI.\n\n"
+            f"Environment: {env_note}\n\n"
+            "Prior conversation in this thread:\n"
+            f"{history_block}\n\n"
+            "New message from the user:\n"
+            f"{user_text}\n\n"
+            "Respond helpfully, with awareness of the prior exchange."
+        )
+
+    async def _execute_chat_task(self, task_id: str, user_text: str):
+        """Handle a direct chat message.
+
+        Each call spawns a fresh `claude -p` session — no `--resume`. The
+        bridge inlines prior turns from `_chat_history[task_id]` into the
+        prompt instead. See _build_chat_prompt for the trade-off.
+        """
+        history = list(self._chat_history.get(task_id, []))
+        is_followup = bool(history)
+        logger.info(
+            "Chat task %s: %s (followup=%s, prior_turns=%d)",
+            task_id, user_text[:100], is_followup, len(history),
+        )
+
+        prompt = self._build_chat_prompt(user_text, history)
 
         if self._sandbox:
-            exit_code, output, session_id = await self._sandbox.exec_claude(prompt, session_id=existing_session)
+            exit_code, output, _ = await self._sandbox.exec_claude(prompt)
         else:
-            exit_code, output, session_id = await run_claude_code(prompt, session_id=existing_session)
+            exit_code, output, _ = await run_claude_code(prompt)
 
-        self._record_session(task_id, session_id)
-
-        # Send response back to hub
         result_text = (output or "").strip() or "I couldn't generate a response."
+
+        # Only record the turn on success — failed turns shouldn't pollute
+        # context for subsequent messages.
+        if exit_code == 0:
+            self._record_chat_turn(task_id, user_text, result_text)
+
         await self._send_task_complete(task_id, result_text, exit_code)
 
     async def _execute_agentorg_task(self, task_id: str, company_id: str, agent_task_id: str):
