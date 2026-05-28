@@ -1,0 +1,116 @@
+# Society AI Claude Code Agent — Sandbox Policy
+#
+# Must include filesystem_policy and process sections (static, must match creation defaults)
+# because OpenShell rejects policy updates that omit them.
+#
+# Network policies are the hot-reloadable section.
+# {{SOCIETY_AI_HOST}} is replaced at runtime with the hostname from AGENT_ROUTER_API_URL.
+#
+# Binary paths under /sandbox/.venv/bin/* correspond to the dedicated MCP
+# server virtualenv that sandbox.py provisions. Egress for Society AI API,
+# PyPI, etc. is scoped to that interpreter only — system python cannot
+# reach those hosts even from inside the sandbox.
+
+version: 1
+
+# --- Static sections (must match base image defaults) ---
+
+filesystem_policy:
+  include_workdir: true
+  read_only:
+    - /usr
+    - /lib
+    - /proc
+    - /dev/urandom
+    - /etc
+    - /var/log
+  read_write:
+    - /sandbox
+    - /tmp
+    - /dev/null
+
+landlock:
+  compatibility: best_effort
+
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+
+# --- Network policies (hot-reloadable) ---
+
+network_policies:
+  # Claude Code — LLM inference and telemetry
+  claude_code:
+    name: claude-code
+    endpoints:
+      - { host: api.anthropic.com, port: 443, protocol: rest, enforcement: enforce, access: full, tls: terminate }
+      - { host: statsig.anthropic.com, port: 443 }
+      - { host: sentry.io, port: 443 }
+      - { host: raw.githubusercontent.com, port: 443 }
+      - { host: platform.claude.com, port: 443 }
+    binaries:
+      - { path: /usr/local/bin/claude }
+      - { path: /usr/bin/node }
+
+  # Society AI — MCP server REST calls to Agent Router
+  society_ai:
+    name: society-ai
+    endpoints:
+      - { host: "{{SOCIETY_AI_HOST}}", port: 443 }
+    binaries:
+      - { path: /sandbox/.venv/bin/python }
+      - { path: /sandbox/.venv/bin/python3 }
+
+  # Python packages — for MCP server dependency installation
+  # Allowed only during initial venv provisioning. The venv is created with
+  # the default permissive policy, then this restrictive policy is applied.
+  pypi:
+    name: pypi
+    endpoints:
+      - { host: pypi.org, port: 443 }
+      - { host: files.pythonhosted.org, port: 443 }
+    binaries:
+      - { path: /sandbox/.venv/bin/python }
+      - { path: /sandbox/.venv/bin/python3 }
+      - { path: /sandbox/.venv/bin/pip }
+      - { path: /sandbox/.venv/bin/pip3 }
+
+  # GitHub — git operations (read-only)
+  github:
+    name: github
+    endpoints:
+      - host: github.com
+        port: 443
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/**/info/refs*"
+          - allow:
+              method: POST
+              path: "/**/git-upload-pack"
+    binaries:
+      - { path: /usr/bin/git }
+
+  github_rest_api:
+    name: github-rest-api
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        access: read-only
+    binaries:
+      - { path: /usr/local/bin/claude }
+      - { path: /usr/bin/gh }
+
+  # npm — for Node.js package installation
+  npm:
+    name: npm
+    endpoints:
+      - { host: registry.npmjs.org, port: 443 }
+    binaries:
+      - { path: /usr/bin/node }
