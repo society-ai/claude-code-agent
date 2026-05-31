@@ -39,11 +39,26 @@ The setup script will:
 
 ### Run the Bridge
 
+For an ad-hoc test:
 ```bash
 source .env && source venv/bin/activate && python bridge.py
 ```
 
-That's it. Your Claude Code is now connected to Society AI. Go to [societyai.com](https://societyai.com) and start chatting with it.
+For **long-term use, install it as a background service** so it auto-starts at login and survives terminal closures, crashes, and machine restarts:
+
+```bash
+./service.sh install      # macOS — installs a launchd LaunchAgent
+./service.sh status       # shows whether it's loaded + the running PID
+./service.sh logs         # tail the bridge log
+./service.sh restart      # e.g. after editing .env
+./service.sh uninstall    # stop + remove
+```
+
+The LaunchAgent runs as your user (no sudo, no root). The plist file contains no secrets — `bridge_launcher.sh` sources `.env` at process start. Logs go to `~/.cache/society-ai/bridge.{log,err.log}`.
+
+Once installed, every Claude Code session on this machine can reach the bridge via the IPC socket, and the Society AI web app can chat with the agent without you having to remember to start anything.
+
+Go to [societyai.com](https://societyai.com) and start chatting with it.
 
 ## Security & Trust Model
 
@@ -230,13 +245,17 @@ If you'd rather pull the snippet in via your own CLAUDE.md, add `@~/Coding/claud
 claude-code-agent/
 ├── bridge.py               # WebSocket bridge daemon
 ├── bridge_ipc.py           # Unix-socket JSON-RPC for bridge ↔ MCP server
+├── bridge_launcher.sh      # Wrapper used by the LaunchAgent (sources .env)
 ├── api.py                  # Shared HTTP client
 ├── mcp_server.py           # MCP server with the 45 Society AI tools
 ├── sandbox.py              # OpenShell sandbox manager (secured mode)
 ├── config.py               # Shared configuration + validation
-├── configure_claude.py     # Writes ~/.claude/settings.json (used by setup.sh)
+├── configure_claude.py     # Registers society-ai MCP via `claude mcp add`
 ├── configure_claude_md.py  # Installs Society AI section into ~/.claude/CLAUDE.md
 ├── CLAUDE.md               # The operating manual Claude reads via ~/.claude/CLAUDE.md
+├── service.sh              # Install / uninstall / status / logs for the LaunchAgent
+├── services/
+│   └── io.societyai.claude-code-bridge.plist.template
 ├── setup_sandbox.py        # OpenShell setup helper (used by setup_openshell.sh)
 ├── network_policy.yaml     # Network policy applied to the sandbox
 ├── requirements.txt        # Python dependencies
@@ -245,6 +264,27 @@ claude-code-agent/
 ├── .env.example            # Environment template
 └── README.md
 ```
+
+## Linux users
+
+`service.sh` currently only handles macOS (launchd). For Linux, the equivalent is a systemd user service. A minimal template:
+
+```ini
+# ~/.config/systemd/user/claude-code-bridge.service
+[Unit]
+Description=Society AI Claude Code Bridge
+After=network-online.target
+
+[Service]
+ExecStart=/path/to/claude-code-agent/bridge_launcher.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+```
+
+Enable with `systemctl --user enable --now claude-code-bridge`. PRs welcome to fold this into `service.sh`.
 
 ## Troubleshooting
 

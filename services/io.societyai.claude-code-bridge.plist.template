@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Society AI Claude Code Bridge — macOS LaunchAgent template.
+
+  Installed into ~/Library/LaunchAgents/ by ./service.sh install with the
+  {{...}} placeholders substituted at install time. Contains no secrets —
+  bridge_launcher.sh sources .env at process start.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.societyai.claude-code-bridge</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{REPO_DIR}}/bridge_launcher.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>{{REPO_DIR}}</string>
+
+    <!-- Start at login and again every time the agent exits. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart on crash, but not if the user explicitly stops it with
+         a successful exit. NetworkState gates restart on the laptop
+         actually having a network — avoids tight restart loops while
+         offline. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>NetworkState</key>
+        <true/>
+    </dict>
+
+    <!-- Cap restart frequency so a bug that crashes on startup doesn't
+         pin a CPU core. launchd will wait at least this many seconds
+         between restarts. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Stream stdout/stderr to log files. The wrapper sets the same
+         working directory so relative paths in bridge.py work, but
+         logs go under ~/.cache so they don't clutter the repo. -->
+    <key>StandardOutPath</key>
+    <string>{{LOG_DIR}}/bridge.log</string>
+    <key>StandardErrorPath</key>
+    <string>{{LOG_DIR}}/bridge.err.log</string>
+
+    <!-- Give the launchd process a sane PATH that includes Homebrew so
+         tools like `claude` and `python3` (if the venv ever needs to
+         fall back) are findable. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <!-- Avoid being throttled into oblivion if the user's network is
+         flaky — bridge.py has its own exponential backoff on reconnect. -->
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
