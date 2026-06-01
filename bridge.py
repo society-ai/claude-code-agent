@@ -44,13 +44,16 @@ from config import (
     COMPANY_ID,
     API_HEADERS,
     EXECUTION_MODE,
+    EXTRA_DIRS,
     SANDBOX_NAME,
     SANDBOX_TIMEOUT,
     SOCIETY_AI_BRIDGE_SOCKET,
+    STATUS_VERBOSITY,
     __version__,
     ws_url,
 )
-from typing import Any
+from streaming import StreamMapper
+from typing import Any, Awaitable, Callable
 
 logging.basicConfig(
     level=logging.INFO,
@@ -234,20 +237,118 @@ Instructions:
 Do the work, then report your results."""
 
 
+async def stream_claude_code(
+    prompt: str,
+    on_event: "Callable[[dict], Awaitable[None]]",
+) -> tuple[int, str, str | None, bool]:
+    """Spawn `claude -p --output-format stream-json` and forward each
+    parsed event to `on_event` as it arrives.
+
+    Returns (exit_code, accumulated_text, session_id, had_error).
+    `accumulated_text` is the assistant's final response text — sourced
+    from `result.result` if Claude Code surfaced one, else stitched
+    together from text content blocks. `had_error` is True if the
+    `result` event reported `subtype != "success"` or `is_error: true`.
+
+    This is the production path used by both the chat flow and the
+    AgentOrg-task flow. We don't use `--resume` because Claude Code's
+    session storage doesn't preserve thinking blocks byte-for-byte
+    across replay (see v0.2.2 hotfix for details); instead the bridge
+    inlines prior turns into the prompt itself.
+    """
+    cmd = [
+        "claude",
+        "-p", prompt,
+        "--output-format", "stream-json",
+        "--verbose",  # stream-json requires --verbose to actually emit each event
+    ]
+    for extra_dir in EXTRA_DIRS:
+        cmd.extend(["--add-dir", extra_dir])
+
+    logger.info("Spawning Claude Code (streaming) in %s", WORK_DIR)
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=WORK_DIR,
+    )
+
+    accumulated_text: list[str] = []
+    final_result_text: str | None = None
+    session_id: str | None = None
+    had_error = False
+
+    assert process.stdout is not None
+    async for raw in process.stdout:
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            logger.debug("Non-JSON stream line: %s", line[:200])
+            continue
+
+        # Surface to the bridge first — the caller's mapper builds DataParts
+        # and sends them onward as task.status frames.
+        try:
+            await on_event(event)
+        except Exception:
+            # Forwarding shouldn't kill the run; the final task.complete
+            # still goes out at the end.
+            logger.exception("on_event handler raised; continuing stream")
+
+        etype = event.get("type")
+        if etype == "system" and event.get("subtype") == "init":
+            session_id = event.get("session_id")
+        elif etype == "assistant":
+            for block in (event.get("message") or {}).get("content", []) or []:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text = block.get("text") or ""
+                    if text:
+                        accumulated_text.append(text)
+        elif etype == "result":
+            result_text = event.get("result")
+            if isinstance(result_text, str) and result_text:
+                final_result_text = result_text
+            if event.get("subtype") != "success" or event.get("is_error"):
+                had_error = True
+
+    # Drain stderr (for diagnostics only — never re-sent to the hub).
+    try:
+        stderr = await process.stderr.read() if process.stderr else b""
+    except Exception:
+        stderr = b""
+    await process.wait()
+    exit_code = process.returncode or 0
+
+    if stderr:
+        stderr_text = stderr.decode("utf-8", errors="replace").strip()
+        if stderr_text:
+            logger.warning("Claude Code stderr: %s", stderr_text[:1000])
+
+    output_text = final_result_text if final_result_text is not None else "".join(accumulated_text).strip()
+
+    if exit_code != 0 or had_error:
+        logger.error("Claude Code FAILED (exit=%d, had_error=%s): %s",
+                     exit_code, had_error, (output_text or "")[:500])
+    else:
+        logger.info("Claude Code OK (session=%s, len=%d)",
+                    session_id, len(output_text or ""))
+
+    return exit_code, output_text, session_id, had_error
+
+
 async def run_claude_code(
     prompt: str,
     session_id: str | None = None,
 ) -> tuple[int, str, str | None]:
-    """Spawn a Claude Code CLI session and collect output.
+    """Legacy non-streaming runner — kept for the secured-mode sandbox path
+    until v0.4.x extends streaming into that flow too. Standard mode uses
+    `stream_claude_code` instead.
 
     Retries automatically on tool-use concurrency errors (HTTP 400) which
     happen when another Claude Code session is actively using tools.
-
-    Args:
-        prompt: The message to send.
-        session_id: If provided, resumes this session (multi-turn conversation).
-
-    Returns (exit_code, output_text, session_id).
     """
     # Initialize before loop so we can always return safely, even if the
     # retry loop is configured to zero iterations.
@@ -261,6 +362,11 @@ async def run_claude_code(
             "-p", prompt,
             "--output-format", "json",
         ]
+        # Expand Claude Code's per-cwd file sandbox to include any directories
+        # the user opted into via the EXTRA_DIRS env var. Each path becomes a
+        # `--add-dir <path>` flag. Validation already happened at config load.
+        for extra_dir in EXTRA_DIRS:
+            cmd.extend(["--add-dir", extra_dir])
         if session_id:
             cmd.extend(["--resume", session_id])
 
@@ -758,12 +864,31 @@ class Bridge:
             "Respond helpfully, with awareness of the prior exchange."
         )
 
+    async def _stream_to_status_updates(self, task_id: str) -> "Callable[[dict], Awaitable[None]]":
+        """Build an `on_event` callback for stream_claude_code that maps each
+        event to DataParts and ships them out as `task.status` frames.
+
+        Returns the callback; the caller can also pull the mapper off the
+        returned closure's `__self__` if it needs final_text, error info, etc.
+        """
+        mapper = StreamMapper(task_id, verbosity=STATUS_VERBOSITY)
+
+        async def on_event(event: dict) -> None:
+            parts = mapper.consume(event)
+            if parts:
+                await self._send_status_update(task_id, parts)
+
+        # Stash the mapper on the callback so callers can introspect.
+        on_event.__mapper__ = mapper  # type: ignore[attr-defined]
+        return on_event
+
     async def _execute_chat_task(self, task_id: str, user_text: str):
         """Handle a direct chat message.
 
-        Each call spawns a fresh `claude -p` session — no `--resume`. The
-        bridge inlines prior turns from `_chat_history[task_id]` into the
-        prompt instead. See _build_chat_prompt for the trade-off.
+        Each call spawns a fresh streaming `claude -p` session — no `--resume`,
+        per the v0.2.2 history fix. Intermediate work (tool calls, thinking
+        markers, etc.) is forwarded to the Society AI chat UI as `task.status`
+        DataParts; the final text goes out as `task.complete`.
         """
         history = list(self._chat_history.get(task_id, []))
         is_followup = bool(history)
@@ -775,18 +900,29 @@ class Bridge:
         prompt = self._build_chat_prompt(user_text, history)
 
         if self._sandbox:
+            # Secured mode still uses the legacy non-streaming runner. Streaming
+            # support in the sandbox is a v0.4.x follow-up — it requires routing
+            # stdout through SSH line-by-line, which the current SandboxManager
+            # doesn't expose.
             exit_code, output, _ = await self._sandbox.exec_claude(prompt)
-        else:
-            exit_code, output, _ = await run_claude_code(prompt)
+            result_text = (output or "").strip() or "I couldn't generate a response."
+            if exit_code == 0:
+                self._record_chat_turn(task_id, user_text, result_text)
+            await self._send_task_complete(task_id, result_text, exit_code)
+            return
 
-        result_text = (output or "").strip() or "I couldn't generate a response."
+        on_event = await self._stream_to_status_updates(task_id)
+        exit_code, output, _session, had_error = await stream_claude_code(prompt, on_event)
+        mapper: StreamMapper = on_event.__mapper__  # type: ignore[attr-defined]
 
-        # Only record the turn on success — failed turns shouldn't pollute
-        # context for subsequent messages.
-        if exit_code == 0:
+        result_text = (output or "").strip() or (mapper.final_text() or "I couldn't generate a response.")
+
+        if exit_code == 0 and not had_error:
             self._record_chat_turn(task_id, user_text, result_text)
 
-        await self._send_task_complete(task_id, result_text, exit_code)
+        await self._send_task_complete(
+            task_id, result_text, exit_code or (1 if had_error else 0),
+        )
 
     async def _execute_agentorg_task(self, task_id: str, company_id: str, agent_task_id: str):
         """Handle an AgentOrg task — fetch context, spawn Claude Code, report results."""
@@ -821,11 +957,47 @@ class Bridge:
 
         if self._sandbox:
             exit_code, output, _ = await self._sandbox.exec_claude(prompt)
+            result_text = (output or "").strip() or f"Task completed with exit code {exit_code}"
+            await self._send_task_complete(task_id, result_text, exit_code)
         else:
-            exit_code, output, _ = await run_claude_code(prompt)
-        result_text = (output or "").strip() or f"Task completed with exit code {exit_code}"
-        await self._send_task_complete(task_id, result_text, exit_code)
+            on_event = await self._stream_to_status_updates(task_id)
+            exit_code, output, _session, had_error = await stream_claude_code(prompt, on_event)
+            mapper: StreamMapper = on_event.__mapper__  # type: ignore[attr-defined]
+            result_text = (
+                (output or "").strip()
+                or (mapper.final_text() or f"Task completed with exit code {exit_code}")
+            )
+            await self._send_task_complete(
+                task_id, result_text, exit_code or (1 if had_error else 0),
+            )
         logger.info("Task %s completed (exit=%d)", task.get("identifier", task_id), exit_code)
+
+    async def _send_status_update(self, task_id: str, parts: list[dict]):
+        """Send a `task.status` JSON-RPC frame with intermediate DataParts.
+
+        Mirrors the OpenClaw connector's wire format: same method name, same
+        params shape, `final: false`, `state: "working"`. The hub forwards
+        these to the chat session via SSE and persists each part as a
+        `DataPart` row attached to the agent's `Message`, so reloading the
+        session later replays the full tool-call trace.
+        """
+        if not parts:
+            return
+        await self.send_rpc(
+            "task.status",
+            {
+                "task_id": task_id,
+                "status": {
+                    "state": "working",
+                    "message": {
+                        "role": "agent",
+                        "parts": parts,
+                    },
+                },
+                "final": False,
+            },
+            msg_id=self._next_id(),
+        )
 
     async def _send_task_complete(self, task_id: str, result_text: str, exit_code: int = 0):
         """Send task.complete to the hub.

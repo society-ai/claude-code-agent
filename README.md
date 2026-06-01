@@ -97,10 +97,10 @@ Society AI Hub (WebSocket)
 
 When you send a message from the Society AI chatbot:
 1. Society AI hub delivers it to the bridge via WebSocket
-2. Bridge spawns a `claude -p` session (or resumes an existing one for multi-turn conversations)
-3. Claude Code reads your codebase, makes changes, and generates a response
-4. Bridge sends the response back to the hub
-5. You see the response in the chatbot
+2. Bridge spawns a `claude -p` session with `--output-format stream-json`
+3. As Claude works, the bridge streams **intermediate progress** (tool calls, thinking markers, file reads, etc.) back to the chat UI as `task.status` DataPart frames — the same wire format the OpenClaw/ZeroClaw connector uses, so the chat shows live workflow callouts
+4. When Claude finishes, the bridge sends the final response via `task.complete`
+5. You see the full trace in the chatbot — tools that were called, results returned, and the final answer — and it's all persisted in the platform DB so reloading the chat replays everything
 
 ### Task Flow
 
@@ -179,6 +179,32 @@ Both tools talk to the bridge over a local Unix socket at `$SOCIETY_AI_BRIDGE_SO
 
 These are off by default — an LLM accidentally spawning or deleting agents is hard to undo. Flip `ENABLE_AGENT_LIFECYCLE=true` in the bridge environment only when you actually want this.
 
+## What the user sees in the chat (streaming)
+
+Because the bridge forwards intermediate events as `task.status` frames with `DataPart` payloads, the Society AI chat renders each tool call as a workflow callout — same UX as OpenClaw delegation steps. While Jenkins works on a message, the user sees:
+
+- **`💭 <first sentence of the thinking>`** — when Claude is reasoning
+- **`🔧 Calling list_tasks…`** → **`✓ Got 5 tasks`** — for every tool call, with status flipping from `working` to `completed`/`failed`
+- **`📄 src/main.py`** / **`$ pytest tests/`** — file reads and bash commands show a sanitized one-line summary, never the raw input
+- The final answer arrives as a normal `task.complete` text part at the end
+
+This is configurable via `STATUS_VERBOSITY` (`quiet` | `normal` | `verbose`, default `normal`). All events are also **persisted in the platform DB** as `DataPart` rows attached to the chat's `Message`, so reloading a past session replays the full tool trace — not just the final text. That's the same persistence model the platform uses for OpenClaw / ZeroClaw agents; the streaming bridge integrates with it without any platform changes.
+
+The wire format and persistence are intentionally identical to what a future GCP-hosted variant of this agent (deployable via Agent Factory) would produce — local and hosted sessions are indistinguishable in the database.
+
+## File access scope
+
+Claude Code 2.x sandboxes file access to the directory it was launched in. When the bridge runs as a LaunchAgent, that directory is the integration's own repo (`~/Coding/claude-code-agent`) — which is why a fresh agent will say it can only see that folder when you ask it about your code.
+
+Two knobs widen the scope:
+
+- **`WORK_DIR`** — change the cwd Claude is rooted in. Point it at the project you want the agent to live in by default.
+- **`EXTRA_DIRS`** — comma-separated list of additional absolute paths. Each one becomes a `claude -p --add-dir <path>` flag. Use this when the agent should be able to bounce between multiple projects, or when you want the agent rooted in one place but able to peek at another.
+
+After editing `.env`, run `./service.sh restart` to pick up the change.
+
+**Security trade-off**: anything in these directories is fully **readable and writable** by the agent. Don't add directories that hold credentials — `~/.ssh`, `~/.aws`, `~/Library/Keychains`, project `.env` files with production keys, etc. A safe default for a developer machine is `EXTRA_DIRS=$HOME/Coding` (or wherever you keep code). Pointing `WORK_DIR` directly at `$HOME` is the broadest possible scope — only do that if you really trust the messages you'll be sending the agent.
+
 ## Publishing Artifacts
 
 `save_artifact` uploads via the platform's internal artifact-ingest route, which only accepts a **service-auth** token — not the regular `sai_…` user API key. If you have one, set it in `.env`:
@@ -201,6 +227,8 @@ All configuration is via environment variables (set in `.env`):
 | `AGENT_NAME` | No | `claude-code-<user>-<host>` (set by setup.sh) | Agent identity |
 | `COMPANY_ID` | No | — | Default company UUID |
 | `WORK_DIR` | No | Current directory | Where Claude Code runs (standard mode only) |
+| `EXTRA_DIRS` | No | — | Comma-separated additional dirs the agent can read/write (see [File access scope](#file-access-scope)) |
+| `STATUS_VERBOSITY` | No | `normal` | How much intermediate work to surface to the chat — `quiet` / `normal` / `verbose` |
 | `MAX_CONCURRENT_TASKS` | No | `3` | Max parallel Claude Code sessions |
 | `MAX_RESULT_CHARS` | No | `16000` | Result truncation cap |
 | `AGENT_ROUTER_API_URL` | No | `https://api.societyai.com` | API endpoint |

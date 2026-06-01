@@ -11,7 +11,7 @@ import os
 import re
 import sys
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # -- Required / core ---------------------------------------------------------
 
@@ -38,6 +38,18 @@ SOCIETY_AI_BRIDGE_SOCKET: str = os.getenv(
 ENABLE_AGENT_LIFECYCLE: bool = os.getenv("ENABLE_AGENT_LIFECYCLE", "false").strip().lower() in (
     "1", "true", "yes", "on",
 )
+
+# -- Streaming + visibility --------------------------------------------------
+# Controls how much intermediate progress the bridge surfaces to the Society
+# AI chat UI while Claude Code is working. Values are validated below.
+#   quiet   = no thinking markers, no text deltas; tool calls + results only
+#   normal  = tool calls, tool results, and a "Thinking: <first sentence>"
+#             marker per thinking block. Default.
+#   verbose = everything in normal + assistant text streamed as partial
+#             text_delta DataParts before the final task.complete
+
+_VALID_STATUS_VERBOSITY = {"quiet", "normal", "verbose"}
+STATUS_VERBOSITY: str = os.getenv("STATUS_VERBOSITY", "normal").strip().lower()
 
 # -- Execution mode ----------------------------------------------------------
 
@@ -72,6 +84,14 @@ if EXECUTION_MODE not in _VALID_EXECUTION_MODES:
     )
     sys.exit(2)
 
+if STATUS_VERBOSITY not in _VALID_STATUS_VERBOSITY:
+    print(
+        f"Error: STATUS_VERBOSITY must be one of {sorted(_VALID_STATUS_VERBOSITY)} "
+        f"(got {STATUS_VERBOSITY!r})",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
 if AGENT_NAME and not _AGENT_NAME_RE.match(AGENT_NAME):
     print(
         f"Error: AGENT_NAME must be lowercase alphanumerics with -, _, or . "
@@ -86,6 +106,36 @@ if not AGENT_ROUTER_API_URL.startswith(("http://", "https://")):
         file=sys.stderr,
     )
     sys.exit(2)
+
+# -- Extra directories the spawned Claude Code is allowed to read/write -------
+# Claude Code 2.x sandboxes file access to the cwd it was launched in. The
+# bridge launches it in WORK_DIR; anything outside WORK_DIR is off-limits.
+# EXTRA_DIRS adds more directories via `claude -p --add-dir <path>` so the
+# agent can work across multiple projects without you having to point WORK_DIR
+# at your whole home. Each entry must be an absolute path. Missing directories
+# are warned about and skipped — we don't fail startup, since a user might
+# legitimately have one of them mounted only sometimes.
+
+EXTRA_DIRS_RAW: str = os.getenv("EXTRA_DIRS", "").strip()
+EXTRA_DIRS: list[str] = []
+if EXTRA_DIRS_RAW:
+    for _candidate in EXTRA_DIRS_RAW.split(","):
+        _candidate = _candidate.strip()
+        if not _candidate:
+            continue
+        if not os.path.isabs(_candidate):
+            print(
+                f"Warning: EXTRA_DIRS entry must be an absolute path, skipping {_candidate!r}",
+                file=sys.stderr,
+            )
+            continue
+        if not os.path.isdir(_candidate):
+            print(
+                f"Warning: EXTRA_DIRS entry {_candidate!r} is not an existing directory, skipping",
+                file=sys.stderr,
+            )
+            continue
+        EXTRA_DIRS.append(_candidate)
 
 # -- Derived -----------------------------------------------------------------
 
