@@ -60,7 +60,10 @@ _VALID_TASK_STATUSES = {
     "backlog", "todo", "in_progress", "in_review",
     "done", "blocked", "cancelled", "failed",
 }
-_VALID_PRIORITIES = {"low", "medium", "high", "critical", "normal", "urgent"}
+# Task priorities (AgentTaskCreate schema): low | medium | high | critical
+_VALID_TASK_PRIORITIES = {"low", "medium", "high", "critical"}
+# Inbox priorities (InboxItemCreate schema): low | normal | high | urgent
+_VALID_INBOX_PRIORITIES = {"low", "normal", "high", "urgent"}
 _VALID_INBOX_TYPES = {
     "status-update", "approval-required", "review-required",
     "input-required", "alert",
@@ -154,52 +157,66 @@ async def list_tasks(
     priority: Optional[str] = None,
     limit: int = 50,
 ) -> str:
-    """List tasks in the company, optionally filtered by status, agent, or priority."""
-    try:
-        cid = _resolve_company_id(company_id)
-    except ValueError as e:
-        return _result(_error(str(e)))
+    """List tasks, optionally filtered by company, status, agent, or priority.
+
+    Works in both personal scope (no company_id) and company scope. When called
+    by an agent without ``company_id`` and without an explicit ``assigned_to_agent``
+    filter, the platform defaults to tasks where this agent is creator or assignee
+    across every scope it touches.
+    """
+    cid = (company_id or COMPANY_ID or "").strip()
+    if cid:
+        try:
+            _validate_uuid(cid, "company_id")
+        except ValueError as e:
+            return _result(_error(str(e)))
     for err in (
         _enum_check(status, _VALID_TASK_STATUSES, "status"),
-        _enum_check(priority, _VALID_PRIORITIES, "priority"),
+        _enum_check(priority, _VALID_TASK_PRIORITIES, "priority"),
     ):
         if err:
             return _result(err)
     limit = max(1, min(200, int(limit)))
     params: dict[str, Any] = {"limit": limit}
+    if cid:
+        params["company_id"] = cid
     if status:
         params["status"] = status
     if assigned_to_agent:
         params["assigned_to_agent"] = assigned_to_agent
     if priority:
         params["priority"] = priority
-    return _result(await api.get(f"/api/v1/companies/{cid}/tasks", params=params))
+    return _result(await api.get("/api/v1/agent-tasks", params=params))
 
 
 @mcp.tool()
-async def get_task(task_id: str, company_id: Optional[str] = None) -> str:
-    """Get full task details — description, acceptance criteria, status, result."""
+async def get_task(task_id: str) -> str:
+    """Get full task details — description, acceptance criteria, status, result.
+
+    Works for personal and company-scoped tasks alike; the platform looks the
+    task up by id and enforces scope from the caller's auth context.
+    """
     try:
-        cid = _resolve_company_id(company_id)
         _validate_uuid(task_id, "task_id")
     except ValueError as e:
         return _result(_error(str(e)))
-    return _result(await api.get(f"/api/v1/companies/{cid}/tasks/{task_id}"))
+    return _result(await api.get(f"/api/v1/agent-tasks/{task_id}"))
 
 
 @mcp.tool()
 async def update_task(
     task_id: str,
-    company_id: Optional[str] = None,
     status: Optional[str] = None,
     result: Optional[str] = None,
     blocked_reason: Optional[str] = None,
     title: Optional[str] = None,
     description: Optional[str] = None,
 ) -> str:
-    """Update a task's status, result, or other fields. Only provided fields are updated."""
+    """Update a task's status, result, or other fields. Only provided fields are
+    updated. Works for personal and company-scoped tasks alike — the platform
+    enforces scope from the caller's auth context.
+    """
     try:
-        cid = _resolve_company_id(company_id)
         _validate_uuid(task_id, "task_id")
     except ValueError as e:
         return _result(_error(str(e)))
@@ -218,7 +235,7 @@ async def update_task(
             body[k] = v
     if not body:
         return _result(_error("No fields to update"))
-    return _result(await api.patch(f"/api/v1/companies/{cid}/tasks/{task_id}", body))
+    return _result(await api.patch(f"/api/v1/agent-tasks/{task_id}", body))
 
 
 @mcp.tool()
@@ -237,7 +254,7 @@ async def send_inbox_item(
         return _result(_error("title and body are required"))
     for err in (
         _enum_check(type, _VALID_INBOX_TYPES, "type"),
-        _enum_check(priority, _VALID_PRIORITIES, "priority"),
+        _enum_check(priority, _VALID_INBOX_PRIORITIES, "priority"),
     ):
         if err:
             return _result(err)
@@ -318,29 +335,40 @@ async def create_task(
     company_id: Optional[str] = None,
     description: Optional[str] = None,
     assigned_to_agent: Optional[str] = None,
-    priority: Optional[str] = "normal",
+    priority: str = "medium",
     space_id: Optional[str] = None,
     project_id: Optional[str] = None,
     acceptance_criteria: Optional[list[str]] = None,
     parent_task_id: Optional[str] = None,
 ) -> str:
-    """Create a new task in the company task board.
+    """Create a new task.
+
+    Works in both personal scope (no company_id) and company scope. When neither
+    ``company_id`` is passed nor ``COMPANY_ID`` env var is set, the task is
+    created as a personal task owned by the authenticated user.
+
+    Note: when an agent creates a task, ``assigned_to_agent`` is required —
+    typically the agent assigns to itself. Without an assignee the task lands
+    in 'todo' but never dispatches.
 
     Args:
         title: Short task title (required).
-        company_id: Company UUID. Falls back to COMPANY_ID env var.
+        company_id: Optional company UUID. Falls back to COMPANY_ID env var.
+                    If neither is set, creates a personal task.
         description: Longer free-form description.
         assigned_to_agent: Agent name to assign the task to.
-        priority: low, normal, high, urgent, critical.
-        space_id: Optional space (department) UUID.
-        project_id: Optional project UUID.
+        priority: low, medium, high, critical. Defaults to medium.
+        space_id: Optional space (department) UUID — company tasks only.
+        project_id: Optional project UUID — company tasks only.
         acceptance_criteria: List of acceptance criteria strings.
         parent_task_id: Optional parent task for sub-tasks.
     """
     if not title or not title.strip():
         return _result(_error("title is required"))
+    cid = (company_id or COMPANY_ID or "").strip()
     try:
-        cid = _resolve_company_id(company_id)
+        if cid:
+            _validate_uuid(cid, "company_id")
         if space_id:
             _validate_uuid(space_id, "space_id")
         if project_id:
@@ -349,7 +377,7 @@ async def create_task(
             _validate_uuid(parent_task_id, "parent_task_id")
     except ValueError as e:
         return _result(_error(str(e)))
-    err = _enum_check(priority, _VALID_PRIORITIES, "priority")
+    err = _enum_check(priority, _VALID_TASK_PRIORITIES, "priority")
     if err:
         return _result(err)
 
@@ -357,6 +385,8 @@ async def create_task(
         "title": title.strip(),
         "created_by_agent": AGENT_NAME,
     }
+    if cid:
+        body["company_id"] = cid
     if description is not None:
         body["description"] = description
     if assigned_to_agent:
@@ -374,26 +404,26 @@ async def create_task(
     if parent_task_id:
         body["parent_task_id"] = parent_task_id
 
-    return _result(await api.post(f"/api/v1/companies/{cid}/tasks", body))
+    return _result(await api.post("/api/v1/agent-tasks", body))
 
 
 @mcp.tool()
 async def review_task(
     task_id: str,
     decision: str,
-    company_id: Optional[str] = None,
-    notes: Optional[str] = None,
+    review_notes: Optional[str] = None,
 ) -> str:
     """Approve or reject a task that is in `in_review` state.
+
+    Works for personal and company-scoped tasks alike — the platform enforces
+    scope from the caller's auth context.
 
     Args:
         task_id: Task UUID.
         decision: "approve" or "reject".
-        company_id: Company UUID. Falls back to COMPANY_ID env var.
-        notes: Optional reviewer notes (especially when rejecting).
+        review_notes: Optional reviewer notes (especially when rejecting).
     """
     try:
-        cid = _resolve_company_id(company_id)
         _validate_uuid(task_id, "task_id")
     except ValueError as e:
         return _result(_error(str(e)))
@@ -401,40 +431,40 @@ async def review_task(
     if err:
         return _result(err)
     body: dict[str, Any] = {"decision": decision, "reviewed_by_agent": AGENT_NAME}
-    if notes is not None:
-        body["notes"] = notes
-    return _result(await api.post(f"/api/v1/companies/{cid}/tasks/{task_id}/review", body))
+    if review_notes is not None:
+        body["review_notes"] = review_notes
+    return _result(await api.post(f"/api/v1/agent-tasks/{task_id}/review", body))
 
 
 @mcp.tool()
 async def reassign_task(
     task_id: str,
-    new_agent_name: str,
-    company_id: Optional[str] = None,
+    new_agent: str,
     reason: Optional[str] = None,
 ) -> str:
     """Reassign a task to a different agent.
 
+    Works for personal and company-scoped tasks alike — the platform enforces
+    scope from the caller's auth context.
+
     Args:
         task_id: Task UUID.
-        new_agent_name: Agent name of the new assignee.
-        company_id: Company UUID. Falls back to COMPANY_ID env var.
+        new_agent: Canonical agent name of the new assignee.
         reason: Short explanation for the reassignment.
     """
-    if not new_agent_name or not new_agent_name.strip():
-        return _result(_error("new_agent_name is required"))
+    if not new_agent or not new_agent.strip():
+        return _result(_error("new_agent is required"))
     try:
-        cid = _resolve_company_id(company_id)
         _validate_uuid(task_id, "task_id")
     except ValueError as e:
         return _result(_error(str(e)))
     body: dict[str, Any] = {
-        "new_agent_name": new_agent_name.strip(),
-        "reassigned_by_agent": AGENT_NAME,
+        "new_agent": new_agent.strip(),
+        "assigned_by_agent": AGENT_NAME,
     }
     if reason is not None:
         body["reason"] = reason
-    return _result(await api.post(f"/api/v1/companies/{cid}/tasks/{task_id}/reassign", body))
+    return _result(await api.post(f"/api/v1/agent-tasks/{task_id}/reassign", body))
 
 
 @mcp.tool()
