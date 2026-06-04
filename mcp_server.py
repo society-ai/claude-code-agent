@@ -74,6 +74,10 @@ _VALID_TRIGGER_TYPES = {"message", "task", "workflow"}
 _VALID_NAV_VISIBILITY = {"all", "admin", "agent"}
 _VALID_PANEL_SIZES = {"full", "half", "third"}
 _VALID_REVIEW_DECISIONS = {"approve", "reject"}
+# Reviewer identity type for `review_assigned_to` on tasks. 'agent' fires a
+# pgmq trigger so the reviewer's runtime wakes up; 'user' is an inbox-only
+# notification handled by the web UI.
+_VALID_REVIEWER_TYPES = {"user", "agent"}
 _VALID_AGENT_LIFECYCLE_ROLES = {
     "ceo", "coo", "cto", "cfo", "cmo", "department_head",
     "team_lead", "individual_contributor",
@@ -211,10 +215,17 @@ async def update_task(
     blocked_reason: Optional[str] = None,
     title: Optional[str] = None,
     description: Optional[str] = None,
+    review_assigned_to: Optional[str] = None,
+    review_assigned_to_type: Optional[str] = None,
 ) -> str:
     """Update a task's status, result, or other fields. Only provided fields are
     updated. Works for personal and company-scoped tasks alike — the platform
     enforces scope from the caller's auth context.
+
+    To request a review by a specific agent or user in the same call that
+    moves the task to in_review, pass ``review_assigned_to`` together with
+    ``review_assigned_to_type`` ('agent' or 'user'). The trigger routing
+    uses these fields to direct the in_review notification.
     """
     try:
         _validate_uuid(task_id, "task_id")
@@ -223,6 +234,14 @@ async def update_task(
     err = _enum_check(status, _VALID_TASK_STATUSES, "status")
     if err:
         return _result(err)
+    err = _enum_check(review_assigned_to_type, _VALID_REVIEWER_TYPES, "review_assigned_to_type")
+    if err:
+        return _result(err)
+    if review_assigned_to and not review_assigned_to_type:
+        return _result(_error(
+            "review_assigned_to_type ('user' or 'agent') is required when "
+            "review_assigned_to is set"
+        ))
     body: dict[str, Any] = {}
     for k, v in {
         "status": status,
@@ -230,6 +249,8 @@ async def update_task(
         "blocked_reason": blocked_reason,
         "title": title,
         "description": description,
+        "review_assigned_to": review_assigned_to,
+        "review_assigned_to_type": review_assigned_to_type,
     }.items():
         if v is not None:
             body[k] = v
@@ -340,6 +361,8 @@ async def create_task(
     project_id: Optional[str] = None,
     acceptance_criteria: Optional[list[str]] = None,
     parent_task_id: Optional[str] = None,
+    review_assigned_to: Optional[str] = None,
+    review_assigned_to_type: Optional[str] = None,
 ) -> str:
     """Create a new task.
 
@@ -362,6 +385,14 @@ async def create_task(
         project_id: Optional project UUID — company tasks only.
         acceptance_criteria: List of acceptance criteria strings.
         parent_task_id: Optional parent task for sub-tasks.
+        review_assigned_to: Optional reviewer for this task. When set, the
+            in_review transition routes the notification here instead of
+            climbing the org chart. Pass an agent name (with
+            review_assigned_to_type='agent') to wake another agent's
+            runtime, or a user UUID (with type='user') to drop a
+            review-required item in that user's inbox.
+        review_assigned_to_type: 'agent' or 'user'. Required when
+            review_assigned_to is set.
     """
     if not title or not title.strip():
         return _result(_error("title is required"))
@@ -380,6 +411,14 @@ async def create_task(
     err = _enum_check(priority, _VALID_TASK_PRIORITIES, "priority")
     if err:
         return _result(err)
+    err = _enum_check(review_assigned_to_type, _VALID_REVIEWER_TYPES, "review_assigned_to_type")
+    if err:
+        return _result(err)
+    if review_assigned_to and not review_assigned_to_type:
+        return _result(_error(
+            "review_assigned_to_type ('user' or 'agent') is required when "
+            "review_assigned_to is set"
+        ))
 
     body: dict[str, Any] = {
         "title": title.strip(),
@@ -403,6 +442,9 @@ async def create_task(
         body["acceptance_criteria"] = [str(c) for c in acceptance_criteria]
     if parent_task_id:
         body["parent_task_id"] = parent_task_id
+    if review_assigned_to:
+        body["review_assigned_to"] = review_assigned_to
+        body["review_assigned_to_type"] = review_assigned_to_type
 
     return _result(await api.post("/api/v1/agent-tasks", body))
 
