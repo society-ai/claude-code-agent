@@ -273,11 +273,18 @@ async def stream_claude_code(
         cmd.extend(["--add-dir", extra_dir])
 
     logger.info("Spawning Claude Code (streaming) in %s", WORK_DIR)
+    # asyncio.StreamReader's default line buffer is 64 KiB. Claude Code's
+    # stream-json events can blow past that for a single line — a tool_result
+    # carrying a 50 KB file becomes >80 KB after JSON escaping, and a Read on
+    # a longer file blows it out entirely. Hitting the limit raises
+    # LimitOverrunError mid-stream and the whole task fails. Bump it to 16
+    # MiB so any reasonable single event fits in one readline().
     process = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=WORK_DIR,
+        limit=16 * 1024 * 1024,
     )
 
     accumulated_text: list[str] = []
