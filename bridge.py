@@ -261,6 +261,13 @@ async def stream_claude_code(
         "-p", prompt,
         "--output-format", "stream-json",
         "--verbose",  # stream-json requires --verbose to actually emit each event
+        # Headless mode: no human at the terminal to press 'y' on each
+        # tool-use approval prompt, so MCP tools and Bash invocations
+        # silently fail without this. Trust boundary is the same as
+        # running `claude -p` yourself interactively — only the agent's
+        # owner can deliver tasks (WS hub enforces creator_id match),
+        # and file ops are still scoped by WORK_DIR + EXTRA_DIRS.
+        "--permission-mode", "bypassPermissions",
     ]
     for extra_dir in EXTRA_DIRS:
         cmd.extend(["--add-dir", extra_dir])
@@ -361,6 +368,7 @@ async def run_claude_code(
             "claude",
             "-p", prompt,
             "--output-format", "json",
+            "--permission-mode", "bypassPermissions",
         ]
         # Expand Claude Code's per-cwd file sandbox to include any directories
         # the user opted into via the EXTRA_DIRS env var. Each path becomes a
