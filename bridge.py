@@ -802,8 +802,13 @@ class Bridge:
                         # AgentOrg trigger flow — full context + Claude Code spawn
                         await self._execute_agentorg_task(task_id, company_id, agent_task_id)
                     else:
-                        # Chat flow — direct message, respond via Claude Code
-                        await self._execute_chat_task(task_id, user_text)
+                        # Chat flow OR personal-task trigger (no company_id) —
+                        # direct message, respond via Claude Code. Pass
+                        # agent_task_id through so the chat task can pick the
+                        # right context primer (active chat vs background).
+                        await self._execute_chat_task(
+                            task_id, user_text, agent_task_id=agent_task_id,
+                        )
                 except Exception as e:
                     logger.exception("Task %s failed with unhandled exception", task_id)
                     await self._send_task_complete(
@@ -835,6 +840,47 @@ class Bridge:
             for k in drop:
                 self._chat_history.pop(k, None)
                 self._task_locks.pop(k, None)
+
+    @staticmethod
+    def _bridge_context_primer_background(trigger_reason: str = "") -> str:
+        """Prepend at the top of a spawned-Claude prompt to disambiguate mode.
+
+        For trigger-initiated spawns: tells Claude explicitly that no user
+        is watching this session. Without this, Claude can default to
+        chat-style behavior (asking questions inline and waiting), which
+        for autonomous work means waiting indefinitely — there's no one
+        there to answer. Steers it toward `send_inbox_item` for any
+        communication.
+        """
+        reason_clause = f" reason={trigger_reason}" if trigger_reason else ""
+        return (
+            f"[Context: background work{reason_clause} — no user is actively "
+            "watching this session. Use `send_inbox_item` for any "
+            "communication you need; don't ask questions inline and wait "
+            "for replies.]\n\n"
+        )
+
+    @staticmethod
+    def _bridge_context_primer_chat(chat_id: str, prior_turns: int) -> str:
+        """Prepend at the top of a chat-spawned Claude prompt.
+
+        Tells Claude this is a live interactive session — the user IS
+        watching, communicate normally. Reinforces the CLAUDE.md
+        active-chat-vs-background distinction so behavior is locked in
+        from the first token.
+        """
+        turn_clause = (
+            f"turn {prior_turns + 1} of this thread"
+            if prior_turns
+            else "first turn"
+        )
+        return (
+            f"[Context: active chat with a user on Society AI "
+            f"(chat_id={chat_id}, {turn_clause}). The user is typing live "
+            "and watching your work in the agent console panel. "
+            "Communicate normally — ask questions inline, narrate progress "
+            "inline. Don't drop inbox items at them.]\n\n"
+        )
 
     def _build_chat_prompt(self, user_text: str, history: list[dict[str, str]]) -> str:
         """Construct a single-shot prompt that inlines prior conversation.
@@ -897,22 +943,40 @@ class Bridge:
         on_event.__mapper__ = mapper  # type: ignore[attr-defined]
         return on_event
 
-    async def _execute_chat_task(self, task_id: str, user_text: str):
-        """Handle a direct chat message.
+    async def _execute_chat_task(
+        self,
+        task_id: str,
+        user_text: str,
+        agent_task_id: str | None = None,
+    ):
+        """Handle a direct chat message OR a personal-task trigger.
 
         Each call spawns a fresh streaming `claude -p` session — no `--resume`,
         per the v0.2.2 history fix. Intermediate work (tool calls, thinking
         markers, etc.) is forwarded to the Society AI chat UI as `task.status`
         DataParts; the final text goes out as `task.complete`.
+
+        ``agent_task_id`` distinguishes a real chat (None) from a personal-task
+        trigger (UUID present). The context primer flips accordingly so Claude
+        doesn't try to chat with a user who isn't there (trigger case) or go
+        silent on a user who is (chat case).
         """
         history = list(self._chat_history.get(task_id, []))
         is_followup = bool(history)
+        # Fallback detection: chat-path triggers carry a [Trigger: ...] prefix
+        # in user_text even when agent_task_id metadata is somehow missing.
+        is_background = bool(agent_task_id) or user_text.lstrip().startswith("[Trigger:")
         logger.info(
-            "Chat task %s: %s (followup=%s, prior_turns=%d)",
-            task_id, user_text[:100], is_followup, len(history),
+            "Chat task %s: %s (followup=%s, prior_turns=%d, background=%s)",
+            task_id, user_text[:100], is_followup, len(history), is_background,
         )
 
-        prompt = self._build_chat_prompt(user_text, history)
+        primer = (
+            self._bridge_context_primer_background(trigger_reason="task")
+            if is_background
+            else self._bridge_context_primer_chat(task_id, len(history))
+        )
+        prompt = primer + self._build_chat_prompt(user_text, history)
 
         if self._sandbox:
             # Secured mode still uses the legacy non-streaming runner. Streaming
@@ -964,7 +1028,14 @@ class Bridge:
                 "companyId": company_id,
             }
 
-        prompt = build_prompt(company, task, sandboxed=bool(self._sandbox))
+        # Prepend mode primer so Claude knows up-front this is background
+        # work — the existing build_prompt() instructions already cover the
+        # right behaviors near the bottom of the prompt, but the primer at
+        # the top removes any ambiguity about whether a user is watching.
+        prompt = (
+            self._bridge_context_primer_background(trigger_reason="agentorg-task")
+            + build_prompt(company, task, sandboxed=bool(self._sandbox))
+        )
         logger.info(
             "Executing task: %s — %s",
             task.get("identifier", "unknown"), task.get("title", "unknown"),

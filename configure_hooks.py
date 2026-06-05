@@ -1,15 +1,16 @@
-"""Register the Society AI SessionStart and Stop hooks with Claude Code.
+"""Register the Society AI SessionStart, Stop, and statusLine entries with Claude Code.
 
 Called by setup.sh — not intended to be run directly.
 
-Adds idempotent entries to ~/.claude/settings.json:
+Writes idempotent entries to ~/.claude/settings.json:
 - SessionStart -> hook_session_start.py  (injects state snapshot)
 - Stop         -> hook_stop.py           (reminds about in_progress tasks)
+- statusLine   -> hook_status_line.py    (📥 N · ✅ M · 🔔 K review)
 
 Identifies own entries by their command path containing our script
 filenames, so re-running the script replaces in place rather than
-appending duplicates. Other hooks the user has configured are left
-untouched.
+appending duplicates. Foreign hook entries and a foreign statusLine
+are left untouched.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ SETTINGS_PATH = os.path.join(
 # also writing a migration that prunes the old filename from settings.
 SESSION_START_SCRIPT = "hook_session_start.py"
 STOP_SCRIPT = "hook_stop.py"
+STATUS_LINE_SCRIPT = "hook_status_line.py"
 
 # Per-hook timeout in seconds. SessionStart hits the platform with two
 # GETs; 5s is generous for the common case and short enough that a hung
@@ -95,11 +97,29 @@ def _upsert_event(
     hooks[event_name] = entries
 
 
+def _upsert_status_line(data: dict, command: str) -> None:
+    """Set the statusLine entry to point at our script.
+
+    Only replaces if either no statusLine exists yet or the existing one
+    is already ours (identified by command string containing our script
+    filename). Foreign statusLine entries are left untouched so we don't
+    clobber a custom one the user wrote.
+    """
+    existing = data.get("statusLine")
+    if isinstance(existing, dict):
+        existing_cmd = existing.get("command") or ""
+        if isinstance(existing_cmd, str) and STATUS_LINE_SCRIPT not in existing_cmd:
+            # Foreign statusLine — don't overwrite.
+            return
+    data["statusLine"] = {"type": "command", "command": command}
+
+
 def main() -> None:
     repo_dir = os.path.dirname(os.path.abspath(__file__))
     venv_py = os.path.join(repo_dir, "venv", "bin", "python")
     session_script = os.path.join(repo_dir, SESSION_START_SCRIPT)
     stop_script = os.path.join(repo_dir, STOP_SCRIPT)
+    status_script = os.path.join(repo_dir, STATUS_LINE_SCRIPT)
 
     if not os.path.isfile(venv_py):
         print(
@@ -108,15 +128,17 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(2)
-    if not os.path.isfile(session_script) or not os.path.isfile(stop_script):
-        print(
-            "  Error: hook scripts missing in repo. Reinstall claude-code-agent.",
-            file=sys.stderr,
-        )
-        sys.exit(2)
+    for script in (session_script, stop_script, status_script):
+        if not os.path.isfile(script):
+            print(
+                f"  Error: hook script missing at {script}. Reinstall claude-code-agent.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
 
     session_cmd = f"{venv_py} {session_script}"
     stop_cmd = f"{venv_py} {stop_script}"
+    status_cmd = f"{venv_py} {status_script}"
 
     data = _read_settings()
     hooks = data.setdefault("hooks", {})
@@ -132,11 +154,13 @@ def main() -> None:
 
     _upsert_event(hooks, "SessionStart", session_cmd, SESSION_START_SCRIPT)
     _upsert_event(hooks, "Stop", stop_cmd, STOP_SCRIPT)
+    _upsert_status_line(data, status_cmd)
     data["hooks"] = hooks
 
     _write_settings(data)
     print(
-        "  Registered SessionStart + Stop hooks in ~/.claude/settings.json"
+        "  Registered SessionStart + Stop hooks and statusLine in "
+        "~/.claude/settings.json"
     )
 
 
