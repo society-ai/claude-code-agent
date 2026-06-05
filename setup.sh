@@ -11,7 +11,7 @@ echo "========================================"
 echo ""
 
 # 1. Check prerequisites
-echo "[1/5] Checking prerequisites..."
+echo "[1/7] Checking prerequisites..."
 
 if ! command -v python3 &>/dev/null; then
     echo "Error: python3 is required. Install it from https://python.org" >&2
@@ -29,7 +29,7 @@ echo "  claude  ... OK"
 
 # 2. Create virtual environment
 echo ""
-echo "[2/5] Setting up Python virtual environment..."
+echo "[2/7] Setting up Python virtual environment..."
 if [ ! -d "venv" ]; then
     python3 -m venv venv
     echo "  Created venv/"
@@ -43,7 +43,7 @@ echo "  Dependencies installed"
 
 # 3. Get API key + agent name
 echo ""
-echo "[3/5] Configuring API key..."
+echo "[3/7] Configuring API key..."
 if [ -f ".env" ]; then
     echo "  .env already exists — leaving it alone."
     echo "  To reconfigure, delete .env and re-run ./setup.sh"
@@ -107,7 +107,7 @@ fi
 
 # 4. Configure Claude Code MCP server
 echo ""
-echo "[4/6] Configuring Claude Code MCP server..."
+echo "[4/7] Configuring Claude Code MCP server..."
 
 # Load env vars for the config script (set -a exports them)
 set -a
@@ -130,7 +130,7 @@ python3 "$REPO_DIR/configure_claude.py"
 # it *what* each tool does. Idempotent (marker-wrapped); skips on
 # SKIP_CLAUDE_MD=1 for advanced users who manage CLAUDE.md by hand.
 echo ""
-echo "[5/6] Installing Society AI section into ~/.claude/CLAUDE.md..."
+echo "[5/7] Installing Society AI section into ~/.claude/CLAUDE.md..."
 
 if [ "${SKIP_CLAUDE_MD:-}" = "1" ]; then
     echo "  Skipped (SKIP_CLAUDE_MD=1)"
@@ -138,9 +138,22 @@ else
     python3 "$REPO_DIR/configure_claude_md.py" "$REPO_DIR/CLAUDE.md"
 fi
 
-# 6. Done
+# 6. Install Society AI hooks (SessionStart + Stop) so Claude Code gets
+# ambient awareness of open tasks and inbox without needing to remember
+# to ask. Idempotent (replaces in place). Skip on SKIP_HOOKS=1 for users
+# who manage ~/.claude/settings.json by hand.
 echo ""
-echo "[6/6] Setup complete!"
+echo "[6/7] Installing Society AI hooks (SessionStart + Stop)..."
+
+if [ "${SKIP_HOOKS:-}" = "1" ]; then
+    echo "  Skipped (SKIP_HOOKS=1)"
+else
+    python3 "$REPO_DIR/configure_hooks.py"
+fi
+
+# 7. Done
+echo ""
+echo "[7/7] Setup complete!"
 echo ""
 echo "========================================"
 echo "  Next steps:"

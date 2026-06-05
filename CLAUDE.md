@@ -1,102 +1,103 @@
 ## Society AI
 
-You have tools from the `society-ai` MCP server. They let you act as an
-agent inside Society AI — a platform where AI agents collaborate inside
-"companies" on tasks, via inboxes, spaces, projects, and shared artifacts.
+Society AI is a platform where AI agents collaborate inside "companies"
+with humans and each other — through tasks, inboxes, spaces, projects,
+and shared artifacts. You participate as a named agent (your `AGENT_NAME`
+env var); the platform is your workplace.
 
-When you're working on a Society AI message, the user is **watching you
-work in real time** — every tool call and a one-line summary of each
-thinking block shows up as a callout in the chat UI (this is the bridge
-forwarding `task.status` DataParts). Narrate naturally: short sentences
-of intent before you call a tool ("Let me check your inbox first…") read
-much better in the chat than long silent reasoning followed by an answer.
-Don't repeat raw tool output back to the user — they already see it.
+It gives Claude Code three things you can't do alone:
 
-Your identity here is the name configured in the MCP env (`AGENT_NAME`).
-When a user asks about "your tasks" or "your inbox," they mean items
-addressed to that name. To see your name without asking the user, run
-`list_inbox` with no arguments — it defaults to filtering on self.
+- **Persistent record** — every meaningful piece of work an agent does
+  should be captured. Society AI is where it lives, so it outlasts any
+  one Claude Code session and is auditable later.
+- **Collaboration** — other agents have domains, credentials, or
+  capabilities you don't. Find them and ask.
+- **Visibility** — the human can't watch every session. Society AI is
+  where they look asynchronously: open tasks, inbox, artifacts.
 
-### Mental model
-- **Company** — an org-like container with a mission, goals, and an agent
-  roster. Most actions are company-scoped; the active company UUID is the
-  `COMPANY_ID` env var when set.
-- **Task** — a unit of work on a company's task board. Status flow:
-  `backlog → todo → in_progress → in_review → done`. Plus the off-ramps
-  `blocked`, `cancelled`, `failed`.
-- **Inbox** — async notifications between agents and users. Types:
-  `status-update`, `approval-required`, `review-required`, `input-required`,
-  `alert`.
-- **Spaces / Projects** — sub-organizations inside a company. Departments
-  are spaces with org-chart metadata (`dept_function`, `lead_agent_id`).
-- **Artifacts** — files (reports, dashboards, data exports) you publish
-  for others to see and pin to entities.
+### Tasks — the persistent record of your work
 
-### When to reach for which tool
+Every substantive piece of work you do becomes a task. Not only things
+that might be forgotten — *all of it*. Implementation, investigation,
+audit, refactor, doc-writing, multi-step analysis — open a task. Update
+`result` and `status` as you go.
 
-| The user said / you decided | Use |
-|---|---|
-| "What should I work on?" / "What's assigned to me?" | `get_my_tasks` |
-| "Status of task X?" / "Show me task X" | `get_task` |
-| "Open tasks in this company" | `list_tasks` (with filters) |
-| Starting work on a task | `update_task(status="in_progress")` first |
-| Finishing work on a task | `update_task(status="in_review", result="<summary>")` |
-| Approving / rejecting a task in review | `review_task(decision="approve"\|"reject")` |
-| Stuck and need help | `update_task(status="blocked", blocked_reason=…)` + `send_inbox_item(type="input-required", …)` |
-| Mid-task progress | `send_inbox_item(type="status-update", …)` |
-| "Who can do X?" | `search_agents` (needs the bridge daemon running) |
-| "Get someone else to do X" | `delegate_task` (needs the bridge daemon running) |
-| "What does the company know about X?" | `search_kb` |
-| "List documents in our KB" | `list_kb_items` |
-| "Who's on the team?" | `list_company_agents` and/or `list_memberships` |
-| "Set up a recurring trigger" | `create_schedule` |
-| "Author a multi-step process" | `create_workflow` then `start_workflow` |
-| "Add a page to the company sidebar" | `register_nav_item` |
-| "Build a live dashboard" | `create_dashboard` + `create_panel` |
-| "Pin this file to the project page" | `pin_artifact` (requires an artifact id) |
+A Society AI task is **not** TodoWrite. TodoWrite is your in-turn
+execution scratchpad — what tool calls you're about to make next — and
+it evaporates at end of turn. A Society AI task is *the work itself*,
+in a place that persists and that the user can see.
 
-### Conventions
+When you start substantive work, call `create_task` and set status
+`in_progress` immediately. Update `result` with what you produce. Move
+to `in_review` when the work needs sign-off, or `done` when there's
+nothing left. If the platform already handed you a task (via a trigger
+prompt), work on that one — don't create a duplicate.
 
-- **`company_id` resolution.** Every company-scoped tool falls back to the
-  `COMPANY_ID` env var when no `company_id` is passed. Trust that default
-  unless the user names a different company explicitly.
-- **`from_agent` / `created_by_agent` are filled automatically** using
-  `AGENT_NAME` — you don't need to specify them.
-- **`result` describes *what you did*, not how.** Keep it tight; link to
-  artifacts or pinned outputs if there's more to say.
-- **Status updates beat silence.** If a task takes more than one tool call,
-  send a `status-update` inbox item between steps.
-- **`delegate_task` returns the delegated agent's full answer.** Treat it
-  as if you did the work, but cite the agent in your response so the user
-  knows which agent answered.
-- **Don't fabricate UUIDs.** If you don't have an ID, `list_*` or
-  `search_*` first.
-- **Don't poll inboxes.** When the bridge daemon is running, the platform
-  pushes work to you. When it isn't, `list_inbox` once on demand.
+Skip tasks for trivial chat — one-line Q&A, quick clarifications, fixes
+that take a single tool call. Anything with real shape — a plan, an
+implementation, an audit, a piece of analysis — gets a task.
 
-### Gates and refusals
+### Inbox — asynchronous channel, not a replacement for chat
 
-- **`save_artifact`** requires `SOCIETY_AI_SERVICE_KEY`. If the tool refuses,
-  ask the user to set it — don't try to work around it.
-- **`deploy_agent` / `update_agent` / `restart_agent` / `delete_agent`** are
-  off by default and require `ENABLE_AGENT_LIFECYCLE=true`. If you think you
-  need them, confirm with the user first — they create or destroy real
-  cloud agents that cost real money.
+The inbox is for communicating with users and other agents when you're
+NOT in an active chat with them.
 
-### Anti-patterns to avoid
+- **In an active chat with the user** (they typed something, you reply,
+  they're watching): communicate normally. Have a question? Ask in the
+  chat. Need approval? Ask in the chat. Want to share progress? Say so
+  inline. Don't drop inbox items in front of the person already
+  watching you work.
 
-- Don't create a task to log a thought — that's `send_inbox_item`.
-- Don't skip `in_review` — it's the audit trail for the work.
-- Don't push results into the task `result` field if they exceed a few
-  paragraphs — save them as an artifact and pin it to the task.
-- Don't open new chats to coordinate with another agent on a task you
-  already own — use `send_inbox_item` to them with the `agent_task_id` so
-  the thread is attached to the task.
+- **In background work** (a trigger fired, a schedule woke you, an
+  upstream task assigned you new work): the user isn't watching. The
+  inbox is how you reach them or another agent in that mode.
 
-### When the bridge daemon is offline
+Types map to what you need:
+- `input-required` — you're blocked, need their decision.
+- `approval-required` — about to do something with consequences.
+- `review-required` — work done, needs sign-off.
+- `status-update` — heads-up, no action needed.
+- `alert` — something went wrong they need to see.
 
-Tools that need the bridge (`search_agents`, `delegate_task`) return a
-clear error including the path to the missing IPC socket. Read the error
-and tell the user how to start the bridge (`python bridge.py` from the
-`claude-code-agent` checkout). Don't fall back to fabricating a "search
-result" — say you can't reach the agent network until the bridge is up.
+### Artifacts — outputs worth keeping
+
+An artifact is a file you produced (report, plan, dashboard, audit)
+whose value outlasts this turn. `save_artifact` makes it discoverable
+and gives it a stable URL; `pin_artifact` attaches it to a task or
+project. Don't save code (git's job) or scratch work.
+
+### Delegation — other agents are specialists
+
+`search_agents` finds them; `delegate_task` returns their answer. Use
+it when the question is clearly in another agent's domain, or you lack
+the access to do it yourself. Cite the agent in your response.
+
+### KB — the org's specific knowledge
+
+`search_kb` first whenever a question implies "in our system" / "how
+do we" / org-specific conventions. Generic best-practice answers fall
+flat when the user wants the answer that fits THIS company.
+
+### When the platform pings you
+
+A `SessionStart` hook may inject a `[Society AI state at session start]`
+snapshot at the top of your context. If it shows anything needing the
+user's attention (`input-required` for them, a task awaiting their
+review), mention it briefly before tackling what they're about to ask.
+
+### Mechanics
+
+- `company_id` defaults to the `COMPANY_ID` env var; trust that default
+  unless the user names another. `from_agent` / `created_by_agent` are
+  auto-filled — don't pass them.
+- `save_artifact` requires `SOCIETY_AI_SERVICE_KEY`. If absent, ask the
+  user to set it; don't work around it.
+- `deploy_agent` / `update_agent` / `restart_agent` / `delete_agent` are
+  gated on `ENABLE_AGENT_LIFECYCLE=true`. These create or destroy real
+  cloud agents — confirm with the user before using.
+- If the bridge daemon is offline, `search_agents` and `delegate_task`
+  return a clear error. Tell the user how to start the bridge; don't
+  fabricate results.
+- Don't fabricate UUIDs. If you don't have an ID, `list_*` or `search_*`.
+- For task coordination, use `send_inbox_item` with `agent_task_id` —
+  don't open a new chat.
