@@ -207,15 +207,9 @@ After editing `.env`, run `./service.sh restart` to pick up the change.
 
 ## Publishing Artifacts
 
-`save_artifact` uploads via the platform's internal artifact-ingest route, which only accepts a **service-auth** token — not the regular `sai_…` user API key. If you have one, set it in `.env`:
+As of v0.5.2, `save_artifact` uses your normal `sai_…` user API key — same auth as every other MCP tool. The MCP server calls agent_router's `POST /api/v1/artifacts` route, which internally proxies to the platform's service-auth ingest endpoint. The service secret stays in the backend; the bridge never holds it.
 
-```
-SOCIETY_AI_SERVICE_KEY=<service token>
-```
-
-Without it, `save_artifact` returns a clear error and does NOT attempt the upload. Pinning, listing, and unpinning existing artifacts (`pin_artifact` etc.) work with the regular user key — only the initial *upload* needs the service token.
-
-If you don't have a service token, ask your platform admin, or use the platform's `save-artifact` skill from inside an OpenClaw worker, which has the service auth in its environment.
+You can also pin in the same call via `pin_to_entity_type` + `pin_to_entity_id` (one of `company`, `space`, `project`, `task`) — saves a follow-up `pin_artifact` RPC.
 
 ## Configuration
 

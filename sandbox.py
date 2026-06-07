@@ -355,8 +355,6 @@ class SandboxManager:
             "COMPANY_ID": self._env_vars.get("COMPANY_ID", ""),
             "SOCIETY_AI_BRIDGE_SOCKET": "/tmp/society-ai-bridge.sock",
         }
-        if self._env_vars.get("SOCIETY_AI_SERVICE_KEY"):
-            env_block["SOCIETY_AI_SERVICE_KEY"] = self._env_vars["SOCIETY_AI_SERVICE_KEY"]
         if self._env_vars.get("ENABLE_AGENT_LIFECYCLE"):
             env_block["ENABLE_AGENT_LIFECYCLE"] = self._env_vars["ENABLE_AGENT_LIFECYCLE"]
         settings = {

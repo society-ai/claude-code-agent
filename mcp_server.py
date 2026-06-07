@@ -13,8 +13,8 @@ Tool surface (see README for full descriptions):
     search_agents, delegate_task
 
   Phase 3 — artifacts and knowledge base:
-    save_artifact (requires SOCIETY_AI_SERVICE_KEY), pin_artifact,
-    list_pinned_artifacts, unpin_artifact, search_kb, list_kb_items
+    save_artifact, pin_artifact, list_pinned_artifacts, unpin_artifact,
+    search_kb, list_kb_items
 
   Phase 4 — org context:
     list_company_agents, list_departments, create_department, list_memberships,
@@ -46,7 +46,6 @@ from config import (
     AGENT_NAME,
     COMPANY_ID,
     ENABLE_AGENT_LIFECYCLE,
-    SOCIETY_AI_SERVICE_KEY,
 )
 
 # -- Validation primitives ---------------------------------------------------
@@ -672,11 +671,6 @@ async def delegate_task(
 # ==============================================================================
 
 
-# Artifact ingest is reachable only on the ai-chatbot service path with the
-# service-auth token. The bridge cannot publish artifacts without it.
-_ARTIFACT_INGEST_PATH = "/api/internal/artifacts/ingest"
-
-
 @mcp.tool()
 async def save_artifact(
     file_path: str,
@@ -689,14 +683,16 @@ async def save_artifact(
     project_id: Optional[str] = None,
     chat_id: Optional[str] = None,
     cache_key: Optional[str] = None,
+    pin_to_entity_type: Optional[str] = None,
+    pin_to_entity_id: Optional[str] = None,
+    pin_to_label: Optional[str] = None,
 ) -> str:
     """Publish a local file as a Society AI artifact (S3-backed, presigned URL).
 
-    Requires `SOCIETY_AI_SERVICE_KEY` to be set on the bridge process —
-    without it this tool returns a structured error and does NOT attempt
-    the upload. If you don't have a service key, ask your platform admin
-    to publish on your behalf or use the platform `save-artifact` skill
-    from inside an OpenClaw worker.
+    Authenticates with the agent's normal sai_ token via agent_router's
+    `/api/v1/artifacts` route — no service key required. The route
+    internally proxies to ai-chatbot's service-auth ingest endpoint
+    while the service secret stays in the backend.
 
     Args:
         file_path: Absolute path to a local file.
@@ -707,15 +703,16 @@ async def save_artifact(
         company_id: Optional company UUID for scoping.
         space_id, project_id, chat_id: Optional scope UUIDs.
         cache_key: If set with company_id, creates/replaces a stable
-            (company_id, cache_key) artifact (the Peirot pattern). Subsequent
-            uploads with the same key replace the file in place.
+            (company_id, cache_key) artifact (the Peirot pattern).
+            Subsequent uploads with the same key replace the file
+            in place.
+        pin_to_entity_type: When set with pin_to_entity_id, also pins the
+            created artifact to that entity in the same call (saves a
+            follow-up pin_artifact RPC). One of: 'company', 'space',
+            'project', 'task'.
+        pin_to_entity_id: UUID of the entity to pin to.
+        pin_to_label: Optional display label for the pin.
     """
-    if not SOCIETY_AI_SERVICE_KEY:
-        return _result(_error(
-            "save_artifact requires SOCIETY_AI_SERVICE_KEY to be set on the bridge "
-            "process. This route accepts service auth only, not user API keys. "
-            "See the README section 'Publishing Artifacts' for the workaround."
-        ))
     if not file_path or not os.path.isfile(file_path):
         return _result(_error(f"file_path not found or not a file: {file_path}"))
     if not mime_type or not mime_type.strip():
@@ -738,6 +735,19 @@ async def save_artifact(
                 _validate_uuid(u_val, u_name)
             except ValueError as e:
                 return _result(_error(str(e)))
+    if pin_to_entity_type or pin_to_entity_id:
+        if not (pin_to_entity_type and pin_to_entity_id):
+            return _result(_error(
+                "pin_to_entity_type and pin_to_entity_id must be set together"
+            ))
+        if pin_to_entity_type not in _VALID_PIN_ENTITY_TYPES:
+            return _result(_error(
+                f"pin_to_entity_type must be one of {sorted(_VALID_PIN_ENTITY_TYPES)}"
+            ))
+        try:
+            _validate_uuid(pin_to_entity_id, "pin_to_entity_id")
+        except ValueError as e:
+            return _result(_error(str(e)))
 
     try:
         with open(file_path, "rb") as f:
@@ -767,15 +777,16 @@ async def save_artifact(
         body["chat_id"] = chat_id
     if cache_key:
         body["cache_key"] = cache_key
+    if pin_to_entity_type and pin_to_entity_id:
+        pin: dict[str, Any] = {
+            "entity_type": pin_to_entity_type,
+            "entity_id": pin_to_entity_id,
+        }
+        if pin_to_label:
+            pin["label"] = pin_to_label
+        body["pin_to"] = pin
 
-    service_headers = {
-        "Authorization": f"Bearer {SOCIETY_AI_SERVICE_KEY}",
-        "Content-Type": "application/json",
-        "User-Agent": f"claude-code-agent/{api.__version__}",
-    }
-    # The artifact ingest endpoint lives on the ai-chatbot service. By
-    # convention, in prod that's reachable on the same domain as the API.
-    return _result(await api.post(_ARTIFACT_INGEST_PATH, body, headers=service_headers))
+    return _result(await api.post("/api/v1/artifacts", body))
 
 
 @mcp.tool()

@@ -11,7 +11,7 @@ import os
 import re
 import sys
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 
 # -- Required / core ---------------------------------------------------------
 
@@ -19,12 +19,6 @@ AGENT_ROUTER_API_URL: str = os.getenv("AGENT_ROUTER_API_URL", "https://api.socie
 SOCIETY_AI_AUTH_TOKEN: str = os.getenv("SOCIETY_AI_AUTH_TOKEN", "").strip()
 AGENT_NAME: str = os.getenv("AGENT_NAME", "claude-code").strip()
 COMPANY_ID: str = os.getenv("COMPANY_ID", "").strip()
-
-# Optional service-auth key for routes that only accept the platform's
-# internal service token (e.g. `POST /api/internal/artifacts/ingest`). When
-# present, `save_artifact` will upload via that route; when absent, the tool
-# returns a clear error explaining the limitation rather than silently failing.
-SOCIETY_AI_SERVICE_KEY: str = os.getenv("SOCIETY_AI_SERVICE_KEY", "").strip()
 
 # IPC socket path for bridge <-> MCP server communication (delegation, search).
 SOCIETY_AI_BRIDGE_SOCKET: str = os.getenv(

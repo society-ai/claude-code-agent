@@ -90,8 +90,6 @@ review), mention it briefly before tackling what they're about to ask.
 - `company_id` defaults to the `COMPANY_ID` env var; trust that default
   unless the user names another. `from_agent` / `created_by_agent` are
   auto-filled — don't pass them.
-- `save_artifact` requires `SOCIETY_AI_SERVICE_KEY`. If absent, ask the
-  user to set it; don't work around it.
 - `deploy_agent` / `update_agent` / `restart_agent` / `delete_agent` are
   gated on `ENABLE_AGENT_LIFECYCLE=true`. These create or destroy real
   cloud agents — confirm with the user before using.

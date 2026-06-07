@@ -92,7 +92,6 @@ def main() -> None:
         "SOCIETY_AI_BRIDGE_SOCKET",
         os.path.join(os.path.expanduser("~"), ".cache", "society-ai", "bridge.sock"),
     ).strip()
-    service_key = os.environ.get("SOCIETY_AI_SERVICE_KEY", "").strip()
     lifecycle_flag = os.environ.get("ENABLE_AGENT_LIFECYCLE", "").strip()
 
     if not auth_token:
@@ -136,8 +135,6 @@ def main() -> None:
         _env_value_for_cli("AGENT_ROUTER_API_URL", api_url),
         _env_value_for_cli("SOCIETY_AI_BRIDGE_SOCKET", bridge_socket),
     ]
-    if service_key:
-        env_pairs.append(_env_value_for_cli("SOCIETY_AI_SERVICE_KEY", service_key))
     if lifecycle_flag:
         env_pairs.append(_env_value_for_cli("ENABLE_AGENT_LIFECYCLE", lifecycle_flag))
 

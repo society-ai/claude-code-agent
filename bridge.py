@@ -482,15 +482,13 @@ class Bridge:
             except ImportError:
                 logger.error("EXECUTION_MODE=secured requires sandbox.py. Check your installation.")
                 sys.exit(1)
-            from config import SOCIETY_AI_SERVICE_KEY, ENABLE_AGENT_LIFECYCLE
+            from config import ENABLE_AGENT_LIFECYCLE
             sandbox_env = {
                 "SOCIETY_AI_AUTH_TOKEN": SOCIETY_AI_AUTH_TOKEN,
                 "AGENT_ROUTER_API_URL": AGENT_ROUTER_API_URL,
                 "AGENT_NAME": AGENT_NAME,
                 "COMPANY_ID": COMPANY_ID,
             }
-            if SOCIETY_AI_SERVICE_KEY:
-                sandbox_env["SOCIETY_AI_SERVICE_KEY"] = SOCIETY_AI_SERVICE_KEY
             if ENABLE_AGENT_LIFECYCLE:
                 sandbox_env["ENABLE_AGENT_LIFECYCLE"] = "true"
             self._sandbox = SandboxManager(
