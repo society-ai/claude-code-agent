@@ -4,17 +4,20 @@
   Society AI Claude Code Bridge — macOS LaunchAgent template.
 
   Installed into ~/Library/LaunchAgents/ by ./service.sh install with the
-  {{...}} placeholders substituted at install time. Contains no secrets —
-  bridge_launcher.sh sources .env at process start.
+  {{...}} placeholders substituted at install time. One plist per persona:
+  the default persona keeps the bare label; additional personas get
+  io.societyai.claude-code-bridge.<name> and pass the persona name to the
+  launcher (which sources .env.<name>). Contains no secrets —
+  bridge_launcher.sh sources the env file at process start.
 -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>io.societyai.claude-code-bridge</string>
+    <string>{{LABEL}}</string>
 
     <key>ProgramArguments</key>
     <array>
-        <string>{{REPO_DIR}}/bridge_launcher.sh</string>
+        <string>{{REPO_DIR}}/bridge_launcher.sh</string>{{PERSONA_ARG}}
     </array>
 
     <key>WorkingDirectory</key>

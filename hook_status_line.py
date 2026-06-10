@@ -1,20 +1,19 @@
 """Render a compact Society AI indicator for Claude Code's status line.
 
-Output format:
+Single persona:
     📥 N · ✅ M · 🔔 K review
+Multiple personas (one segment per persona with anything open):
+    jenkins 📥1 ✅2 · saichi ✅1
 
 Where:
-  📥 N    — pending inbox items addressed to this agent
-  ✅ M    — open (non-terminal) tasks assigned to this agent
-  🔔 K    — tasks at status='in_review' (typically things awaiting your action)
+  📥 N    — pending inbox items addressed to the agent
+  ✅ M    — open (non-terminal) tasks assigned to the agent
+  🔔 K    — tasks at status='in_review'
 
 Cached to ~/.cache/society-ai/statusline.json for 30 seconds so we don't
 hammer the API on every model turn (Claude Code calls the status-line
-command after each turn). Silent when nothing's open or platform is
+command after each turn). Silent when nothing's open or the platform is
 unreachable — Claude Code renders an empty status line cleanly.
-
-Designed to be fast — uses a 1.5s network timeout and falls back to
-cached data if the network call doesn't return in time.
 """
 
 from __future__ import annotations
@@ -26,33 +25,13 @@ import sys
 import time
 from typing import Any
 
-REPO_DIR = pathlib.Path(__file__).resolve().parent
-ENV_PATH = REPO_DIR / ".env"
+from hook_common import discover_personas
+
 CACHE_DIR = pathlib.Path(os.path.expanduser("~")) / ".cache" / "society-ai"
 CACHE_PATH = CACHE_DIR / "statusline.json"
 CACHE_TTL_S = 30
 HTTP_TIMEOUT_S = 1.5
-DEFAULT_API_URL = "https://api.societyai.com"
 OPEN_TASK_STATUSES = {"backlog", "todo", "in_progress", "in_review", "blocked"}
-
-
-def _parse_env_file(path: pathlib.Path) -> dict[str, str]:
-    out: dict[str, str] = {}
-    try:
-        with path.open() as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, val = line.partition("=")
-                out[key.strip()] = val.strip().strip('"').strip("'")
-    except OSError:
-        pass
-    return out
-
-
-def _resolve(env: dict[str, str], key: str, default: str = "") -> str:
-    return (env.get(key) or os.environ.get(key) or default).strip()
 
 
 def _read_cache() -> dict[str, Any] | None:
@@ -68,12 +47,12 @@ def _read_cache() -> dict[str, Any] | None:
         return None
 
 
-def _write_cache(counts: dict[str, int]) -> None:
+def _write_cache(by_persona: dict[str, dict[str, int]]) -> None:
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         tmp = CACHE_PATH.with_suffix(".tmp")
         with tmp.open("w") as f:
-            json.dump({"at": time.time(), "counts": counts}, f)
+            json.dump({"at": time.time(), "personas": by_persona}, f)
         tmp.replace(CACHE_PATH)
     except Exception:
         pass
@@ -124,27 +103,7 @@ def _fetch_counts(api_url: str, token: str, agent_name: str) -> dict[str, int] |
     }
 
 
-def main() -> int:
-    counts: dict[str, int] | None = None
-
-    cached = _read_cache()
-    if cached:
-        counts = cached.get("counts") or {}
-
-    if counts is None:
-        env = _parse_env_file(ENV_PATH)
-        token = _resolve(env, "SOCIETY_AI_AUTH_TOKEN")
-        agent_name = _resolve(env, "AGENT_NAME")
-        api_url = _resolve(env, "AGENT_ROUTER_API_URL", DEFAULT_API_URL).rstrip("/")
-        if not token or not agent_name:
-            return 0
-        counts = _fetch_counts(api_url, token, agent_name)
-        if counts is not None:
-            _write_cache(counts)
-
-    if not counts:
-        return 0
-
+def _segment(counts: dict[str, int]) -> str:
     parts: list[str] = []
     if counts.get("inbox", 0):
         parts.append(f"📥 {counts['inbox']}")
@@ -152,9 +111,46 @@ def main() -> int:
         parts.append(f"✅ {counts['tasks']}")
     if counts.get("in_review", 0):
         parts.append(f"🔔 {counts['in_review']} review")
+    return " · ".join(parts)
 
-    if parts:
-        print(" · ".join(parts))
+
+def main() -> int:
+    by_persona: dict[str, dict[str, int]] | None = None
+
+    cached = _read_cache()
+    if cached:
+        by_persona = cached.get("personas") or {}
+
+    if by_persona is None:
+        personas = discover_personas()
+        if not personas:
+            return 0
+        by_persona = {}
+        for p in personas:
+            counts = _fetch_counts(p["api_url"], p["token"], p["name"])
+            if counts is not None:
+                by_persona[p["name"]] = counts
+        if by_persona:
+            _write_cache(by_persona)
+
+    if not by_persona:
+        return 0
+
+    active = {n: c for n, c in by_persona.items() if any(c.values())}
+    if not active:
+        return 0
+
+    if len(by_persona) == 1:
+        # Single persona keeps the original compact format.
+        print(_segment(next(iter(active.values()))))
+    else:
+        # Multi-persona: name-prefixed compact segments, only for personas
+        # with anything open.
+        segs = []
+        for name, counts in active.items():
+            compact = _segment(counts).replace(" · ", " ").replace("📥 ", "📥").replace("✅ ", "✅").replace("🔔 ", "🔔")
+            segs.append(f"{name} {compact}")
+        print(" · ".join(segs))
     return 0
 
 

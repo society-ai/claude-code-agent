@@ -1,5 +1,7 @@
-# Environment
+# Environment (per-persona env files hold sai_ tokens)
 .env
+.env.*
+!.env.example
 venv/
 .venv/
 

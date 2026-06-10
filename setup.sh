@@ -1,9 +1,85 @@
 #!/usr/bin/env bash
 # Society AI + Claude Code — one-command setup
+#
+# Default run sets up the primary persona (.env). Additional personas
+# (more agents on this same machine, each its own bridge + identity):
+#
+#   ./setup.sh --persona <name>
+#
+# Reads the persona's sai_… key from $SOCIETY_AI_AUTH_TOKEN when set
+# (non-interactive), otherwise prompts. Writes .env.<name>, creates the
+# per-persona log/socket dir, and installs the persona's LaunchAgent.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$REPO_DIR"
+
+# ── Additional-persona mode ────────────────────────────────────────────────
+if [ "${1:-}" = "--persona" ]; then
+    PERSONA="${2:-}"
+    if ! printf '%s' "$PERSONA" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,62}$'; then
+        echo "Error: invalid persona name: '${PERSONA}'" >&2
+        echo "(lowercase alphanumerics plus - _ . , max 63 chars)" >&2
+        exit 1
+    fi
+    if [ ! -f ".env" ] || [ ! -x "venv/bin/python" ]; then
+        echo "Error: run ./setup.sh (no args) once first to set up the" >&2
+        echo "default persona — additional personas reuse its venv, MCP" >&2
+        echo "registration, hooks, and CLAUDE.md." >&2
+        exit 1
+    fi
+
+    ENV_FILE=".env.$PERSONA"
+    if [ -f "$ENV_FILE" ]; then
+        echo "  $ENV_FILE already exists — leaving it alone."
+        echo "  To reconfigure, delete it and re-run."
+    else
+        API_KEY="${SOCIETY_AI_AUTH_TOKEN:-}"
+        if [ -z "$API_KEY" ]; then
+            echo ""
+            echo "  Persona '$PERSONA' needs its own Society AI API key."
+            echo "  Create the agent + key at: https://societyai.com"
+            echo ""
+            read -rp "  Enter the API key for $PERSONA (sai_...): " API_KEY || true
+            API_KEY="${API_KEY#"${API_KEY%%[![:space:]]*}"}"
+            API_KEY="${API_KEY%"${API_KEY##*[![:space:]]}"}"
+        fi
+        case "$API_KEY" in
+            sai_*) ;;
+            *)
+                echo "  Error: API key must start with 'sai_'." >&2
+                exit 1
+                ;;
+        esac
+
+        # Inherit the API URL from the default persona's .env when set.
+        API_URL="$(grep -E '^AGENT_ROUTER_API_URL=' .env 2>/dev/null | head -1 | cut -d= -f2- || true)"
+
+        umask 077
+        {
+            echo "# Persona '$PERSONA' — created by setup.sh --persona"
+            echo "SOCIETY_AI_AUTH_TOKEN=$API_KEY"
+            echo "AGENT_NAME=$PERSONA"
+            [ -n "$API_URL" ] && echo "AGENT_ROUTER_API_URL=$API_URL"
+            echo "SOCIETY_AI_BRIDGE_SOCKET=$HOME/.cache/society-ai/$PERSONA/bridge.sock"
+        } > "$ENV_FILE"
+        chmod 600 "$ENV_FILE"
+        echo "  Wrote $ENV_FILE (mode 0600)"
+    fi
+
+    mkdir -p "$HOME/.cache/society-ai/$PERSONA"
+    ./service.sh install "$PERSONA"
+
+    echo ""
+    echo "Persona '$PERSONA' is set up."
+    echo "  - Its bridge runs as LaunchAgent io.societyai.claude-code-bridge.$PERSONA"
+    echo "  - Sessions it spawns authenticate as '$PERSONA' (env expansion in"
+    echo "    the shared MCP registration; interactive terminal sessions still"
+    echo "    default to the primary persona)."
+    echo "  - Optional: edit $ENV_FILE to set WORK_DIR / EXTRA_DIRS for this"
+    echo "    persona's file scope, then: ./service.sh restart $PERSONA"
+    exit 0
+fi
 
 echo "========================================"
 echo "  Society AI + Claude Code Setup"

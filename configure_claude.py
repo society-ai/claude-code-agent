@@ -128,12 +128,28 @@ def main() -> None:
         )
         sys.exit(2)
 
+    # Multi-persona support: register every identity-bearing env var as
+    # ${VAR:-<default>} rather than a baked literal. Claude Code expands
+    # these at MCP-server spawn time from the *Claude Code process's* own
+    # environment — so a session spawned by a persona's bridge (whose env
+    # carries that persona's AGENT_NAME / token / socket) authenticates as
+    # that persona, while interactive terminal sessions fall back to the
+    # default persona configured here. Verified working at user scope.
     env_pairs = [
-        _env_value_for_cli("SOCIETY_AI_AUTH_TOKEN", auth_token),
-        _env_value_for_cli("AGENT_NAME", agent_name),
-        _env_value_for_cli("COMPANY_ID", company_id),
-        _env_value_for_cli("AGENT_ROUTER_API_URL", api_url),
-        _env_value_for_cli("SOCIETY_AI_BRIDGE_SOCKET", bridge_socket),
+        _env_value_for_cli(
+            "SOCIETY_AI_AUTH_TOKEN",
+            "${SOCIETY_AI_AUTH_TOKEN:-" + auth_token + "}",
+        ),
+        _env_value_for_cli("AGENT_NAME", "${AGENT_NAME:-" + agent_name + "}"),
+        _env_value_for_cli("COMPANY_ID", "${COMPANY_ID:-" + company_id + "}"),
+        _env_value_for_cli(
+            "AGENT_ROUTER_API_URL",
+            "${AGENT_ROUTER_API_URL:-" + api_url + "}",
+        ),
+        _env_value_for_cli(
+            "SOCIETY_AI_BRIDGE_SOCKET",
+            "${SOCIETY_AI_BRIDGE_SOCKET:-" + bridge_socket + "}",
+        ),
     ]
     if lifecycle_flag:
         env_pairs.append(_env_value_for_cli("ENABLE_AGENT_LIFECYCLE", lifecycle_flag))
