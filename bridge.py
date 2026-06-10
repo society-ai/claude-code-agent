@@ -762,6 +762,22 @@ class Bridge:
         company_id = metadata.get("company_id") or COMPANY_ID
         agent_task_id = metadata.get("agent_task_id")
 
+        # Persona context injected by the platform on every dispatch
+        # (task_manager._inject_card_instructions). agent_instructions is
+        # the agent-level text authored on the agent's edit page;
+        # skill_instructions arrives pre-matched as the invoked skill's
+        # string (the router injects skill_instructions[skill_used], not
+        # the whole dict) — tolerate non-strings from older routers.
+        agent_instructions = metadata.get("agent_instructions")
+        if not isinstance(agent_instructions, str):
+            agent_instructions = ""
+        skill_instructions = metadata.get("skill_instructions")
+        if not isinstance(skill_instructions, str):
+            skill_instructions = ""
+        instructions_block = self._format_instructions_block(
+            agent_instructions.strip(), skill_instructions.strip()
+        )
+
         # Extract user message text
         message = params.get("message", {}) or {}
         parts = message.get("parts", []) or []
@@ -798,7 +814,10 @@ class Bridge:
                 try:
                     if agent_task_id and company_id:
                         # AgentOrg trigger flow — full context + Claude Code spawn
-                        await self._execute_agentorg_task(task_id, company_id, agent_task_id)
+                        await self._execute_agentorg_task(
+                            task_id, company_id, agent_task_id,
+                            instructions_block=instructions_block,
+                        )
                     else:
                         # Chat flow OR personal-task trigger (no company_id) —
                         # direct message, respond via Claude Code. Pass
@@ -806,6 +825,7 @@ class Bridge:
                         # right context primer (active chat vs background).
                         await self._execute_chat_task(
                             task_id, user_text, agent_task_id=agent_task_id,
+                            instructions_block=instructions_block,
                         )
                 except Exception as e:
                     logger.exception("Task %s failed with unhandled exception", task_id)
@@ -838,6 +858,32 @@ class Bridge:
             for k in drop:
                 self._chat_history.pop(k, None)
                 self._task_locks.pop(k, None)
+
+    @staticmethod
+    def _format_instructions_block(
+        agent_instructions: str, skill_instructions: str
+    ) -> str:
+        """Format platform-authored persona context for the spawned prompt.
+
+        agent_instructions come from the agent's edit page ("Instructions"
+        section); skill_instructions are the invoked skill's per-skill
+        text, present only when the dispatch carried a matching
+        `skill_used`. Returns "" when neither is set, so callers can
+        unconditionally concatenate.
+        """
+        parts: list[str] = []
+        if agent_instructions:
+            parts.append(
+                "[Agent instructions — authored by your creator on the "
+                "platform; follow them throughout]\n" + agent_instructions
+            )
+        if skill_instructions:
+            parts.append(
+                "[Skill instructions for this request]\n" + skill_instructions
+            )
+        if not parts:
+            return ""
+        return "\n\n".join(parts) + "\n\n"
 
     @staticmethod
     def _bridge_context_primer_background(trigger_reason: str = "") -> str:
@@ -946,6 +992,7 @@ class Bridge:
         task_id: str,
         user_text: str,
         agent_task_id: str | None = None,
+        instructions_block: str = "",
     ):
         """Handle a direct chat message OR a personal-task trigger.
 
@@ -974,7 +1021,7 @@ class Bridge:
             if is_background
             else self._bridge_context_primer_chat(task_id, len(history))
         )
-        prompt = primer + self._build_chat_prompt(user_text, history)
+        prompt = primer + instructions_block + self._build_chat_prompt(user_text, history)
 
         if self._sandbox:
             # Secured mode still uses the legacy non-streaming runner. Streaming
@@ -1001,7 +1048,13 @@ class Bridge:
             task_id, result_text, exit_code or (1 if had_error else 0),
         )
 
-    async def _execute_agentorg_task(self, task_id: str, company_id: str, agent_task_id: str):
+    async def _execute_agentorg_task(
+        self,
+        task_id: str,
+        company_id: str,
+        agent_task_id: str,
+        instructions_block: str = "",
+    ):
         """Handle an AgentOrg task — fetch context, spawn Claude Code, report results."""
         company = await fetch_company_details(company_id)
         if not company:
@@ -1032,6 +1085,7 @@ class Bridge:
         # the top removes any ambiguity about whether a user is watching.
         prompt = (
             self._bridge_context_primer_background(trigger_reason="agentorg-task")
+            + instructions_block
             + build_prompt(company, task, sandboxed=bool(self._sandbox))
         )
         logger.info(
