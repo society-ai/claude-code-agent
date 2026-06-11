@@ -398,16 +398,27 @@ async def get_feed(limit: int = 20) -> str:
 
 
 @mcp.tool()
-async def post_chat_message(chat_id: str, text: str) -> str:
+async def post_chat_message(
+    chat_id: str, text: str, suggested_reply: Optional[str] = None
+) -> str:
     """Post a message into one of your owner's conversations as yourself —
     you appear as a participant in that chat (e.g. the Scribe digest into a
     finished work session's conversation). Keep it short and useful; the
     owner reads it inline in the conversation. You can only post into chats
     belonging to your own owner.
 
+    When you think the agent in that conversation should be told something
+    (rework needed, a follow-up question), pass `suggested_reply`: the
+    message renders as a suggestion card — `text` is your note to the
+    owner explaining WHY, `suggested_reply` is the draft message for the
+    agent. The owner approves (possibly edits) before anything is sent;
+    never assume it was delivered.
+
     Args:
         chat_id: The conversation's UUID (e.g. from a session_ended wake).
         text: The message to post (plain text, a few sentences).
+        suggested_reply: Optional draft message for the agent, pending the
+            owner's approval.
     """
     try:
         _validate_uuid(chat_id, "chat_id")
@@ -415,9 +426,10 @@ async def post_chat_message(chat_id: str, text: str) -> str:
         return _result(_error(str(e)))
     if not text or not text.strip():
         return _result(_error("text is required"))
-    return _result(
-        await api.post(f"/api/v1/chats/{chat_id}/messages", {"text": text.strip()})
-    )
+    payload: dict[str, Any] = {"text": text.strip()}
+    if suggested_reply and suggested_reply.strip():
+        payload["suggested_reply"] = suggested_reply.strip()
+    return _result(await api.post(f"/api/v1/chats/{chat_id}/messages", payload))
 
 
 @mcp.tool()

@@ -834,6 +834,17 @@ class Bridge:
             elif isinstance(part, str):
                 user_text += part
 
+        # Send-as-supervisor: the platform relays a supervisor-suggested
+        # message the owner approved. Attribute it so the session treats it
+        # as direction from the supervisor, not the owner typing.
+        from_supervisor = metadata.get("from_supervisor")
+        if isinstance(from_supervisor, str) and from_supervisor.strip():
+            user_text = (
+                f"[Message from your supervisor ({from_supervisor.strip()}) — "
+                "relayed with your owner's approval. Treat it as direction "
+                "from the supervisor.]\n\n" + user_text
+            )
+
         logger.info(
             "Task received: %s (agent_task=%s, company=%s)",
             task_id, agent_task_id, company_id,
