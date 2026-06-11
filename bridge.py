@@ -47,6 +47,7 @@ from config import (
     EXTRA_DIRS,
     SANDBOX_NAME,
     SANDBOX_TIMEOUT,
+    SESSION_MODE,
     SOCIETY_AI_BRIDGE_SOCKET,
     STATUS_VERBOSITY,
     __version__,
@@ -474,6 +475,30 @@ class Bridge:
         self._pending_delegations: dict[str, asyncio.Future] = {}
         self._ipc_msg_counter = 0
 
+        # Session mode (v0.7): persistent interactive sessions per work item.
+        # Hub + manager are created here; started in run(). Standard mode only.
+        self._session_mode = SESSION_MODE and EXECUTION_MODE != "secured"
+        self._channel_hub = None
+        self._session_mgr = None
+        if self._session_mode:
+            from channel_hub import ChannelHub
+            from session_manager import SessionManager
+            from policy import default_policy, apply_local_env
+            # Channel hub socket lives beside the IPC socket, per-bridge.
+            hub_sock = os.path.join(
+                os.path.dirname(SOCIETY_AI_BRIDGE_SOCKET) or ".", "channels.sock"
+            )
+            self._channel_hub = ChannelHub(hub_sock, self._on_channel_reply)
+            self._session_mgr = SessionManager(hub_sock)
+            # Register this persona's policy (defaults + local env override now;
+            # platform-fetched config is overlaid in run() once connected).
+            pol = default_policy(AGENT_NAME, WORK_DIR, list(EXTRA_DIRS))
+            apply_local_env(pol, AGENT_NAME)
+            self._session_mgr.set_policy(pol)
+            # event_id -> A2A task_id awaiting the session's reply.
+            self._pending_session_tasks: dict[str, str] = {}
+            logger.info("SESSION_MODE enabled: work runs in persistent sessions")
+
         # Sandbox executor for secured mode
         self._sandbox = None
         if EXECUTION_MODE == "secured":
@@ -812,7 +837,29 @@ class Bridge:
             async with task_lock:
                 self._active_tasks.add(task_id)
                 try:
-                    if agent_task_id and company_id:
+                    if self._session_mode:
+                        # v0.7: dispatch into a persistent per-work-item session.
+                        # Stable key gives task rework continuity (resume same
+                        # session); chat falls back to sessionId/task_id.
+                        work_item_key = (
+                            agent_task_id
+                            or params.get("sessionId")
+                            or metadata.get("chat_id")
+                            or task_id
+                        )
+                        is_background = bool(agent_task_id) or user_text.lstrip().startswith("[Trigger:")
+                        primer = (
+                            self._bridge_context_primer_background(trigger_reason="task")
+                            if is_background
+                            else self._bridge_context_primer_chat(work_item_key, 0)
+                        )
+                        content = primer + instructions_block + user_text
+                        title = (user_text.strip().splitlines() or ["chat"])[0][:60]
+                        await self._execute_via_session(
+                            task_id, str(work_item_key), title, content,
+                            kind="task_assigned" if is_background else "chat",
+                        )
+                    elif agent_task_id and company_id:
                         # AgentOrg trigger flow — full context + Claude Code spawn
                         await self._execute_agentorg_task(
                             task_id, company_id, agent_task_id,
@@ -1171,6 +1218,69 @@ class Bridge:
             msg_id=self._next_id(),
         )
 
+    # -- Session-mode dispatch (v0.7) ----------------------------------------
+
+    async def _on_channel_reply(self, session_key: str, event_id: str, text: str) -> None:
+        """Called by the ChannelHub when a session replies to a pushed event.
+        Resolves the pending future for that event so the dispatching call can
+        send task.complete. Centralizing completion there avoids double-sends."""
+        fut = getattr(self, "_pending_session_tasks", {}).get(event_id)
+        if isinstance(fut, asyncio.Future) and not fut.done():
+            fut.set_result(text)
+
+    async def _execute_via_session(
+        self,
+        task_id: str,
+        work_item_key: str,
+        title: str,
+        content: str,
+        kind: str,
+        timeout_s: float = 600.0,
+    ) -> None:
+        """Dispatch a work item into a persistent session and wait for its
+        reply, then complete the A2A task. The event_id we send IS the A2A
+        task_id, so the reply correlates straight back."""
+        mgr = self._session_mgr
+        hub = self._channel_hub
+        # Ensure (launch or resume) the work item's session.
+        try:
+            await mgr.ensure_session(work_item_key, AGENT_NAME, title=title)
+        except Exception as e:
+            logger.exception("Session launch failed for %s", work_item_key)
+            await self._send_task_complete(
+                task_id, f"Could not start a session: {type(e).__name__}: {e}", exit_code=1
+            )
+            return
+
+        # Wait briefly for the session's channel to connect (fresh launches
+        # connect within ~1-2s; resumes faster).
+        for _ in range(40):
+            if hub.is_connected(work_item_key):
+                break
+            await asyncio.sleep(0.25)
+        if not hub.is_connected(work_item_key):
+            await self._send_task_complete(
+                task_id, "Session started but its channel did not connect in time.", exit_code=1
+            )
+            return
+
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._pending_session_tasks[event_id := task_id] = fut
+        try:
+            await hub.push_event(work_item_key, content, {"event_id": task_id, "kind": kind})
+            mgr.touch(work_item_key)
+            try:
+                text = await asyncio.wait_for(fut, timeout=timeout_s)
+            except asyncio.TimeoutError:
+                await self._send_task_complete(
+                    task_id, "The agent did not reply within the time limit.", exit_code=1
+                )
+                return
+            await self._send_task_complete(task_id, text or "(no reply)", exit_code=0)
+        finally:
+            self._pending_session_tasks.pop(task_id, None)
+
     # -- Main loop -----------------------------------------------------------
 
     async def run(self):
@@ -1185,6 +1295,25 @@ class Bridge:
                     "Cannot run in secured mode. Fix the issue above or use EXECUTION_MODE=standard."
                 )
                 sys.exit(1)
+
+        # Start session-mode infrastructure (channel hub + session manager),
+        # and overlay platform-fetched policy onto this persona.
+        if self._session_mode:
+            try:
+                await self._channel_hub.start()
+                self._session_mgr.start()
+                from policy import fetch_platform_policy, apply_platform, apply_local_env
+                fetched = await fetch_platform_policy(
+                    AGENT_ROUTER_API_URL, SOCIETY_AI_AUTH_TOKEN, AGENT_NAME
+                )
+                if fetched:
+                    pol = self._session_mgr.policy(AGENT_NAME)
+                    apply_platform(pol, fetched)
+                    apply_local_env(pol, AGENT_NAME)  # local always wins
+                    logger.info("Applied platform policy for %s", AGENT_NAME)
+            except Exception:
+                logger.exception("Session-mode startup failed; falling back to spawn path")
+                self._session_mode = False
 
         reconnect_delay = 1
 
@@ -1332,6 +1461,19 @@ def main():
                 loop.run_until_complete(bridge._sandbox.stop())
             except Exception as e:
                 logger.warning("Error stopping sandbox: %s", e)
+        # Tear down session-mode infrastructure (kills tmux sessions, removes
+        # the hub socket). Sessions themselves persist as transcripts on disk
+        # and can be resumed on the next launch.
+        if getattr(bridge, "_session_mgr", None):
+            try:
+                loop.run_until_complete(bridge._session_mgr.stop())
+            except Exception as e:
+                logger.warning("Error stopping session manager: %s", e)
+        if getattr(bridge, "_channel_hub", None):
+            try:
+                loop.run_until_complete(bridge._channel_hub.stop())
+            except Exception as e:
+                logger.warning("Error stopping channel hub: %s", e)
         try:
             loop.close()
         except Exception:

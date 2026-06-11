@@ -1,0 +1,11 @@
+{
+  "name": "society-ai-channel",
+  "version": "0.7.0",
+  "private": true,
+  "type": "module",
+  "description": "Society AI channel server for Claude Code — a dumb pipe between a session and the bridge daemon.",
+  "main": "server.mjs",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  }
+}

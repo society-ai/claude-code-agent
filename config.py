@@ -11,7 +11,7 @@ import os
 import re
 import sys
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 # -- Required / core ---------------------------------------------------------
 
@@ -44,6 +44,17 @@ ENABLE_AGENT_LIFECYCLE: bool = os.getenv("ENABLE_AGENT_LIFECYCLE", "false").stri
 
 _VALID_STATUS_VERBOSITY = {"quiet", "normal", "verbose"}
 STATUS_VERBOSITY: str = os.getenv("STATUS_VERBOSITY", "normal").strip().lower()
+
+# -- Session mode (v0.7 execution model) -------------------------------------
+# When enabled, the bridge dispatches work into persistent interactive Claude
+# Code sessions (one per work item, tmux + channel) instead of spawning
+# `claude -p` per message. This bills to the interactive pool (not the SDK
+# credit pool, June 15 2026), gives native multi-turn continuity, and is the
+# foundation for the supervisor architecture. Opt-in while it matures; the
+# spawn path remains the fallback. Requires standard (non-sandbox) mode.
+SESSION_MODE: bool = os.getenv("SESSION_MODE", "false").strip().lower() in (
+    "1", "true", "yes", "on",
+)
 
 # -- Execution mode ----------------------------------------------------------
 

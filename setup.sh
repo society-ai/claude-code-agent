@@ -117,6 +117,16 @@ source venv/bin/activate
 pip install -q -r requirements.txt
 echo "  Dependencies installed"
 
+# Channel server deps (Node) — only needed for SESSION_MODE. Best-effort:
+# the bridge runs fine without them in the default spawn mode.
+if [ -d "channel" ] && command -v npm &>/dev/null; then
+    if [ ! -d "channel/node_modules" ]; then
+        (cd channel && npm install --silent >/dev/null 2>&1) \
+            && echo "  Channel server deps installed (Node)" \
+            || echo "  Note: channel deps not installed (SESSION_MODE only)"
+    fi
+fi
+
 # 3. Get API key + agent name
 echo ""
 echo "[3/7] Configuring API key..."

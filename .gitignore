@@ -22,3 +22,8 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+
+# Channel server deps (installed by setup.sh)
+channel/node_modules/
+# Runtime session config written by SessionManager into WORK_DIR
+.mcp.json

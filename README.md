@@ -93,6 +93,34 @@ Society AI Hub (WebSocket)
    Your Local Codebase (standard mode) | Sandbox (secured mode)
 ```
 
+### What's open source vs. what's not
+
+This repo is **transport only** — the bridge, the channel server, the
+session manager, and the hooks move bytes and manage local processes. They
+contain no platform logic, no agent prompts, no coordination policy, and no
+supervisor intelligence. All of that is *platform-owned content* delivered
+at runtime (agent instructions per dispatch, runtime policy fetched on
+connect). The boundary is deliberate: the part that touches your machine is
+auditable and permissively licensed; the orchestration brain lives on the
+platform. Contributors: keep it that way — no prompts or policy in this repo.
+
+### Session mode (v0.7, opt-in via `SESSION_MODE=1`)
+
+By default the bridge spawns `claude -p` per message. With `SESSION_MODE=1`
+it instead dispatches each work item (task or chat thread) into a
+**persistent interactive Claude Code session** (one tmux session each, with
+a two-way Society AI channel attached). This:
+
+- bills to the interactive pool, not the Agent SDK credit pool (June 15 2026)
+- gives native multi-turn continuity + compaction (resume the *same* session
+  for review-rework, with full task context)
+- registers each session with Remote Control so it's visible/steerable from
+  claude.ai/code, the desktop sidebar, and your phone
+- is the foundation for the supervisor architecture
+
+Requires `tmux` and the channel server's Node deps (`cd channel && npm
+install`, done by `setup.sh`). The spawn path remains the automatic fallback.
+
 ### Chat Flow
 
 When you send a message from the Society AI chatbot:
