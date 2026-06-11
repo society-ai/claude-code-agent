@@ -344,6 +344,129 @@ async def list_inbox(
     return _result(await api.get("/api/v1/inbox", params=params))
 
 
+_VALID_SUBJECT_KINDS = {"task", "inbox"}
+
+
+@mcp.tool()
+async def post_feed(
+    message: str,
+    subject_kind: Optional[str] = None,
+    subject_id: Optional[str] = None,
+) -> str:
+    """Post a short notification to your owner's homepage feed.
+
+    Use this to tell the user what you did — e.g. after reviewing a task or
+    finishing work. Optionally attach the task or inbox item it's about via
+    `subject_kind` ('task' | 'inbox') + `subject_id`, and the feed renders a
+    live preview of it. You can only ever post to your own owner's feed.
+
+    Args:
+        message: The notification text (what you did / what's noteworthy).
+        subject_kind: Optional — 'task' or 'inbox' to attach a subject.
+        subject_id: The task / inbox item UUID (required if subject_kind is set).
+    """
+    if not message or not message.strip():
+        return _result(_error("message is required"))
+    if subject_kind is not None and subject_kind not in _VALID_SUBJECT_KINDS:
+        return _result(_error("subject_kind must be 'task' or 'inbox'"))
+    if subject_kind and not subject_id:
+        return _result(_error("subject_id is required when subject_kind is set"))
+    if subject_id:
+        try:
+            _validate_uuid(subject_id, "subject_id")
+        except ValueError as e:
+            return _result(_error(str(e)))
+
+    payload: dict[str, Any] = {"message": message.strip()}
+    if subject_kind:
+        payload["subject_kind"] = subject_kind
+        payload["subject_id"] = subject_id
+    return _result(await api.post("/api/v1/feed", payload))
+
+
+@mcp.tool()
+async def get_feed(limit: int = 20) -> str:
+    """Read recent items from your owner's homepage feed — what you and other
+    agents posted lately. Call at the start of a cycle to see what already
+    happened and avoid repeating yourself.
+
+    Args:
+        limit: Max items (1-100, default 20).
+    """
+    limit = max(1, min(100, int(limit)))
+    return _result(await api.get("/api/v1/feed", params={"limit": limit}))
+
+
+@mcp.tool()
+async def post_chat_message(chat_id: str, text: str) -> str:
+    """Post a message into one of your owner's conversations as yourself —
+    you appear as a participant in that chat (e.g. the Scribe digest into a
+    finished work session's conversation). Keep it short and useful; the
+    owner reads it inline in the conversation. You can only post into chats
+    belonging to your own owner.
+
+    Args:
+        chat_id: The conversation's UUID (e.g. from a session_ended wake).
+        text: The message to post (plain text, a few sentences).
+    """
+    try:
+        _validate_uuid(chat_id, "chat_id")
+    except ValueError as e:
+        return _result(_error(str(e)))
+    if not text or not text.strip():
+        return _result(_error("text is required"))
+    return _result(
+        await api.post(f"/api/v1/chats/{chat_id}/messages", {"text": text.strip()})
+    )
+
+
+@mcp.tool()
+async def get_chat_messages(chat_id: str, limit: int = 200) -> str:
+    """Read one of your owner's conversations (compact: role, agent, text
+    per message). Use it to read a finished work session's conversation
+    before writing your Scribe digest.
+
+    Args:
+        chat_id: The conversation's UUID.
+        limit: Max messages (1-500, default 200).
+    """
+    try:
+        _validate_uuid(chat_id, "chat_id")
+    except ValueError as e:
+        return _result(_error(str(e)))
+    limit = max(1, min(500, int(limit)))
+    return _result(
+        await api.get(f"/api/v1/chats/{chat_id}/messages", params={"limit": limit})
+    )
+
+
+@mcp.tool()
+async def publish_brief(synthesis: str, highlight: Optional[str] = None) -> str:
+    """Publish (replace) your owner's homepage brief — the short prose at the
+    top of their homepage.
+
+    Call this at the END of every orchestrator cycle. `synthesis` is ONE
+    short, first-person sentence telling the user what currently needs them
+    and where to start (based on the live items you just reviewed).
+    `highlight` is an optional short callout for something important
+    happening BEYOND their review queue (e.g. a critical task aging, a
+    worrying pattern) — omit it when there's nothing real to flag.
+
+    The brief replaces the previous one (current state, no history). You can
+    only publish to your own owner's homepage.
+
+    Args:
+        synthesis: One sentence — what needs the user, where to start.
+        highlight: Optional callout beyond the queue; omit if nothing to flag.
+    """
+    if not synthesis or not synthesis.strip():
+        return _result(_error("synthesis is required"))
+    payload: dict[str, Any] = {"synthesis": synthesis.strip()}
+    if highlight and highlight.strip():
+        payload["highlight"] = highlight.strip()
+    return _result(await api.post("/api/v1/brief", payload))
+
+
 # ==============================================================================
 # PHASE 1 — task / inbox CRUD gap closures
 # ==============================================================================

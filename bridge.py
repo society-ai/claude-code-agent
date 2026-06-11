@@ -876,9 +876,14 @@ class Bridge:
                         )
                         content = primer + instructions_block + user_text
                         title = self._derive_session_title(user_text)
+                        if agent_task_id:
+                            kind = "task_assigned"   # real platform task
+                        elif is_background:
+                            kind = "trigger"          # wake/schedule automation
+                        else:
+                            kind = "chat"
                         await self._execute_via_session(
-                            task_id, str(work_item_key), title, content,
-                            kind="task_assigned" if is_background else "chat",
+                            task_id, str(work_item_key), title, content, kind=kind,
                         )
                     elif agent_task_id and company_id:
                         # AgentOrg trigger flow — full context + Claude Code spawn
@@ -1323,13 +1328,22 @@ class Bridge:
             return
 
         # Register the session for transcript mirroring, linked to the work
-        # item that caused it (task vs chat).
+        # item that caused it. 'task' = a real platform task (agent_task_id);
+        # 'trigger' = platform automation (orchestrator wakes, schedules) —
+        # the distinction loop-guards the supervisor: scribe sessions ending
+        # never re-wake the orchestrator.
         if self._shipper is not None:
+            if kind == "chat":
+                wi_kind = "chat"
+            elif kind == "task_assigned":
+                wi_kind = "task"
+            else:
+                wi_kind = "trigger"
             self._shipper.register(
                 rec.session_id,
                 cwd=mgr.policy(AGENT_NAME).work_dir,
                 title=title,
-                work_item_kind="task" if kind == "task_assigned" else "chat",
+                work_item_kind=wi_kind,
                 work_item_id=work_item_key,
             )
 
