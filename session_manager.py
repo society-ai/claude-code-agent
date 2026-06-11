@@ -74,6 +74,7 @@ class SessionRecord:
     state: str = "starting"            # starting | ready | reaped | failed
     last_active: float = field(default_factory=time.time)
     has_run_once: bool = False         # has it been launched at least once (→ resume)
+    background: bool = False           # automation (wakes/schedules): no RC row
 
 
 class SessionManager:
@@ -143,6 +144,7 @@ class SessionManager:
         persona: str,
         *,
         title: str = "",
+        background: bool = False,
     ) -> SessionRecord:
         """Return a live session for the work item, launching or resuming as
         needed. Concurrency-safe per work item."""
@@ -164,6 +166,7 @@ class SessionManager:
                     session_id=str(uuid.uuid4()),
                     tmux_name=self._tmux_name(persona, work_item_key),
                     title=title or work_item_key,
+                    background=background,
                 )
                 self._sessions[work_item_key] = rec
             else:
@@ -201,7 +204,9 @@ class SessionManager:
             cmd += ["--add-dir", d]
         if pol.permission_mode and pol.permission_mode != "default":
             cmd += ["--permission-mode", pol.permission_mode]
-        if pol.remote_control:
+        # Background automation (wakes, schedules) never claims a Remote
+        # Control sidebar row — only user- and task-originated sessions do.
+        if pol.remote_control and not rec.background:
             cmd += ["--remote-control", rec.title[:60]]
         # Dev-flag loads our bare .mcp.json channel server during the research
         # preview. A packaged plugin + --channels replaces this post-GA.

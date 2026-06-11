@@ -271,6 +271,14 @@ class TranscriptShipper:
             self._save_state()
             return True
 
+    def park_status(self, session_id: str, status: str) -> None:
+        """Durably record a status flip without shipping (shutdown path —
+        no network). The next bridge start's retry pass ships it."""
+        meta = self._state.get(session_id)
+        if meta is not None and not meta.get("pending_status"):
+            meta["pending_status"] = status
+            self._save_state()
+
     async def retry_pending(self) -> int:
         """Re-ship sessions whose status flip (or delta) failed earlier.
         Called at bridge start and periodically. Returns retries attempted."""

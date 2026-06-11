@@ -887,10 +887,17 @@ class Bridge:
                         )
                         content = primer + instructions_block + user_text
                         title = self._derive_session_title(user_text)
-                        if agent_task_id:
-                            kind = "task_assigned"   # real platform task
+                        stripped = user_text.lstrip()
+                        if agent_task_id and (
+                            stripped.startswith("[Trigger: task_assigned]")
+                            or not stripped.startswith("[Trigger:")
+                        ):
+                            kind = "task_assigned"   # real work on the task
                         elif is_background:
-                            kind = "trigger"          # wake/schedule automation
+                            # Status echoes (task_in_review etc.) and wakes are
+                            # automation — 'trigger' kind keeps them out of the
+                            # task's Sessions list and wake marking.
+                            kind = "trigger"
                         else:
                             kind = "chat"
                         await self._execute_via_session(
@@ -1341,9 +1348,14 @@ class Bridge:
         task_id, so the reply correlates straight back."""
         mgr = self._session_mgr
         hub = self._channel_hub
-        # Ensure (launch or resume) the work item's session.
+        # Ensure (launch or resume) the work item's session. Trigger-kind
+        # work (wakes, schedules, status echoes) runs headless — no Remote
+        # Control sidebar row.
         try:
-            rec = await mgr.ensure_session(work_item_key, AGENT_NAME, title=title)
+            rec = await mgr.ensure_session(
+                work_item_key, AGENT_NAME, title=title,
+                background=(kind == "trigger"),
+            )
         except Exception as e:
             logger.exception("Session launch failed for %s", work_item_key)
             await self._send_task_complete(
@@ -1598,6 +1610,16 @@ def main():
         # the hub socket). Sessions themselves persist as transcripts on disk
         # and can be resumed on the next launch.
         if getattr(bridge, "_session_mgr", None):
+            # Shutdown kills the tmux sessions without reap callbacks —
+            # park their 'ended' flips so the next start ships them and
+            # the platform (and the Scribe) still learn the sessions ended.
+            if getattr(bridge, "_shipper", None):
+                try:
+                    for rec in list(bridge._session_mgr._sessions.values()):
+                        if rec.state == "ready":
+                            bridge._shipper.park_status(rec.session_id, "ended")
+                except Exception as e:
+                    logger.warning("Could not park ended flips at shutdown: %s", e)
             try:
                 loop.run_until_complete(bridge._session_mgr.stop())
             except Exception as e:
