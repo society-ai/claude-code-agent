@@ -11,7 +11,7 @@ import os
 import re
 import sys
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 # -- Required / core ---------------------------------------------------------
 
@@ -63,6 +63,23 @@ SESSION_MODE: bool = os.getenv("SESSION_MODE", "false").strip().lower() in (
 MIRROR_SESSIONS: bool = os.getenv("MIRROR", "true").strip().lower() in (
     "1", "true", "yes", "on",
 )
+
+# What gets mirrored. SECURITY BOUNDARY — local-only setting, the platform
+# can never raise it remotely:
+#   messages = conversation only: user/dispatch text, assistant text, and
+#              activity stubs (tool name + safe target like a file path —
+#              never command lines, inputs, or outputs). Default.
+#   full     = trimmed raw transcript records, including tool inputs and
+#              results. Debug opt-in for your own agents only.
+_VALID_MIRROR_LEVELS = {"messages", "full"}
+MIRROR_LEVEL: str = os.getenv("MIRROR_LEVEL", "messages").strip().lower()
+if MIRROR_LEVEL not in _VALID_MIRROR_LEVELS:
+    print(
+        f"Error: MIRROR_LEVEL must be one of {sorted(_VALID_MIRROR_LEVELS)} "
+        f"(got {MIRROR_LEVEL!r})",
+        file=sys.stderr,
+    )
+    sys.exit(2)
 
 # -- Execution mode ----------------------------------------------------------
 

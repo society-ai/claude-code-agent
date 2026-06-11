@@ -80,6 +80,7 @@ class SessionManager:
     def __init__(self, hub_sock_path: str):
         self._hub_sock = hub_sock_path
         self._sessions: dict[str, SessionRecord] = {}
+        self._aliases: dict[str, str] = {}  # alias key -> canonical work_item_key
         self._policies: dict[str, PersonaPolicy] = {}
         self._launch_locks: dict[str, asyncio.Lock] = {}
         self._reaper_task: Optional[asyncio.Task] = None
@@ -116,11 +117,23 @@ class SessionManager:
         for rec in list(self._sessions.values()):
             await self._tmux_kill(rec.tmux_name)
 
+    def resolve(self, work_item_key: str) -> str:
+        """Resolve an aliased key (e.g. the chat a task session projects
+        into) to its canonical work-item key."""
+        return self._aliases.get(work_item_key, work_item_key)
+
+    def alias(self, alias_key: str, canonical_key: str) -> None:
+        """Route a second work-item key into an existing session. Used so
+        replies typed in the session's platform chat continue the SAME
+        Claude Code session instead of opening a new one."""
+        if alias_key and alias_key != canonical_key:
+            self._aliases[alias_key] = canonical_key
+
     def get(self, work_item_key: str) -> Optional[SessionRecord]:
-        return self._sessions.get(work_item_key)
+        return self._sessions.get(self.resolve(work_item_key))
 
     def touch(self, work_item_key: str) -> None:
-        rec = self._sessions.get(work_item_key)
+        rec = self._sessions.get(self.resolve(work_item_key))
         if rec:
             rec.last_active = time.time()
 
@@ -133,6 +146,7 @@ class SessionManager:
     ) -> SessionRecord:
         """Return a live session for the work item, launching or resuming as
         needed. Concurrency-safe per work item."""
+        work_item_key = self.resolve(work_item_key)
         lock = self._launch_locks.setdefault(work_item_key, asyncio.Lock())
         async with lock:
             rec = self._sessions.get(work_item_key)
@@ -160,7 +174,7 @@ class SessionManager:
             return rec
 
     async def reap(self, work_item_key: str) -> None:
-        rec = self._sessions.get(work_item_key)
+        rec = self._sessions.get(self.resolve(work_item_key))
         if not rec:
             return
         await self._tmux_kill(rec.tmux_name)
@@ -385,7 +399,7 @@ class SessionManager:
         """Type a literal message into a session's input + submit. Used for
         on-demand RC enable (/remote-control) and direct nudges. Returns False
         if the session isn't alive."""
-        rec = self._sessions.get(work_item_key)
+        rec = self._sessions.get(self.resolve(work_item_key))
         if not rec or not await self._tmux_alive(rec.tmux_name):
             return False
         await self._tmux_send(rec.tmux_name, text, enter=False)

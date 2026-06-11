@@ -45,6 +45,7 @@ from config import (
     API_HEADERS,
     EXECUTION_MODE,
     EXTRA_DIRS,
+    MIRROR_LEVEL,
     MIRROR_SESSIONS,
     SANDBOX_NAME,
     SANDBOX_TIMEOUT,
@@ -510,9 +511,14 @@ class Bridge:
                     AGENT_ROUTER_API_URL,
                     SOCIETY_AI_AUTH_TOKEN,
                     state_dir=os.path.dirname(SOCIETY_AI_BRIDGE_SOCKET) or ".",
+                    level=MIRROR_LEVEL,
                 )
                 self._session_mgr.on_reap = self._on_session_reap
-                logger.info("Session mirroring enabled (MIRROR=false to disable)")
+                self._shipper.on_chat_link = self._on_mirror_chat_link
+                logger.info(
+                    "Session mirroring enabled (level=%s; MIRROR=false to disable)",
+                    MIRROR_LEVEL,
+                )
 
         # Sandbox executor for secured mode
         self._sandbox = None
@@ -869,7 +875,7 @@ class Bridge:
                             else self._bridge_context_primer_chat(work_item_key, 0)
                         )
                         content = primer + instructions_block + user_text
-                        title = (user_text.strip().splitlines() or ["chat"])[0][:60]
+                        title = self._derive_session_title(user_text)
                         await self._execute_via_session(
                             task_id, str(work_item_key), title, content,
                             kind="task_assigned" if is_background else "chat",
@@ -1235,11 +1241,41 @@ class Bridge:
 
     # -- Session-mode dispatch (v0.7) ----------------------------------------
 
+    @staticmethod
+    def _derive_session_title(user_text: str) -> str:
+        """Human title for a session: the task's own title when the dispatch
+        is a task trigger, else the first meaningful line. Trigger banners
+        ('[Trigger: ...]') never become titles."""
+        m = re.search(r"new task \([A-Z0-9-]+\):\s*(.+)", user_text)
+        if m:
+            return m.group(1).strip()[:60]
+        for line in user_text.strip().splitlines():
+            line = re.sub(r"^\[Trigger:[^\]]*\]\s*", "", line.strip())
+            if line:
+                return line[:60]
+        return "chat"
+
     async def _on_session_reap(self, rec) -> None:
         """SessionManager reap callback: ship the final transcript delta and
         flip the platform mirror to 'ended'."""
         if self._shipper is not None:
             await self._shipper.ship(rec.session_id, status="ended")
+
+    async def _on_mirror_chat_link(self, session_id: str, chat_id: str) -> None:
+        """The platform told us which chat a session projects into. Alias
+        that chat id to the session's work item, so a user replying in the
+        chat composer continues the SAME Claude Code session."""
+        mgr = self._session_mgr
+        if mgr is None:
+            return
+        for rec in list(mgr._sessions.values()):
+            if rec.session_id == session_id:
+                mgr.alias(chat_id, rec.work_item_key)
+                logger.info(
+                    "Chat %s aliased to session work item %s",
+                    chat_id[:8], rec.work_item_key[:24],
+                )
+                return
 
     async def ipc_mirror_notify(self, params: dict) -> dict:
         """IPC from the Stop hook: a Claude Code turn ended on this machine.
@@ -1297,13 +1333,18 @@ class Bridge:
                 work_item_id=work_item_key,
             )
 
+        # An aliased dispatch (e.g. a reply typed in the session's platform
+        # chat) resolves to the canonical work item — the channel registered
+        # under that key, so all hub operations use it.
+        channel_key = rec.work_item_key
+
         # Wait briefly for the session's channel to connect (fresh launches
         # connect within ~1-2s; resumes faster).
         for _ in range(40):
-            if hub.is_connected(work_item_key):
+            if hub.is_connected(channel_key):
                 break
             await asyncio.sleep(0.25)
-        if not hub.is_connected(work_item_key):
+        if not hub.is_connected(channel_key):
             await self._send_task_complete(
                 task_id, "Session started but its channel did not connect in time.", exit_code=1
             )
@@ -1313,8 +1354,8 @@ class Bridge:
         fut: asyncio.Future = loop.create_future()
         self._pending_session_tasks[event_id := task_id] = fut
         try:
-            await hub.push_event(work_item_key, content, {"event_id": task_id, "kind": kind})
-            mgr.touch(work_item_key)
+            await hub.push_event(channel_key, content, {"event_id": task_id, "kind": kind})
+            mgr.touch(channel_key)
             try:
                 text = await asyncio.wait_for(fut, timeout=timeout_s)
             except asyncio.TimeoutError:
