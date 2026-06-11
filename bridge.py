@@ -1277,6 +1277,19 @@ class Bridge:
         if self._shipper is not None:
             await self._shipper.ship(rec.session_id, status="ended")
 
+    async def _mirror_retry_loop(self) -> None:
+        """Re-ship mirror batches whose status flip failed (network blip at
+        reap time) — the session_ended wake and the Scribe depend on the
+        'ended' flip reaching the platform."""
+        while True:
+            try:
+                n = await self._shipper.retry_pending()
+                if n:
+                    logger.info("Mirror retry: re-shipped %d pending session(s)", n)
+            except Exception:
+                logger.exception("mirror retry loop error")
+            await asyncio.sleep(120)
+
     async def _on_mirror_chat_link(self, session_id: str, chat_id: str) -> None:
         """The platform told us which chat a session projects into. Alias
         that chat id to the session's work item, so a user replying in the
@@ -1417,6 +1430,10 @@ class Bridge:
             try:
                 await self._channel_hub.start()
                 self._session_mgr.start()
+                if self._shipper is not None:
+                    # Retry parked mirror flips: immediately (catches flips
+                    # dropped before a restart) and every 2 minutes.
+                    asyncio.ensure_future(self._mirror_retry_loop())
                 from policy import fetch_platform_policy, apply_platform, apply_local_env
                 fetched = await fetch_platform_policy(
                     AGENT_ROUTER_API_URL, SOCIETY_AI_AUTH_TOKEN, AGENT_NAME

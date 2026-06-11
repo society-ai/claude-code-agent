@@ -237,6 +237,11 @@ class TranscriptShipper:
 
         lock = self._locks.setdefault(session_id, asyncio.Lock())
         async with lock:
+            # A status flip that failed to ship earlier (network blip at
+            # reap time) is retried on the next ship of any kind.
+            if status is None and meta.get("pending_status"):
+                status = meta["pending_status"]
+
             entries, new_pos, new_seq = self._read_new_entries(session_id, meta)
             if not entries and status is None:
                 return True  # nothing new, nothing to flip
@@ -253,12 +258,27 @@ class TranscriptShipper:
                     session_id, meta, chunk, status=status if is_last else None
                 )
                 if not ok:
+                    # Status flips must not be lost — the session_ended wake
+                    # (and the Scribe) depend on them. Park for retry.
+                    if status:
+                        meta["pending_status"] = status
+                        self._save_state()
                     return False
 
             meta["pos"] = new_pos
             meta["seq"] = new_seq
+            meta.pop("pending_status", None)
             self._save_state()
             return True
+
+    async def retry_pending(self) -> int:
+        """Re-ship sessions whose status flip (or delta) failed earlier.
+        Called at bridge start and periodically. Returns retries attempted."""
+        attempted = 0
+        for sid in [s for s, m in self._state.items() if m.get("pending_status")]:
+            attempted += 1
+            await self.ship(sid)
+        return attempted
 
     async def close(self) -> None:
         if self._client is not None:
