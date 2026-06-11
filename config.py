@@ -11,7 +11,7 @@ import os
 import re
 import sys
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 # -- Required / core ---------------------------------------------------------
 
@@ -53,6 +53,14 @@ STATUS_VERBOSITY: str = os.getenv("STATUS_VERBOSITY", "normal").strip().lower()
 # foundation for the supervisor architecture. Opt-in while it matures; the
 # spawn path remains the fallback. Requires standard (non-sandbox) mode.
 SESSION_MODE: bool = os.getenv("SESSION_MODE", "false").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+# Mirror session transcripts to Society AI (the recorded workspace). Only
+# sessions the bridge itself launches are shipped — never the machine
+# owner's own desktop/terminal sessions. Kill switch: MIRROR=false.
+# Only meaningful when SESSION_MODE is on.
+MIRROR_SESSIONS: bool = os.getenv("MIRROR", "true").strip().lower() in (
     "1", "true", "yes", "on",
 )
 

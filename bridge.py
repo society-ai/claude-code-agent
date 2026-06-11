@@ -45,6 +45,7 @@ from config import (
     API_HEADERS,
     EXECUTION_MODE,
     EXTRA_DIRS,
+    MIRROR_SESSIONS,
     SANDBOX_NAME,
     SANDBOX_TIMEOUT,
     SESSION_MODE,
@@ -480,6 +481,7 @@ class Bridge:
         self._session_mode = SESSION_MODE and EXECUTION_MODE != "secured"
         self._channel_hub = None
         self._session_mgr = None
+        self._shipper = None  # transcript mirroring; set below in session mode
         if self._session_mode:
             from channel_hub import ChannelHub
             from session_manager import SessionManager
@@ -498,6 +500,19 @@ class Bridge:
             # event_id -> A2A task_id awaiting the session's reply.
             self._pending_session_tasks: dict[str, str] = {}
             logger.info("SESSION_MODE enabled: work runs in persistent sessions")
+
+            # Transcript mirroring (recorded workspace). Ships per-turn JSONL
+            # deltas of bridge-launched sessions to the platform. MIRROR=false
+            # disables it; spawn mode never mirrors.
+            if MIRROR_SESSIONS:
+                from transcript_shipper import TranscriptShipper
+                self._shipper = TranscriptShipper(
+                    AGENT_ROUTER_API_URL,
+                    SOCIETY_AI_AUTH_TOKEN,
+                    state_dir=os.path.dirname(SOCIETY_AI_BRIDGE_SOCKET) or ".",
+                )
+                self._session_mgr.on_reap = self._on_session_reap
+                logger.info("Session mirroring enabled (MIRROR=false to disable)")
 
         # Sandbox executor for secured mode
         self._sandbox = None
@@ -1220,6 +1235,25 @@ class Bridge:
 
     # -- Session-mode dispatch (v0.7) ----------------------------------------
 
+    async def _on_session_reap(self, rec) -> None:
+        """SessionManager reap callback: ship the final transcript delta and
+        flip the platform mirror to 'ended'."""
+        if self._shipper is not None:
+            await self._shipper.ship(rec.session_id, status="ended")
+
+    async def ipc_mirror_notify(self, params: dict) -> dict:
+        """IPC from the Stop hook: a Claude Code turn ended on this machine.
+        Ships the delta if the session is one the bridge launched; silently
+        ignores everything else (the owner's personal sessions are never
+        mirrored)."""
+        session_id = str(params.get("session_id") or "")
+        if not session_id or self._shipper is None:
+            return {"shipped": False}
+        if not self._shipper.is_registered(session_id):
+            return {"shipped": False}
+        ok = await self._shipper.ship(session_id)
+        return {"shipped": ok}
+
     async def _on_channel_reply(self, session_key: str, event_id: str, text: str) -> None:
         """Called by the ChannelHub when a session replies to a pushed event.
         Resolves the pending future for that event so the dispatching call can
@@ -1244,13 +1278,24 @@ class Bridge:
         hub = self._channel_hub
         # Ensure (launch or resume) the work item's session.
         try:
-            await mgr.ensure_session(work_item_key, AGENT_NAME, title=title)
+            rec = await mgr.ensure_session(work_item_key, AGENT_NAME, title=title)
         except Exception as e:
             logger.exception("Session launch failed for %s", work_item_key)
             await self._send_task_complete(
                 task_id, f"Could not start a session: {type(e).__name__}: {e}", exit_code=1
             )
             return
+
+        # Register the session for transcript mirroring, linked to the work
+        # item that caused it (task vs chat).
+        if self._shipper is not None:
+            self._shipper.register(
+                rec.session_id,
+                cwd=mgr.policy(AGENT_NAME).work_dir,
+                title=title,
+                work_item_kind="task" if kind == "task_assigned" else "chat",
+                work_item_id=work_item_key,
+            )
 
         # Wait briefly for the session's channel to connect (fresh launches
         # connect within ~1-2s; resumes faster).
@@ -1280,6 +1325,10 @@ class Bridge:
             await self._send_task_complete(task_id, text or "(no reply)", exit_code=0)
         finally:
             self._pending_session_tasks.pop(task_id, None)
+            # Ship the turn's transcript delta in the background — never
+            # blocks task completion, and failures only log.
+            if self._shipper is not None:
+                asyncio.ensure_future(self._shipper.ship(rec.session_id))
 
     # -- Main loop -----------------------------------------------------------
 
@@ -1417,6 +1466,7 @@ def main():
         handlers={
             "search_agents": bridge.ipc_search_agents,
             "delegate_task": bridge.ipc_delegate_task,
+            "mirror_notify": bridge.ipc_mirror_notify,
         },
         path=SOCIETY_AI_BRIDGE_SOCKET,
     )
@@ -1474,6 +1524,11 @@ def main():
                 loop.run_until_complete(bridge._channel_hub.stop())
             except Exception as e:
                 logger.warning("Error stopping channel hub: %s", e)
+        if getattr(bridge, "_shipper", None):
+            try:
+                loop.run_until_complete(bridge._shipper.close())
+            except Exception as e:
+                logger.warning("Error closing transcript shipper: %s", e)
         try:
             loop.close()
         except Exception:

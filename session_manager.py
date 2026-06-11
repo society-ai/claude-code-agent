@@ -85,6 +85,10 @@ class SessionManager:
         self._reaper_task: Optional[asyncio.Task] = None
         # process-machine one-time flags
         self._bypass_accepted = False
+        # Optional async callback fired after a session is reaped (idle,
+        # concurrency, or explicit). The bridge uses it to ship the final
+        # transcript delta + flip the platform mirror to 'ended'.
+        self.on_reap = None  # async (SessionRecord) -> None
 
     # -- policy registration --------------------------------------------------
 
@@ -161,6 +165,11 @@ class SessionManager:
             return
         await self._tmux_kill(rec.tmux_name)
         rec.state = "reaped"
+        if self.on_reap is not None:
+            try:
+                await self.on_reap(rec)
+            except Exception:
+                logger.exception("on_reap callback failed for %s", work_item_key)
 
     # -- launching ------------------------------------------------------------
 
