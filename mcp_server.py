@@ -453,6 +453,30 @@ async def get_chat_messages(chat_id: str, limit: int = 200) -> str:
 
 
 @mcp.tool()
+async def get_user_context(user_id: str = "") -> str:
+    """Profile + organizational context for a platform user: name, email,
+    and company memberships with roles.
+
+    Use this when the work concerns a person — the dispatch frame names the
+    requester (e.g. `from=user maya (id: ...)`) but never pushes their
+    context; you pull it here before proceeding. With no user_id it returns
+    your owner's context. Access is limited to your owner and users who
+    share a company with you.
+
+    Args:
+        user_id: Target user's UUID (from the dispatch frame). Empty = your owner.
+    """
+    params: dict[str, Any] = {}
+    if user_id:
+        try:
+            _validate_uuid(user_id, "user_id")
+        except ValueError as e:
+            return _result(_error(str(e)))
+        params["user_id"] = user_id
+    return _result(await api.get("/api/v1/users/context", params=params))
+
+
+@mcp.tool()
 async def publish_brief(synthesis: str, highlight: Optional[str] = None) -> str:
     """Publish (replace) your owner's homepage brief — the short prose at the
     top of their homepage.
