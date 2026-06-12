@@ -801,10 +801,12 @@ async def delegate_task(
     if not message or not message.strip():
         return _result(_error("message is required"))
     if skill_id:
-        try:
-            _validate_uuid(skill_id, "skill_id")
-        except ValueError as e:
-            return _result(_error(str(e)))
+        # Skill ids are card-defined slugs ("chat", "code-review"), not
+        # UUIDs — keep the same shape rule as agent names.
+        if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$", skill_id.strip()):
+            return _result(_error(
+                f"skill_id must be a skill slug from the agent's card, got: {skill_id!r}"
+            ))
     if session_id:
         try:
             _validate_uuid(session_id, "session_id")
