@@ -686,7 +686,7 @@ class Bridge:
 
         elif method == "delegation.result":
             # Two-phase delegation: the hub correlates the result back to
-            # our original tasks/sendSubscribe via `original_id`.
+            # our original agent.send_task via `original_id`.
             original_id_raw = params.get("original_id") if isinstance(params, dict) else None
             original_id = str(original_id_raw) if original_id_raw is not None else None
             if not self._resolve_pending(self._pending_delegations, original_id, params):
@@ -698,10 +698,12 @@ class Bridge:
     # -- Outbound IPC handlers (used by the bridge IPC server) -------------
 
     async def ipc_search_agents(self, params: dict) -> dict:
-        """Run an `agents/search` JSON-RPC request over our WS connection.
+        """Run an `agent.search` JSON-RPC request over our WS connection.
 
         Called by the IPC server on behalf of the MCP server's `search_agents`
         tool. Returns either the hub's search result or a structured error.
+        Hub contract: method `agent.search`, params {query, limit} — the same
+        names the OpenClaw connector uses.
         """
         if not self.ws or not self.registered:
             return {"error": True, "message": "Bridge is not currently connected to the Society AI hub"}
@@ -716,18 +718,22 @@ class Bridge:
         fut = loop.create_future()
         self._pending_requests[req_id] = fut
         try:
-            await self.send_rpc("agents/search", {"q": q.strip(), "limit": limit}, msg_id=req_id)
+            await self.send_rpc("agent.search", {"query": q.strip(), "limit": limit}, msg_id=req_id)
             try:
                 result = await asyncio.wait_for(fut, timeout=30)
             except asyncio.TimeoutError:
-                return {"error": True, "message": "agents/search timed out after 30s"}
+                return {"error": True, "message": "agent.search timed out after 30s"}
             return result if isinstance(result, dict) else {"agents": result}
         finally:
             self._pending_requests.pop(req_id, None)
 
     async def ipc_delegate_task(self, params: dict) -> dict:
-        """Run a `tasks/sendSubscribe` over our WS connection and wait for
+        """Run an `agent.send_task` over our WS connection and wait for
         the asynchronous `delegation.result` notification.
+
+        Hub contract: params {agent_id, message, skill_id (required),
+        session_id?, task_id?}; correlation is the request's JSON-RPC id,
+        echoed back as `original_id` on the delegation.result notification.
 
         Implements the two-phase pattern. Phase 2 (delegation result future)
         is pre-registered BEFORE Phase 1 (request send) to avoid the race
@@ -738,10 +744,20 @@ class Bridge:
 
         agent_name = (params.get("agent_name") or "").strip()
         message = params.get("message")
+        skill_id = (params.get("skill_id") or "").strip()
         if not agent_name:
             return {"error": True, "message": "delegate_task requires 'agent_name'"}
         if not isinstance(message, str) or not message:
             return {"error": True, "message": "delegate_task requires non-empty 'message'"}
+        if not skill_id:
+            return {
+                "error": True,
+                "message": (
+                    "delegate_task requires 'skill_id' — the hub bills and routes "
+                    "by skill. Use search_agents first and pass the target's "
+                    "best_skill_id."
+                ),
+            }
         timeout = int(params.get("timeout", 120))
         timeout = max(5, min(600, timeout))
 
@@ -758,17 +774,17 @@ class Bridge:
         self._pending_requests[req_id] = ack_fut
 
         rpc_params: dict[str, Any] = {
-            "agent_name": agent_name,
+            "agent_id": agent_name,
             "message": message,
-            "original_id": req_id,
+            "skill_id": skill_id,
         }
-        if params.get("skill_id"):
-            rpc_params["skill_id"] = params["skill_id"]
         if params.get("session_id"):
             rpc_params["session_id"] = params["session_id"]
+        if params.get("task_id"):
+            rpc_params["task_id"] = params["task_id"]
 
         try:
-            await self.send_rpc("tasks/sendSubscribe", rpc_params, msg_id=req_id)
+            await self.send_rpc("agent.send_task", rpc_params, msg_id=req_id)
 
             try:
                 ack = await asyncio.wait_for(ack_fut, timeout=15)

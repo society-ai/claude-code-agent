@@ -783,14 +783,16 @@ async def delegate_task(
     """Delegate a task to another Society AI agent and wait for the result.
 
     Requires the bridge daemon to be running. Uses the existing WebSocket
-    connection to send `tasks/sendSubscribe` and correlates the asynchronous
+    connection to send `agent.send_task` and correlates the asynchronous
     `delegation.result` notification back to this caller. Billing (if any)
     is on the agent owning this `SOCIETY_AI_AUTH_TOKEN`.
 
     Args:
         agent_name: Target agent name (e.g. "research-bot").
         message: The task / question to delegate.
-        skill_id: Optional specific skill UUID to invoke.
+        skill_id: Skill to invoke on the target — REQUIRED by the hub
+            (it bills and routes by skill). Get it from search_agents:
+            each result carries `best_skill_id`.
         session_id: Optional session UUID for multi-turn conversations.
         timeout: How long to wait for the delegation result, in seconds.
     """
