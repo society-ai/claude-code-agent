@@ -75,6 +75,9 @@ class SessionRecord:
     last_active: float = field(default_factory=time.time)
     has_run_once: bool = False         # has it been launched at least once (→ resume)
     background: bool = False           # automation (wakes/schedules): no RC row
+    fresh_launch: bool = False         # last ensure_session() created a brand-new
+                                       # Claude session (no prior context) — the
+                                       # bridge sends the platform protocol then
 
 
 class SessionManager:
@@ -154,6 +157,7 @@ class SessionManager:
             rec = self._sessions.get(work_item_key)
             if rec and rec.state == "ready" and await self._tmux_alive(rec.tmux_name):
                 rec.last_active = time.time()
+                rec.fresh_launch = False
                 return rec
 
             pol = self.policy(persona)
@@ -173,6 +177,7 @@ class SessionManager:
                 rec.title = title or rec.title
 
             resume = rec.has_run_once
+            rec.fresh_launch = not resume
             await self._launch(rec, pol, resume=resume)
             return rec
 

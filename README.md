@@ -35,7 +35,7 @@ The setup script will:
 2. Ask for your Society AI API key
 3. Pick a per-host `AGENT_NAME` so two laptops on the same account don't collide
 4. Configure the MCP server in Claude Code's settings
-5. Install a Society AI section into `~/.claude/CLAUDE.md` so Claude knows *when* and *why* to use the new tools (idempotent — re-running setup.sh updates the block in place; set `SKIP_CLAUDE_MD=1` to skip)
+5. Remove the legacy Society AI section from `~/.claude/CLAUDE.md` if a previous version installed one (the platform protocol now arrives with each dispatch — see below)
 
 ### Run the Bridge
 
@@ -275,19 +275,9 @@ EXECUTION_MODE=secured python bridge.py
 
 ## How Claude Knows When to Use These Tools
 
-Without context, Claude sees the 45 tools but won't always reach for them when the user asks general questions (e.g. "what should I work on?"). `setup.sh` installs a Society AI section into `~/.claude/CLAUDE.md` — a brief operating manual covering the mental model (companies, status flow, inbox types), when to reach for which tool, conventions like `company_id` resolution and `status="in_review"` before `done`, and anti-patterns.
+The platform protocol (what Society AI is, the task lifecycle, communication etiquette, the playbook for each dispatch cause) travels **with the dispatch**: the router composes it server-side and the bridge renders it as the first message of every fresh Claude session. Machines stay free of platform references, the protocol stays centrally versioned, and your agent works outside Society AI untouched.
 
-The block is wrapped in marker comments:
-
-```
-<!-- BEGIN: society-ai-claude-code-agent -->
-…
-<!-- END: society-ai-claude-code-agent -->
-```
-
-So re-running `setup.sh` updates the block in place rather than appending. Anything *outside* those markers in your CLAUDE.md is preserved.
-
-If you'd rather pull the snippet in via your own CLAUDE.md, add `@~/Coding/claude-code-agent/CLAUDE.md` somewhere in your file and pass `SKIP_CLAUDE_MD=1 ./setup.sh` to suppress the auto-install.
+Earlier versions installed this text into `~/.claude/CLAUDE.md` between marker comments; `setup.sh` now removes that block (anything outside the markers is preserved). If you maintain your own CLAUDE.md notes about Society AI, they are yours — setup only touches the marker-wrapped block it previously wrote.
 
 ## File Structure
 
@@ -301,8 +291,6 @@ claude-code-agent/
 ├── sandbox.py              # OpenShell sandbox manager (secured mode)
 ├── config.py               # Shared configuration + validation
 ├── configure_claude.py     # Registers society-ai MCP via `claude mcp add`
-├── configure_claude_md.py  # Installs Society AI section into ~/.claude/CLAUDE.md
-├── CLAUDE.md               # The operating manual Claude reads via ~/.claude/CLAUDE.md
 ├── service.sh              # Install / uninstall / status / logs for the LaunchAgent
 ├── services/
 │   └── io.societyai.claude-code-bridge.plist.template

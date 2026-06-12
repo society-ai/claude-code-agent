@@ -211,18 +211,42 @@ fi
 # Use a dedicated Python script to safely handle paths with special characters
 python3 "$REPO_DIR/configure_claude.py"
 
-# 5. Install Society AI section into ~/.claude/CLAUDE.md so Claude knows
-# *when* and *why* to use the new tools — the MCP layer alone only tells
-# it *what* each tool does. Idempotent (marker-wrapped); skips on
-# SKIP_CLAUDE_MD=1 for advanced users who manage CLAUDE.md by hand.
+# 5. Remove the Society AI section from ~/.claude/CLAUDE.md if a previous
+# setup installed one. The platform protocol now travels with dispatches
+# (first message of each fresh session), so machines stay free of platform
+# references and the protocol stays centrally versioned. Only the
+# marker-wrapped block this installer wrote is touched; everything else
+# in the user's CLAUDE.md is preserved.
 echo ""
-echo "[5/7] Installing Society AI section into ~/.claude/CLAUDE.md..."
+echo "[5/7] Removing legacy Society AI section from ~/.claude/CLAUDE.md (if installed)..."
 
-if [ "${SKIP_CLAUDE_MD:-}" = "1" ]; then
-    echo "  Skipped (SKIP_CLAUDE_MD=1)"
-else
-    python3 "$REPO_DIR/configure_claude_md.py" "$REPO_DIR/CLAUDE.md"
-fi
+python3 - << 'PYEOF'
+import os
+
+BEGIN_MARKER = "<!-- BEGIN: society-ai-claude-code-agent -->"
+END_MARKER = "<!-- END: society-ai-claude-code-agent -->"
+
+path = os.path.join(os.path.expanduser("~"), ".claude", "CLAUDE.md")
+try:
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+except FileNotFoundError:
+    print("  Nothing to remove (no ~/.claude/CLAUDE.md)")
+    raise SystemExit(0)
+
+start = content.find(BEGIN_MARKER)
+end = content.find(END_MARKER)
+if start == -1 or end == -1:
+    print("  Nothing to remove (no installed section found)")
+    raise SystemExit(0)
+
+cleaned = (content[:start] + content[end + len(END_MARKER):]).strip()
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    f.write(cleaned + "\n" if cleaned else "")
+os.replace(tmp, path)
+print("  Removed the legacy Society AI section (protocol now arrives with dispatches)")
+PYEOF
 
 # 6. Install Society AI hooks (SessionStart + Stop) so Claude Code gets
 # ambient awareness of open tasks and inbox without needing to remember

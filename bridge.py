@@ -834,11 +834,20 @@ class Bridge:
             elif isinstance(part, str):
                 user_text += part
 
-        # Send-as-supervisor: the platform relays a supervisor-suggested
-        # message the owner approved. Attribute it so the session treats it
-        # as direction from the supervisor, not the owner typing.
+        # Composed dispatch (docs/design/agent-instruction-hierarchy.md):
+        # routers that run the dispatch composer send structured fields —
+        # frame (authenticated facts), blocks (labeled sections), body
+        # (rendered work item), next_steps, protocol. When the frame is
+        # present we render fields and skip every legacy text heuristic;
+        # the legacy path stays as fallback for pre-composer routers and
+        # is deleted when the router's dual-emit window closes.
+        frame = metadata.get("frame") if isinstance(metadata.get("frame"), dict) else None
+
+        # Send-as-supervisor (legacy path only): the platform relays a
+        # supervisor-suggested message the owner approved. Composed
+        # dispatches carry this in the frame (from=supervisor) instead.
         from_supervisor = metadata.get("from_supervisor")
-        if isinstance(from_supervisor, str) and from_supervisor.strip():
+        if frame is None and isinstance(from_supervisor, str) and from_supervisor.strip():
             user_text = (
                 f"[Message from your supervisor ({from_supervisor.strip()}) — "
                 "relayed with your owner's approval. Treat it as direction "
@@ -872,36 +881,64 @@ class Bridge:
                     if self._session_mode:
                         # v0.7: dispatch into a persistent per-work-item session.
                         # Stable key gives task rework continuity (resume same
-                        # session); chat falls back to sessionId/task_id.
+                        # session); chat falls back to sessionId/chat/task_id.
                         work_item_key = (
                             agent_task_id
                             or params.get("sessionId")
                             or metadata.get("chat_id")
                             or task_id
                         )
-                        is_background = bool(agent_task_id) or user_text.lstrip().startswith("[Trigger:")
-                        primer = (
-                            self._bridge_context_primer_background(trigger_reason="task")
-                            if is_background
-                            else self._bridge_context_primer_chat(work_item_key, 0)
-                        )
-                        content = primer + instructions_block + user_text
-                        title = self._derive_session_title(user_text)
-                        stripped = user_text.lstrip()
-                        if agent_task_id and (
-                            stripped.startswith("[Trigger: task_assigned]")
-                            or not stripped.startswith("[Trigger:")
-                        ):
-                            kind = "task_assigned"   # real work on the task
-                        elif is_background:
-                            # Status echoes (task_in_review etc.) and wakes are
-                            # automation — 'trigger' kind keeps them out of the
-                            # task's Sessions list and wake marking.
-                            kind = "trigger"
+                        protocol_text = ""
+                        if frame is not None:
+                            # v0.10: everything derives from frame FIELDS —
+                            # no text sniffing. Session kind comes from the
+                            # cause: task work (assignee/reviewer) is a real
+                            # work session; messages are chats; wakes, status
+                            # notifications and inbox pings are automation
+                            # ('trigger' keeps them out of Sessions lists and
+                            # never re-wakes the supervisor).
+                            cause = str(frame.get("cause") or "message")
+                            role = frame.get("role")
+                            body = metadata.get("body")
+                            work_text = body if isinstance(body, str) and body.strip() else user_text
+                            if (
+                                cause == "task"
+                                and agent_task_id
+                                and role in ("assignee", "reviewer")
+                            ):
+                                kind = "task_assigned"
+                            elif cause == "message":
+                                kind = "chat"
+                            else:
+                                kind = "trigger"
+                            content = self._render_composed_prompt(metadata, frame, work_text)
+                            protocol_text = self._protocol_text(metadata)
+                            title = self._derive_session_title(work_text)
                         else:
-                            kind = "chat"
+                            # Legacy fallback (pre-composer router): sniff
+                            # mode from text, prepend primers. Delete when
+                            # the router dual-emit window closes.
+                            is_background = bool(agent_task_id) or user_text.lstrip().startswith("[Trigger:")
+                            primer = (
+                                self._bridge_context_primer_background(trigger_reason="task")
+                                if is_background
+                                else self._bridge_context_primer_chat(work_item_key, 0)
+                            )
+                            content = primer + instructions_block + user_text
+                            title = self._derive_session_title(user_text)
+                            stripped = user_text.lstrip()
+                            if agent_task_id and (
+                                stripped.startswith("[Trigger: task_assigned]")
+                                or not stripped.startswith("[Trigger:")
+                            ):
+                                kind = "task_assigned"   # real work on the task
+                            elif is_background:
+                                kind = "trigger"
+                            else:
+                                kind = "chat"
                         await self._execute_via_session(
                             task_id, str(work_item_key), title, content, kind=kind,
+                            protocol_text=protocol_text,
                         )
                     elif agent_task_id and company_id:
                         # AgentOrg trigger flow — full context + Claude Code spawn
@@ -949,6 +986,54 @@ class Bridge:
             for k in drop:
                 self._chat_history.pop(k, None)
                 self._task_locks.pop(k, None)
+
+    @staticmethod
+    def _protocol_text(metadata: dict) -> str:
+        """The L1 platform protocol from a composed dispatch ('' if absent).
+
+        Session-scoped standing text: rendered once per fresh Claude
+        session (the session's own transcript carries it across resumes),
+        never re-sent into a warm session.
+        """
+        proto = metadata.get("protocol")
+        if isinstance(proto, dict):
+            text = proto.get("text")
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+        return ""
+
+    @staticmethod
+    def _render_composed_prompt(metadata: dict, frame: dict, work_text: str) -> str:
+        """Render a composed dispatch into the session prompt, per the
+        assembly contract of the instruction-hierarchy spec:
+
+            blocks (labeled sections) -> frame line -> body -> [Next steps]
+
+        The protocol is NOT included here — it is prepended only on fresh
+        launches (see _execute_via_session). Every field is shape-checked;
+        a malformed section is dropped, never fatal.
+        """
+        parts: list[str] = []
+        for block in metadata.get("blocks") or []:
+            if not isinstance(block, dict):
+                continue
+            text = block.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            label = block.get("label")
+            if isinstance(label, str) and label.strip():
+                parts.append(f"[{label.strip()}]\n{text.strip()}")
+            else:
+                parts.append(text.strip())
+        rendered_frame = frame.get("rendered")
+        if isinstance(rendered_frame, str) and rendered_frame.strip():
+            parts.append(rendered_frame.strip())
+        if work_text.strip():
+            parts.append(work_text.strip())
+        next_steps = metadata.get("next_steps")
+        if isinstance(next_steps, str) and next_steps.strip():
+            parts.append("[Next steps]\n" + next_steps.strip())
+        return "\n\n".join(parts)
 
     @staticmethod
     def _format_instructions_block(
@@ -1342,6 +1427,7 @@ class Bridge:
         content: str,
         kind: str,
         timeout_s: float = 600.0,
+        protocol_text: str = "",
     ) -> None:
         """Dispatch a work item into a persistent session and wait for its
         reply, then complete the A2A task. The event_id we send IS the A2A
@@ -1362,6 +1448,12 @@ class Bridge:
                 task_id, f"Could not start a session: {type(e).__name__}: {e}", exit_code=1
             )
             return
+
+        # L1 platform protocol: session-scoped standing text. A fresh
+        # launch has no context — lead with the protocol; resumes and warm
+        # sessions already carry it in their transcript.
+        if protocol_text and getattr(rec, "fresh_launch", False):
+            content = protocol_text + "\n\n" + content
 
         # Register the session for transcript mirroring, linked to the work
         # item that caused it. 'task' = a real platform task (agent_task_id);
