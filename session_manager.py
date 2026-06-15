@@ -62,6 +62,12 @@ class PersonaPolicy:
     idle_reap_minutes: int = 15
     max_concurrent: int = 3
     permission_mode: str = "default"   # 'default' | 'acceptEdits' | 'bypassPermissions'
+    # Per-agent environment injected into each spawned `claude` session so it
+    # acts as THIS agent (token, name, IPC socket). Critical when many agents
+    # share one process (the harness): the session's society-ai MCP reads
+    # these from its environment, so they must be the agent's, not the
+    # process-wide defaults. Empty in the single-agent case (inherits env).
+    session_env: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -245,9 +251,15 @@ class SessionManager:
         # preview. A packaged plugin + --channels replaces this post-GA.
         cmd += ["--dangerously-load-development-channels", "server:society-ai-channel"]
 
-        # Launch detached in tmux, cwd = persona work dir.
+        # Launch detached in tmux, cwd = persona work dir. Per-agent env is
+        # injected as inline assignments on the exec so the spawned claude
+        # (and its society-ai MCP) act as THIS agent — essential when many
+        # agents share one harness process.
         cwd = pol.work_dir
-        shell_cmd = f"cd {_shq(cwd)} && exec " + " ".join(_shq(c) for c in cmd)
+        env_prefix = "".join(
+            f"{k}={_shq(str(v))} " for k, v in (pol.session_env or {}).items() if v
+        )
+        shell_cmd = f"cd {_shq(cwd)} && {env_prefix}exec " + " ".join(_shq(c) for c in cmd)
         await self._tmux_kill(rec.tmux_name)  # idempotent
         proc = await asyncio.create_subprocess_exec(
             "tmux", "new-session", "-d", "-s", rec.tmux_name,

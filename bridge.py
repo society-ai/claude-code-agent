@@ -37,6 +37,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 import bridge_ipc
+from dataclasses import dataclass, field
 from config import (
     AGENT_ROUTER_API_URL,
     SOCIETY_AI_AUTH_TOKEN,
@@ -243,7 +244,15 @@ Do the work, then report your results."""
 async def stream_claude_code(
     prompt: str,
     on_event: "Callable[[dict], Awaitable[None]]",
+    *,
+    work_dir: str | None = None,
+    extra_dirs: list[str] | None = None,
 ) -> tuple[int, str, str | None, bool]:
+    # Per-agent dirs when called from a harness runner; fall back to the
+    # process globals for the single-agent / legacy case.
+    work_dir = work_dir or WORK_DIR
+    if extra_dirs is None:
+        extra_dirs = EXTRA_DIRS
     """Spawn `claude -p --output-format stream-json` and forward each
     parsed event to `on_event` as it arrives.
 
@@ -272,10 +281,10 @@ async def stream_claude_code(
         # and file ops are still scoped by WORK_DIR + EXTRA_DIRS.
         "--permission-mode", "bypassPermissions",
     ]
-    for extra_dir in EXTRA_DIRS:
+    for extra_dir in extra_dirs:
         cmd.extend(["--add-dir", extra_dir])
 
-    logger.info("Spawning Claude Code (streaming) in %s", WORK_DIR)
+    logger.info("Spawning Claude Code (streaming) in %s", work_dir)
     # asyncio.StreamReader's default line buffer is 64 KiB. Claude Code's
     # stream-json events can blow past that for a single line — a tool_result
     # carrying a 50 KB file becomes >80 KB after JSON escaping, and a Read on
@@ -286,7 +295,7 @@ async def stream_claude_code(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        cwd=WORK_DIR,
+        cwd=work_dir,
         limit=16 * 1024 * 1024,
     )
 
@@ -446,13 +455,62 @@ async def run_claude_code(
 
 # -- WebSocket Bridge ---------------------------------------------------------
 
+@dataclass
+class AgentContext:
+    """Everything that makes a bridge runner act AS one specific agent.
+
+    Single-agent: built from the process env (`from_env`). Harness: each
+    agent on the machine gets its own, built from its `.env` file. This is
+    the unit that decouples 'which agent' (token + identity + local file
+    access) from the shared execution machinery.
+    """
+    name: str
+    token: str
+    work_dir: str
+    extra_dirs: list[str]
+    company_id: str
+    socket: str        # this agent's IPC socket path
+    state_dir: str     # shipper state + channel sock live here (= dirname(socket))
+
+    @classmethod
+    def from_env(cls) -> "AgentContext":
+        """The single agent defined by the process environment (the default
+        persona / back-compat path)."""
+        return cls(
+            name=AGENT_NAME,
+            token=SOCIETY_AI_AUTH_TOKEN,
+            work_dir=WORK_DIR,
+            extra_dirs=list(EXTRA_DIRS),
+            company_id=COMPANY_ID,
+            socket=SOCIETY_AI_BRIDGE_SOCKET,
+            state_dir=os.path.dirname(SOCIETY_AI_BRIDGE_SOCKET) or ".",
+        )
+
+    def session_env(self) -> dict:
+        """Env injected into each spawned `claude` so its society-ai MCP acts
+        as this agent (not the process default). Used by the harness."""
+        return {
+            "SOCIETY_AI_AUTH_TOKEN": self.token,
+            "AGENT_NAME": self.name,
+            "COMPANY_ID": self.company_id or "",
+            "SOCIETY_AI_BRIDGE_SOCKET": self.socket,
+        }
+
+
 class Bridge:
-    def __init__(self):
+    def __init__(self, ctx: "AgentContext | None" = None, scheduler: "asyncio.Semaphore | None" = None):
+        # ctx carries this runner's agent identity + local file access.
+        # Default to the process env so single-agent / existing callers work
+        # unchanged. `scheduler` is the SHARED machine-wide concurrency gate
+        # when running under a harness; standalone gets its own.
+        self.ctx = ctx or AgentContext.from_env()
         self.ws = None
         self.registered = False
         self.running = True
         self._active_tasks: set[str] = set()
-        self._semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
+        # Shared scheduler = machine-wide concurrency cap across ALL agents in
+        # a harness. Standalone falls back to a private per-agent cap.
+        self._semaphore = scheduler or asyncio.Semaphore(MAX_CONCURRENT_TASKS)
         self._msg_counter = 0
         self._ws_jwt: str | None = None
         # Per-task chat conversation history. Each entry is a list of
@@ -487,16 +545,17 @@ class Bridge:
             from channel_hub import ChannelHub
             from session_manager import SessionManager
             from policy import default_policy, apply_local_env
-            # Channel hub socket lives beside the IPC socket, per-bridge.
-            hub_sock = os.path.join(
-                os.path.dirname(SOCIETY_AI_BRIDGE_SOCKET) or ".", "channels.sock"
-            )
+            # Channel hub socket lives beside this agent's IPC socket.
+            hub_sock = os.path.join(self.ctx.state_dir, "channels.sock")
             self._channel_hub = ChannelHub(hub_sock, self._on_channel_reply)
             self._session_mgr = SessionManager(hub_sock)
-            # Register this persona's policy (defaults + local env override now;
+            # Register this agent's policy (defaults + local env override now;
             # platform-fetched config is overlaid in run() once connected).
-            pol = default_policy(AGENT_NAME, WORK_DIR, list(EXTRA_DIRS))
-            apply_local_env(pol, AGENT_NAME)
+            # session_env makes every spawned claude act as THIS agent — the
+            # critical bit when many agents share one harness process.
+            pol = default_policy(self.ctx.name, self.ctx.work_dir, list(self.ctx.extra_dirs))
+            apply_local_env(pol, self.ctx.name)
+            pol.session_env = self.ctx.session_env()
             self._session_mgr.set_policy(pol)
             # event_id -> A2A task_id awaiting the session's reply.
             self._pending_session_tasks: dict[str, str] = {}
@@ -509,8 +568,8 @@ class Bridge:
                 from transcript_shipper import TranscriptShipper
                 self._shipper = TranscriptShipper(
                     AGENT_ROUTER_API_URL,
-                    SOCIETY_AI_AUTH_TOKEN,
-                    state_dir=os.path.dirname(SOCIETY_AI_BRIDGE_SOCKET) or ".",
+                    self.ctx.token,
+                    state_dir=self.ctx.state_dir,
                     level=MIRROR_LEVEL,
                 )
                 self._session_mgr.on_reap = self._on_session_reap
@@ -530,15 +589,15 @@ class Bridge:
                 sys.exit(1)
             from config import ENABLE_AGENT_LIFECYCLE
             sandbox_env = {
-                "SOCIETY_AI_AUTH_TOKEN": SOCIETY_AI_AUTH_TOKEN,
+                "SOCIETY_AI_AUTH_TOKEN": self.ctx.token,
                 "AGENT_ROUTER_API_URL": AGENT_ROUTER_API_URL,
-                "AGENT_NAME": AGENT_NAME,
-                "COMPANY_ID": COMPANY_ID,
+                "AGENT_NAME": self.ctx.name,
+                "COMPANY_ID": self.ctx.company_id,
             }
             if ENABLE_AGENT_LIFECYCLE:
                 sandbox_env["ENABLE_AGENT_LIFECYCLE"] = "true"
             self._sandbox = SandboxManager(
-                work_dir=WORK_DIR,
+                work_dir=self.ctx.work_dir,
                 env_vars=sandbox_env,
                 sandbox_name=SANDBOX_NAME,
                 timeout=SANDBOX_TIMEOUT,
@@ -577,7 +636,7 @@ class Bridge:
         so we don't need a proactive refresh loop. If the connection drops,
         the next reconnect attempt fetches a fresh JWT.
         """
-        self._ws_jwt = await exchange_api_key_for_jwt(SOCIETY_AI_AUTH_TOKEN)
+        self._ws_jwt = await exchange_api_key_for_jwt(self.ctx.token)
 
     async def register(self):
         """Register this agent with the hub using the WS JWT."""
@@ -586,7 +645,7 @@ class Bridge:
         await self.send_rpc(
             "agent.register",
             {
-                "agent_name": AGENT_NAME,
+                "agent_name": self.ctx.name,
                 "auth_token": self._ws_jwt,
                 "visibility": "private",
             },
@@ -665,7 +724,7 @@ class Bridge:
             if isinstance(result, dict) and "registered" in result:
                 if result["registered"]:
                     self.registered = True
-                    logger.info("Registered as %s", result.get("agent_id", AGENT_NAME))
+                    logger.info("Registered as %s", result.get("agent_id", self.ctx.name))
                 else:
                     logger.error("Registration failed: %s", result.get("error"))
             return
@@ -821,7 +880,7 @@ class Bridge:
         """
         task_id = params.get("id", msg_id or str(uuid.uuid4()))
         metadata = params.get("metadata", {}) or {}
-        company_id = metadata.get("company_id") or COMPANY_ID
+        company_id = metadata.get("company_id") or self.ctx.company_id
         agent_task_id = metadata.get("agent_task_id")
 
         # Persona context injected by the platform on every dispatch
@@ -1228,7 +1287,8 @@ class Bridge:
             return
 
         on_event = await self._stream_to_status_updates(task_id)
-        exit_code, output, _session, had_error = await stream_claude_code(prompt, on_event)
+        exit_code, output, _session, had_error = await stream_claude_code(
+            prompt, on_event, work_dir=self.ctx.work_dir, extra_dirs=self.ctx.extra_dirs)
         mapper: StreamMapper = on_event.__mapper__  # type: ignore[attr-defined]
 
         result_text = (output or "").strip() or (mapper.final_text() or "I couldn't generate a response.")
@@ -1291,7 +1351,8 @@ class Bridge:
             await self._send_task_complete(task_id, result_text, exit_code)
         else:
             on_event = await self._stream_to_status_updates(task_id)
-            exit_code, output, _session, had_error = await stream_claude_code(prompt, on_event)
+            exit_code, output, _session, had_error = await stream_claude_code(
+            prompt, on_event, work_dir=self.ctx.work_dir, extra_dirs=self.ctx.extra_dirs)
             mapper: StreamMapper = on_event.__mapper__  # type: ignore[attr-defined]
             result_text = (
                 (output or "").strip()
@@ -1441,7 +1502,7 @@ class Bridge:
         ws_connected = bool(self.ws) and getattr(self.ws, "close_code", None) is None
         return {
             "version": __version__,
-            "agent_name": AGENT_NAME,
+            "agent_name": self.ctx.name,
             "pid": os.getpid(),
             "ws_connected": ws_connected,
             "registered": bool(self.registered),
@@ -1451,8 +1512,8 @@ class Bridge:
                 "mirror": MIRROR_SESSIONS,
                 "mirror_level": MIRROR_LEVEL,
                 "execution_mode": EXECUTION_MODE,
-                "work_dir": WORK_DIR,
-                "extra_dirs": list(EXTRA_DIRS),
+                "work_dir": self.ctx.work_dir,
+                "extra_dirs": list(self.ctx.extra_dirs),
             },
             "active_tasks": len(getattr(self, "_active_tasks", []) or []),
             "pending_session_tasks": len(getattr(self, "_pending_session_tasks", {}) or {}),
@@ -1504,7 +1565,7 @@ class Bridge:
         # Control sidebar row.
         try:
             rec = await mgr.ensure_session(
-                work_item_key, AGENT_NAME, title=title,
+                work_item_key, self.ctx.name, title=title,
                 background=(kind == "trigger"),
             )
         except Exception as e:
@@ -1534,7 +1595,7 @@ class Bridge:
                 wi_kind = "trigger"
             self._shipper.register(
                 rec.session_id,
-                cwd=mgr.policy(AGENT_NAME).work_dir,
+                cwd=mgr.policy(self.ctx.name).work_dir,
                 title=title,
                 work_item_kind=wi_kind,
                 work_item_id=work_item_key,
@@ -1605,13 +1666,14 @@ class Bridge:
                     asyncio.ensure_future(self._mirror_retry_loop())
                 from policy import fetch_platform_policy, apply_platform, apply_local_env
                 fetched = await fetch_platform_policy(
-                    AGENT_ROUTER_API_URL, SOCIETY_AI_AUTH_TOKEN, AGENT_NAME
+                    AGENT_ROUTER_API_URL, self.ctx.token, self.ctx.name
                 )
                 if fetched:
-                    pol = self._session_mgr.policy(AGENT_NAME)
+                    pol = self._session_mgr.policy(self.ctx.name)
                     apply_platform(pol, fetched)
-                    apply_local_env(pol, AGENT_NAME)  # local always wins
-                    logger.info("Applied platform policy for %s", AGENT_NAME)
+                    apply_local_env(pol, self.ctx.name)  # local always wins
+                    pol.session_env = self.ctx.session_env()  # keep per-agent env
+                    logger.info("Applied platform policy for %s", self.ctx.name)
             except Exception:
                 logger.exception("Session-mode startup failed; falling back to spawn path")
                 self._session_mode = False
@@ -1687,112 +1749,202 @@ class Bridge:
         logger.info("Shutting down...")
 
 
+# -- Roster + Harness ---------------------------------------------------------
+
+def _read_env_file(path: str) -> dict:
+    """Minimal KEY=value parser for a persona .env file."""
+    out: dict[str, str] = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#") or "=" not in s:
+                    continue
+                if s.startswith("export "):
+                    s = s[len("export "):]
+                k, _, v = s.partition("=")
+                k, v = k.strip(), v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                    v = v[1:-1]
+                out[k] = v
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def _context_from_env_file(repo_dir: str, env_file: str, persona_arg: str) -> "AgentContext | None":
+    env = _read_env_file(os.path.join(repo_dir, env_file))
+    name = (env.get("AGENT_NAME") or "").strip()
+    token = (env.get("SOCIETY_AI_AUTH_TOKEN") or "").strip()
+    if not name or not token:
+        return None
+    cache = os.path.join(os.path.expanduser("~"), ".cache", "society-ai")
+    socket = env.get("SOCIETY_AI_BRIDGE_SOCKET") or (
+        os.path.join(cache, "bridge.sock") if not persona_arg
+        else os.path.join(cache, persona_arg, "bridge.sock")
+    )
+    extra = [d.strip() for d in (env.get("EXTRA_DIRS") or "").split(",") if d.strip()]
+    return AgentContext(
+        name=name, token=token,
+        work_dir=env.get("WORK_DIR") or os.getcwd(),
+        extra_dirs=extra, company_id=env.get("COMPANY_ID", ""),
+        socket=socket, state_dir=os.path.dirname(socket) or ".",
+    )
+
+
+def discover_roster() -> "list[AgentContext]":
+    """Build the machine's agent roster from .env / .env.<persona> files —
+    the same files the per-persona installs and the status panel use."""
+    repo = os.path.dirname(os.path.abspath(__file__))
+    roster: list[AgentContext] = []
+    for entry in sorted(os.listdir(repo)):
+        if entry == ".env":
+            persona_arg = ""
+        elif entry.startswith(".env.") and entry not in (".env.example", ".env.defaults"):
+            persona_arg = entry[len(".env."):]
+            if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,62}", persona_arg):
+                continue
+        else:
+            continue
+        ctx = _context_from_env_file(repo, entry, persona_arg)
+        if ctx:
+            roster.append(ctx)
+    return roster
+
+
+async def _teardown_bridge(bridge: "Bridge") -> None:
+    """Per-agent graceful teardown: park ended flips, stop session infra so
+    the next start ships the sessions and the Scribe still learns they ended."""
+    if bridge._sandbox:
+        try:
+            await bridge._sandbox.stop()
+        except Exception as e:
+            logger.warning("sandbox stop (%s): %s", bridge.ctx.name, e)
+    if getattr(bridge, "_session_mgr", None):
+        if getattr(bridge, "_shipper", None):
+            try:
+                for rec in list(bridge._session_mgr._sessions.values()):
+                    if rec.state == "ready":
+                        bridge._shipper.park_status(rec.session_id, "ended")
+            except Exception as e:
+                logger.warning("park ended flips (%s): %s", bridge.ctx.name, e)
+        try:
+            await bridge._session_mgr.stop()
+        except Exception as e:
+            logger.warning("session mgr stop (%s): %s", bridge.ctx.name, e)
+    if getattr(bridge, "_channel_hub", None):
+        try:
+            await bridge._channel_hub.stop()
+        except Exception as e:
+            logger.warning("channel hub stop (%s): %s", bridge.ctx.name, e)
+    if getattr(bridge, "_shipper", None):
+        try:
+            await bridge._shipper.close()
+        except Exception as e:
+            logger.warning("shipper close (%s): %s", bridge.ctx.name, e)
+
+
+class Harness:
+    """Runs every agent on this machine in one supervised process. Each agent
+    gets its own hub connection + IPC socket (identity plane); all share ONE
+    scheduler — the machine-wide concurrency cap (execution plane). A failure
+    in one agent's connection is isolated and doesn't tear down the others."""
+
+    def __init__(self, roster: "list[AgentContext]", machine_cap: int):
+        self.roster = roster
+        self.machine_cap = machine_cap
+        self.bridges: list[Bridge] = []
+        self.ipc_servers: list = []
+        self._scheduler = None
+
+    async def run(self) -> None:
+        self._scheduler = asyncio.Semaphore(self.machine_cap)
+        for ctx in self.roster:
+            b = Bridge(ctx, scheduler=self._scheduler)
+            self.bridges.append(b)
+            ipc = bridge_ipc.IPCServer(
+                handlers={
+                    "search_agents": b.ipc_search_agents,
+                    "delegate_task": b.ipc_delegate_task,
+                    "mirror_notify": b.ipc_mirror_notify,
+                    "status": b.ipc_status,
+                    "reap_session": b.ipc_reap_session,
+                },
+                path=ctx.socket,
+            )
+            try:
+                await ipc.start()
+            except Exception as e:
+                logger.error("IPC server for %s failed to start: %s", ctx.name, e)
+            self.ipc_servers.append(ipc)
+            logger.info("Harness: agent %s online (socket=%s)", ctx.name, ctx.socket)
+        await asyncio.gather(*(b.run() for b in self.bridges), return_exceptions=True)
+
+    def stop(self) -> None:
+        for b in self.bridges:
+            b.stop()
+
+    async def shutdown(self) -> None:
+        for ipc in self.ipc_servers:
+            try:
+                await ipc.stop()
+            except Exception as e:
+                logger.warning("IPC server stop: %s", e)
+        for b in self.bridges:
+            await _teardown_bridge(b)
+        try:
+            await _close_http_client()
+        except Exception as e:
+            logger.warning("HTTP client cleanup: %s", e)
+
+
 # -- Entry point --------------------------------------------------------------
 
 def main():
-    if not SOCIETY_AI_AUTH_TOKEN:
-        print("Error: SOCIETY_AI_AUTH_TOKEN is required.", file=sys.stderr)
-        print("Get your API key at https://societyai.com and set it:", file=sys.stderr)
-        print("  export SOCIETY_AI_AUTH_TOKEN=sai_...", file=sys.stderr)
-        print("  python bridge.py", file=sys.stderr)
-        sys.exit(2)
-
-    if not SOCIETY_AI_AUTH_TOKEN.startswith("sai_"):
+    roster = discover_roster()
+    if not roster:
         print(
-            "Warning: SOCIETY_AI_AUTH_TOKEN does not start with 'sai_' — "
-            "this may not be a valid Society AI API key.",
+            "Error: no agents found. Set SOCIETY_AI_AUTH_TOKEN + AGENT_NAME in "
+            ".env (or add personas with ./setup.sh --persona <name>).",
             file=sys.stderr,
         )
+        sys.exit(2)
 
-    logger.info("claude-code-agent bridge v%s starting (agent=%s, mode=%s)",
-                __version__, AGENT_NAME, EXECUTION_MODE)
+    # Machine-wide concurrency cap across ALL agents (overridable). This is
+    # the bounded-parallelism limit a single per-agent process can't enforce.
+    machine_cap = max(1, int(os.getenv("MAX_CONCURRENT_MACHINE", "8")))
+    logger.info(
+        "claude-code-agent harness v%s — %d agent(s): %s (mode=%s, machine cap=%d)",
+        __version__, len(roster), ", ".join(c.name for c in roster),
+        EXECUTION_MODE, machine_cap,
+    )
 
-    bridge = Bridge()
+    harness = Harness(roster, machine_cap)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    # IPC server: lets the in-Claude-Code MCP server call back into the
-    # bridge for search_agents / delegate_task. Started before the WS loop
-    # so it survives reconnects, and stopped in the finally block below.
-    ipc = bridge_ipc.IPCServer(
-        handlers={
-            "search_agents": bridge.ipc_search_agents,
-            "delegate_task": bridge.ipc_delegate_task,
-            "mirror_notify": bridge.ipc_mirror_notify,
-            "status": bridge.ipc_status,
-            "reap_session": bridge.ipc_reap_session,
-        },
-        path=SOCIETY_AI_BRIDGE_SOCKET,
-    )
-
     def handle_signal(sig, _):
         logger.info("Received signal %s", sig)
-        bridge.stop()
+        harness.stop()
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
     try:
-        loop.run_until_complete(ipc.start())
-    except Exception as e:
-        logger.error("Failed to start IPC server: %s", e)
-        # IPC is best-effort — delegation/search will fail with a clear
-        # error from the MCP side, but the bridge can still process
-        # inbound tasks. Continue.
-
-    try:
-        loop.run_until_complete(bridge.run())
+        loop.run_until_complete(harness.run())
     except KeyboardInterrupt:
-        bridge.stop()
+        harness.stop()
     finally:
-        # Give in-flight tasks a brief moment to finish their writes.
-        if bridge._active_tasks:
-            logger.info("Waiting for %d active tasks...", len(bridge._active_tasks))
+        if any(b._active_tasks for b in harness.bridges):
+            logger.info("Waiting for in-flight tasks...")
             try:
                 loop.run_until_complete(asyncio.sleep(2))
             except Exception:
                 pass
         try:
-            loop.run_until_complete(ipc.stop())
+            loop.run_until_complete(harness.shutdown())
         except Exception as e:
-            logger.warning("Error stopping IPC server: %s", e)
-        try:
-            loop.run_until_complete(_close_http_client())
-        except Exception as e:
-            logger.warning("Error during HTTP client cleanup: %s", e)
-        if bridge._sandbox:
-            try:
-                loop.run_until_complete(bridge._sandbox.stop())
-            except Exception as e:
-                logger.warning("Error stopping sandbox: %s", e)
-        # Tear down session-mode infrastructure (kills tmux sessions, removes
-        # the hub socket). Sessions themselves persist as transcripts on disk
-        # and can be resumed on the next launch.
-        if getattr(bridge, "_session_mgr", None):
-            # Shutdown kills the tmux sessions without reap callbacks —
-            # park their 'ended' flips so the next start ships them and
-            # the platform (and the Scribe) still learn the sessions ended.
-            if getattr(bridge, "_shipper", None):
-                try:
-                    for rec in list(bridge._session_mgr._sessions.values()):
-                        if rec.state == "ready":
-                            bridge._shipper.park_status(rec.session_id, "ended")
-                except Exception as e:
-                    logger.warning("Could not park ended flips at shutdown: %s", e)
-            try:
-                loop.run_until_complete(bridge._session_mgr.stop())
-            except Exception as e:
-                logger.warning("Error stopping session manager: %s", e)
-        if getattr(bridge, "_channel_hub", None):
-            try:
-                loop.run_until_complete(bridge._channel_hub.stop())
-            except Exception as e:
-                logger.warning("Error stopping channel hub: %s", e)
-        if getattr(bridge, "_shipper", None):
-            try:
-                loop.run_until_complete(bridge._shipper.close())
-            except Exception as e:
-                logger.warning("Error closing transcript shipper: %s", e)
+            logger.warning("Harness shutdown error: %s", e)
         try:
             loop.close()
         except Exception:
