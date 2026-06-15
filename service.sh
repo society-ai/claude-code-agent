@@ -48,6 +48,8 @@ Commands:
              Auto-starts at login. Auto-restarts on crash.
   uninstall  Stop the LaunchAgent and remove the plist.
   status     Show whether the agent is loaded and the bridge process state.
+  start      Connect: bring the agent online (keeps the plist).
+  stop       Disconnect: take the agent offline (keeps the plist).
   restart    Stop and re-start the LaunchAgent (e.g. after editing .env).
   logs       Tail the bridge log (Ctrl-C to exit).
   list       List all installed bridge LaunchAgents (all personas).
@@ -207,6 +209,40 @@ cmd_restart() {
     fi
 }
 
+# Disconnect: take the agent offline (bootout) but KEEP the plist, so it
+# stays down until 'start' (a plain stop would let KeepAlive resurrect it).
+cmd_stop() {
+    require_macos
+    if is_loaded; then
+        echo "  Disconnecting (unloading) $LABEL..."
+        launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || \
+            launchctl unload "$PLIST_PATH" 2>/dev/null || true
+        echo "  Offline. Bring it back with: $0 start ${PERSONA}"
+    else
+        echo "  Already offline (not loaded)."
+    fi
+}
+
+# Connect: bring the agent back online by bootstrapping its existing plist.
+cmd_start() {
+    require_macos
+    if is_loaded; then
+        echo "  Already online — ensuring the process is running..."
+        launchctl kickstart "gui/$(id -u)/$LABEL" 2>/dev/null || true
+        cmd_status
+        return
+    fi
+    if [ ! -f "$PLIST_PATH" ]; then
+        echo "  Not installed yet. Run: $0 install ${PERSONA}" >&2
+        exit 1
+    fi
+    echo "  Connecting (loading) $LABEL..."
+    launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null || \
+        launchctl load "$PLIST_PATH" 2>/dev/null || true
+    sleep 1
+    cmd_status
+}
+
 cmd_logs() {
     # Python's `logging` writes to stderr by default, so the bridge's
     # operational log lines land in bridge.err.log, not bridge.log.
@@ -251,6 +287,8 @@ case "${1:-}" in
     install)   cmd_install ;;
     uninstall) cmd_uninstall ;;
     status)    cmd_status ;;
+    start)     cmd_start ;;
+    stop)      cmd_stop ;;
     restart)   cmd_restart ;;
     logs)      cmd_logs ;;
     list)      cmd_list ;;

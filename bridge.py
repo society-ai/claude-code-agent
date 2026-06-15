@@ -1427,6 +1427,55 @@ class Bridge:
         ok = await self._shipper.ship(session_id)
         return {"shipped": ok}
 
+    async def ipc_status(self, params: dict) -> dict:
+        """Live in-process state for the local status panel (localhost only,
+        via the bridge's unix socket). No secrets, no transcript content —
+        connection health, effective config, and the live session list."""
+        sessions: list[dict] = []
+        if self._session_mgr is not None:
+            try:
+                sessions = self._session_mgr.snapshot()
+            except Exception as e:
+                logger.warning("status snapshot failed: %s", e)
+
+        ws_connected = bool(self.ws) and getattr(self.ws, "close_code", None) is None
+        return {
+            "version": __version__,
+            "agent_name": AGENT_NAME,
+            "pid": os.getpid(),
+            "ws_connected": ws_connected,
+            "registered": bool(self.registered),
+            "api_url": AGENT_ROUTER_API_URL,
+            "config": {
+                "session_mode": self._session_mode,
+                "mirror": MIRROR_SESSIONS,
+                "mirror_level": MIRROR_LEVEL,
+                "execution_mode": EXECUTION_MODE,
+                "work_dir": WORK_DIR,
+                "extra_dirs": list(EXTRA_DIRS),
+            },
+            "active_tasks": len(getattr(self, "_active_tasks", []) or []),
+            "pending_session_tasks": len(getattr(self, "_pending_session_tasks", {}) or {}),
+            "sessions": sessions,
+        }
+
+    async def ipc_reap_session(self, params: dict) -> dict:
+        """Reap (kill + ship-ended) a single live session by work-item key.
+        Lets the panel clear a stuck session without restarting the bridge."""
+        key = str(params.get("work_item_key") or "").strip()
+        if not key:
+            return {"error": True, "message": "work_item_key is required"}
+        if self._session_mgr is None:
+            return {"error": True, "message": "session mode is not enabled"}
+        if self._session_mgr.get(key) is None:
+            return {"error": True, "message": f"no live session for {key}"}
+        try:
+            await self._session_mgr.reap(key)
+            return {"reaped": True, "work_item_key": key}
+        except Exception as e:
+            logger.warning("reap of %s failed: %s", key, e)
+            return {"error": True, "message": str(e)}
+
     async def _on_channel_reply(self, session_key: str, event_id: str, text: str) -> None:
         """Called by the ChannelHub when a session replies to a pushed event.
         Resolves the pending future for that event so the dispatching call can
@@ -1670,6 +1719,8 @@ def main():
             "search_agents": bridge.ipc_search_agents,
             "delegate_task": bridge.ipc_delegate_task,
             "mirror_notify": bridge.ipc_mirror_notify,
+            "status": bridge.ipc_status,
+            "reap_session": bridge.ipc_reap_session,
         },
         path=SOCIETY_AI_BRIDGE_SOCKET,
     )

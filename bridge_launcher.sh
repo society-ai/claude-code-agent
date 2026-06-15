@@ -32,8 +32,13 @@ if [ ! -x "venv/bin/python" ]; then
     exit 1
 fi
 
-# Load the persona env into the environment so bridge.py picks it up.
+# Load config into the environment so bridge.py picks it up. Machine-wide
+# defaults (.env.defaults, managed by the local status panel) load FIRST so
+# the persona's own .env can still override them; per-agent identity and
+# access directories live only in the persona file.
 set -a
+# shellcheck source=/dev/null
+[ -f ".env.defaults" ] && source ".env.defaults"
 # shellcheck source=/dev/null
 source "$ENV_FILE"
 set +a

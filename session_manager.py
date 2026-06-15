@@ -136,6 +136,34 @@ class SessionManager:
     def get(self, work_item_key: str) -> Optional[SessionRecord]:
         return self._sessions.get(self.resolve(work_item_key))
 
+    def snapshot(self) -> list[dict]:
+        """Read-only view of live sessions for the local status panel.
+
+        Returns one dict per tracked session (newest activity first). No
+        transcript content — only the operational shape (what's running,
+        how old, what kind). Aliases are reported alongside their canonical
+        session so the panel can show 'chat X → work item Y'.
+        """
+        now = time.time()
+        alias_by_canonical: dict[str, list[str]] = {}
+        for alias_key, canonical in self._aliases.items():
+            alias_by_canonical.setdefault(canonical, []).append(alias_key)
+
+        rows = []
+        for rec in self._sessions.values():
+            rows.append({
+                "work_item_key": rec.work_item_key,
+                "persona": rec.persona,
+                "title": rec.title,
+                "kind": "background" if rec.background else "interactive",
+                "state": rec.state,
+                "tmux": rec.tmux_name,
+                "idle_seconds": int(now - rec.last_active),
+                "aliases": alias_by_canonical.get(rec.work_item_key, []),
+            })
+        rows.sort(key=lambda r: r["idle_seconds"])
+        return rows
+
     def touch(self, work_item_key: str) -> None:
         rec = self._sessions.get(self.resolve(work_item_key))
         if rec:

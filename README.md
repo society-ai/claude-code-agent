@@ -49,12 +49,40 @@ For **long-term use, install it as a background service** so it auto-starts at l
 ```bash
 ./service.sh install      # macOS — installs a launchd LaunchAgent
 ./service.sh status       # shows whether it's loaded + the running PID
+./service.sh start        # connect: bring the agent online (keeps the plist)
+./service.sh stop         # disconnect: take the agent offline (keeps the plist)
 ./service.sh logs         # tail the bridge log
 ./service.sh restart      # e.g. after editing .env
 ./service.sh uninstall    # stop + remove
 ```
 
 The LaunchAgent runs as your user (no sudo, no root). The plist file contains no secrets — `bridge_launcher.sh` sources `.env` at process start. Logs go to `~/.cache/society-ai/bridge.{log,err.log}`.
+
+### Local status & control panel
+
+```bash
+./status.sh               # opens a localhost web panel in your browser
+```
+
+A browser panel (127.0.0.1 only) for everything on *this* machine — it does
+not duplicate societyai.com, it controls the local integration. Config is
+split the way you actually use it:
+
+- **Per agent** (one card each) — an online/offline toggle, Restart, the
+  live local sessions (with an End button to clear a stuck one), and the
+  folders the agent may use, chosen with the native macOS folder picker
+  (the first is its "main" working folder; the rest are extra access).
+  These map to each persona's `.env`.
+- **Machine settings** (a shared drawer) — how *every* agent behaves:
+  recording on/off + detail, where agents run (standard vs secured
+  sandbox), and limits. Saved to a shared `.env.defaults` that the launcher
+  sources before each persona's file, and lifted out of the persona files
+  so there's a single source of truth.
+
+It is localhost-bound and every action is gated by a token (printed on
+launch, also stored `0600` at `~/.cache/society-ai/status-token`) plus a
+loopback-origin check, so a website you visit can't drive your agents. Set
+`STATUS_PORT` to change the port (default 8787).
 
 Once installed, every Claude Code session on this machine can reach the bridge via the IPC socket, and the Society AI web app can chat with the agent without you having to remember to start anything.
 
