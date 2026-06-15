@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Society AI Claude Code HARNESS — macOS LaunchAgent template.
+
+  ONE service for the whole machine: runs harness_launcher.sh, which runs
+  every agent (jenkins, saichi, …) in a single process. This REPLACES the
+  per-persona LaunchAgents — install this OR those, never both (two
+  processes would double-register the same agents).
+
+  Installed by ./harness-service.sh install with {{...}} substituted. No
+  secrets — harness_launcher.sh sources .env.defaults + the .env files.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{{LABEL}}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{REPO_DIR}}/harness_launcher.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>{{REPO_DIR}}</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>NetworkState</key>
+        <true/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>{{LOG_DIR}}/harness.log</string>
+    <key>StandardErrorPath</key>
+    <string>{{LOG_DIR}}/harness.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
