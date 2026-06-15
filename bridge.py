@@ -726,7 +726,21 @@ class Bridge:
                     self.registered = True
                     logger.info("Registered as %s", result.get("agent_id", self.ctx.name))
                 else:
-                    logger.error("Registration failed: %s", result.get("error"))
+                    # Reject (commonly "already connected" during a restart or
+                    # harness cutover, while the hub still holds this agent's
+                    # prior connection): drop and let the reconnect loop retry.
+                    # The stale connection clears on the hub's heartbeat
+                    # timeout, after which re-registration succeeds.
+                    logger.error(
+                        "Registration failed (%s) — reconnecting to retry",
+                        result.get("error"),
+                    )
+                    await asyncio.sleep(5)
+                    try:
+                        if self.ws:
+                            await self.ws.close(code=1012, reason="re-register")
+                    except Exception:
+                        pass
             return
 
         # --- Notifications / inbound requests -----------------------------
@@ -1923,12 +1937,24 @@ def main():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    def handle_signal(sig, _):
-        logger.info("Received signal %s", sig)
+    def _request_shutdown():
+        logger.info("Shutdown requested")
         harness.stop()
+        # Close each agent's WS so its run loop unblocks and returns —
+        # otherwise the process ignores SIGTERM (the read loop stays parked
+        # on `async for raw in ws`). launchd stops/restarts via SIGTERM, so
+        # this is what lets a clean teardown (parked status flips) happen.
+        for b in harness.bridges:
+            if b.ws is not None:
+                asyncio.ensure_future(b.ws.close())
 
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
+    # Prefer loop-native signal handling (runs inside the loop, can schedule
+    # the WS closes); fall back to plain signals where unavailable.
+    for _sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(_sig, _request_shutdown)
+        except (NotImplementedError, RuntimeError):
+            signal.signal(_sig, lambda *_: _request_shutdown())
 
     try:
         loop.run_until_complete(harness.run())
