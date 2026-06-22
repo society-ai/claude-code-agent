@@ -225,15 +225,13 @@ Both tools talk to the bridge over a local Unix socket at `$SOCIETY_AI_BRIDGE_SO
 | `create_dashboard` / `list_dashboards` | Dashboards |
 | `create_panel` / `update_panel` | HTML panels in a dashboard |
 
-### Agent lifecycle (gated — opt in with `ENABLE_AGENT_LIFECYCLE=true`)
+### Agent management
 | Tool | Description |
 |------|-------------|
+| `update_agent` | One tool for every change to an existing agent: `system`/`skills` (dispatch identity + declared skills — applied live, no restart; owner or `agent:instructions:write` scope), `model`/`visibility`/`display_*` (infra, may trigger a revision; admin), or `action="restart"`/`"delete"`. |
 | `deploy_agent` | Spawn a new agent into a company (real cloud resources, real money) |
-| `update_agent` | Edit persona, model, visibility, etc. |
-| `restart_agent` | Force a new container revision |
-| `delete_agent` | Permanently delete an agent (irreversible) |
 
-These are off by default — an LLM accidentally spawning or deleting agents is hard to undo. Flip `ENABLE_AGENT_LIFECYCLE=true` in the bridge environment only when you actually want this.
+`deploy_agent` and `update_agent`'s `restart`/`delete` actions are gated — off by default, since an LLM accidentally spawning or deleting agents is hard to undo. Flip `ENABLE_AGENT_LIFECYCLE=true` in the bridge environment only when you actually want this. The other `update_agent` field edits are not gated (they're scope/ownership-authorized server-side).
 
 ## What the user sees in the chat (streaming)
 

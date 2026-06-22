@@ -16,6 +16,11 @@ Tool surface (see README for full descriptions):
     save_artifact, pin_artifact, list_pinned_artifacts, unpin_artifact,
     search_kb, list_kb_items
 
+  Knowledge system — unified KB (memory|document|policy|process):
+    submit_knowledge, search_knowledge, read_kb_item, get_entity, kb_neighbors,
+    write_kb_item, update_kb_item, supersede_kb_item, upsert_entity, add_edge,
+    list_kb_submissions, resolve_kb_submission   [curator writes need knowledge:curate]
+
   Phase 4 — org context:
     list_company_agents, list_departments, create_department, list_memberships,
     list_spaces, create_space, get_space, list_projects, create_project, get_project
@@ -24,7 +29,8 @@ Tool surface (see README for full descriptions):
     create_schedule, list_schedules, create_workflow, list_workflows, start_workflow,
     register_nav_item, list_nav_items, create_dashboard, list_dashboards,
     create_panel, update_panel,
-    deploy_agent, update_agent, restart_agent, delete_agent  [gated on ENABLE_AGENT_LIFECYCLE]
+    update_agent  (one tool: system/skills live, model/visibility, action=restart|delete),
+    deploy_agent  [gated on ENABLE_AGENT_LIFECYCLE; update_agent's restart/delete actions also gated]
 
 All tools return JSON strings. Errors (network, 4xx/5xx, validation) are
 encoded as {"error": true, ...} objects so the LLM can read and recover.
@@ -1078,6 +1084,323 @@ async def list_kb_items(
 
 
 # ==============================================================================
+# KNOWLEDGE SYSTEM — unified KB (memory|document|policy|process)
+# Reads + submit_knowledge: any agent. Curator writes: require knowledge:curate
+# (server-enforced; granted only to the Librarian). org/identity come from the
+# bearer token. See docs/design/knowledge-system.md.
+# ==============================================================================
+
+_KB_KINDS = {"memory", "document", "policy", "process"}
+
+
+@mcp.tool()
+async def submit_knowledge(
+    content: str,
+    why: Optional[str] = None,
+    kind: Optional[str] = None,
+    company_id: Optional[str] = None,
+    space_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+    source_task_id: Optional[str] = None,
+    artifact_ids: Optional[list[str]] = None,
+) -> str:
+    """Contribute something durable you learned to the knowledge base.
+
+    Write plain prose — one paragraph is fine. Don't worry about where it goes
+    or how to format it; the Librarian files, dedups, and structures it. This is
+    fire-and-forget (lands in a review queue), so use it freely whenever you
+    learn a durable fact, a gotcha, a preference, or a how-to worth keeping.
+
+    Args:
+        content: What you learned, in plain language (required).
+        why: Optional — why it matters / how you hit it.
+        kind: Optional rough hint (memory | document | policy | process).
+        company_id / space_id / project_id: Optional scope hint for where it belongs.
+        source_task_id: Optional task this came from (provenance).
+    """
+    if not content or not content.strip():
+        return _result(_error("content is required"))
+    body: dict[str, Any] = {"content": content.strip()}
+    if why:
+        body["why"] = why
+    if kind:
+        if kind not in _KB_KINDS:
+            return _result(_error(f"kind must be one of {sorted(_KB_KINDS)}"))
+        body["kind"] = kind
+    for name, val in (("company_id", company_id), ("space_id", space_id),
+                      ("project_id", project_id), ("source_task_id", source_task_id)):
+        if val:
+            try:
+                _validate_uuid(val, name)
+            except ValueError as e:
+                return _result(_error(str(e)))
+            body[name] = val
+    if artifact_ids:
+        body["artifact_ids"] = artifact_ids
+    return _result(await api.post("/api/v1/kb/submissions", body))
+
+
+@mcp.tool()
+async def search_knowledge(
+    query: str,
+    company_id: Optional[str] = None,
+    space_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+    kinds: Optional[list[str]] = None,
+    top_k: int = 8,
+) -> str:
+    """Search the knowledge base (hybrid semantic + keyword, scope-filtered).
+
+    Returns whole items (memories, documents, policies, processes) ranked by
+    relevance. Org scope comes from your token; narrow further with company/
+    space/project or by kind. Use this when you need to recall facts, find a
+    how-to, or check what's already known before acting.
+
+    Args:
+        query: Natural-language query (required).
+        company_id / space_id / project_id: Optional scope narrowing.
+        kinds: Optional list to restrict kinds, e.g. ["process","policy"].
+        top_k: Max items to return (1-50).
+    """
+    if not query or not query.strip():
+        return _result(_error("query is required"))
+    body: dict[str, Any] = {"query": query.strip(), "limit": max(1, min(50, int(top_k)))}
+    for name, val in (("company_id", company_id), ("space_id", space_id), ("project_id", project_id)):
+        if val:
+            try:
+                _validate_uuid(val, name)
+            except ValueError as e:
+                return _result(_error(str(e)))
+            body[name] = val
+    if kinds:
+        bad = [k for k in kinds if k not in _KB_KINDS]
+        if bad:
+            return _result(_error(f"invalid kinds {bad}; allowed {sorted(_KB_KINDS)}"))
+        body["kinds"] = kinds
+    return _result(await api.post("/api/v1/kb/search", body))
+
+
+@mcp.tool()
+async def read_kb_item(item_id: str) -> str:
+    """Read a single knowledge-base item by id (full content + frontmatter)."""
+    try:
+        _validate_uuid(item_id, "item_id")
+    except ValueError as e:
+        return _result(_error(str(e)))
+    return _result(await api.get(f"/api/v1/kb/items/{item_id}"))
+
+
+@mcp.tool()
+async def write_kb_item(
+    kind: str,
+    content: str,
+    title: Optional[str] = None,
+    description: Optional[str] = None,
+    tags: Optional[list[str]] = None,
+    synthetic_queries: Optional[list[str]] = None,
+    path: Optional[str] = None,
+    status: str = "draft",
+    applies_when: Optional[dict] = None,
+    company_id: Optional[str] = None,
+    space_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+    entity_key: Optional[str] = None,
+    resource_url: Optional[str] = None,
+    source_task_id: Optional[str] = None,
+    artifact_ids: Optional[list[str]] = None,
+) -> str:
+    """[Librarian] Commit a curated item to the knowledge base.
+
+    Requires the knowledge:curate scope (server-enforced). Set status='canonical'
+    once verified. For policy/process that should auto-attach to tasks, pass
+    applies_when (e.g. {"tags": ["payments"]}). Generate 3-5 synthetic_queries.
+    """
+    if kind not in _KB_KINDS and kind != "index":
+        return _result(_error(f"kind must be one of {sorted(_KB_KINDS)} or 'index'"))
+    if not content or not content.strip():
+        return _result(_error("content is required"))
+    body: dict[str, Any] = {"kind": kind, "content": content, "status": status}
+    for name, val in (("title", title), ("description", description), ("path", path),
+                      ("entity_key", entity_key), ("resource_url", resource_url)):
+        if val is not None:
+            body[name] = val
+    if tags:
+        body["tags"] = tags
+    if synthetic_queries:
+        body["synthetic_queries"] = synthetic_queries
+    if artifact_ids:
+        body["artifact_ids"] = artifact_ids
+    if applies_when:
+        body["applies_when"] = applies_when
+    for name, val in (("company_id", company_id), ("space_id", space_id),
+                      ("project_id", project_id), ("source_task_id", source_task_id)):
+        if val:
+            try:
+                _validate_uuid(val, name)
+            except ValueError as e:
+                return _result(_error(str(e)))
+            body[name] = val
+    return _result(await api.post("/api/v1/kb/items", body))
+
+
+@mcp.tool()
+async def update_kb_item(
+    item_id: str,
+    content: Optional[str] = None,
+    title: Optional[str] = None,
+    description: Optional[str] = None,
+    tags: Optional[list[str]] = None,
+    synthetic_queries: Optional[list[str]] = None,
+    status: Optional[str] = None,
+    applies_when: Optional[dict] = None,
+    resource_url: Optional[str] = None,
+) -> str:
+    """[Librarian] Update a knowledge-base item (incremental edit). Requires knowledge:curate."""
+    try:
+        _validate_uuid(item_id, "item_id")
+    except ValueError as e:
+        return _result(_error(str(e)))
+    body: dict[str, Any] = {}
+    for name, val in (("content", content), ("title", title), ("description", description),
+                      ("status", status), ("resource_url", resource_url)):
+        if val is not None:
+            body[name] = val
+    if tags is not None:
+        body["tags"] = tags
+    if synthetic_queries is not None:
+        body["synthetic_queries"] = synthetic_queries
+    if applies_when is not None:
+        body["applies_when"] = applies_when
+    if not body:
+        return _result(_error("nothing to update"))
+    return _result(await api.patch(f"/api/v1/kb/items/{item_id}", body))
+
+
+@mcp.tool()
+async def supersede_kb_item(item_id: str, superseded_by: str) -> str:
+    """[Librarian] Mark an item deprecated, replaced by superseded_by. Requires knowledge:curate."""
+    for name, val in (("item_id", item_id), ("superseded_by", superseded_by)):
+        try:
+            _validate_uuid(val, name)
+        except ValueError as e:
+            return _result(_error(str(e)))
+    return _result(await api.post(f"/api/v1/kb/items/{item_id}/supersede", {"superseded_by": superseded_by}))
+
+
+@mcp.tool()
+async def list_kb_submissions(status: str = "pending", company_id: Optional[str] = None, limit: int = 50) -> str:
+    """[Librarian] List the submission queue (default: pending). Requires knowledge:curate."""
+    params: dict[str, Any] = {"status": status, "limit": max(1, min(200, int(limit)))}
+    if company_id:
+        try:
+            _validate_uuid(company_id, "company_id")
+        except ValueError as e:
+            return _result(_error(str(e)))
+        params["company_id"] = company_id
+    return _result(await api.get("/api/v1/kb/submissions", params=params))
+
+
+@mcp.tool()
+async def resolve_kb_submission(
+    submission_id: str,
+    status: str,
+    item_id: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> str:
+    """[Librarian] Resolve a submission: status in {merged, rejected, deferred}.
+
+    Pass item_id when merged into / filed as a specific kb_item. Requires knowledge:curate.
+    """
+    try:
+        _validate_uuid(submission_id, "submission_id")
+    except ValueError as e:
+        return _result(_error(str(e)))
+    if status not in {"merged", "rejected", "deferred"}:
+        return _result(_error("status must be one of merged, rejected, deferred"))
+    body: dict[str, Any] = {"status": status}
+    if item_id:
+        body["item_id"] = item_id
+    if reason:
+        body["reason"] = reason
+    return _result(await api.post(f"/api/v1/kb/submissions/{submission_id}/resolve", body))
+
+
+@mcp.tool()
+async def get_entity(name: str, company_id: Optional[str] = None) -> str:
+    """Get an entity (a canonical concept — person/org/system/product/project/concept)
+    with the knowledge items that mention it and its typed relationships (edges)."""
+    from urllib.parse import quote
+    if not name or not name.strip():
+        return _result(_error("name is required"))
+    params: dict[str, Any] = {}
+    if company_id:
+        try:
+            _validate_uuid(company_id, "company_id")
+        except ValueError as e:
+            return _result(_error(str(e)))
+        params["company_id"] = company_id
+    return _result(await api.get(f"/api/v1/kb/entities/{quote(name.strip(), safe='')}", params=params))
+
+
+@mcp.tool()
+async def kb_neighbors(item_id: str, limit: int = 10) -> str:
+    """Find knowledge items that co-mention an entity with the given item (related context)."""
+    try:
+        _validate_uuid(item_id, "item_id")
+    except ValueError as e:
+        return _result(_error(str(e)))
+    return _result(await api.get("/api/v1/kb/neighbors", params={"item_id": item_id, "limit": max(1, min(50, int(limit)))}))
+
+
+@mcp.tool()
+async def upsert_entity(
+    type: str,
+    name: str,
+    company_id: Optional[str] = None,
+    aliases: Optional[list[str]] = None,
+    summary: Optional[str] = None,
+    page_item_id: Optional[str] = None,
+) -> str:
+    """[Librarian] Create or update a canonical entity (set aliases, summary, or its page).
+    Requires knowledge:curate. type: person|organization|system|product|project|concept."""
+    if not type or not name:
+        return _result(_error("type and name are required"))
+    body: dict[str, Any] = {"type": type, "name": name}
+    if company_id:
+        body["company_id"] = company_id
+    if aliases:
+        body["aliases"] = aliases
+    if summary:
+        body["summary"] = summary
+    if page_item_id:
+        body["page_item_id"] = page_item_id
+    return _result(await api.post("/api/v1/kb/entities", body))
+
+
+@mcp.tool()
+async def add_edge(
+    src_name: str,
+    relation: str,
+    dst_name: str,
+    src_type: str = "concept",
+    dst_type: str = "concept",
+    company_id: Optional[str] = None,
+    source_item_id: Optional[str] = None,
+) -> str:
+    """[Librarian] Add a typed relationship between two entities (e.g. Lior --founder_of--> Society AI).
+    Use the ontology's relation vocabulary. Requires knowledge:curate."""
+    if not src_name or not relation or not dst_name:
+        return _result(_error("src_name, relation, dst_name are required"))
+    body: dict[str, Any] = {"src_name": src_name, "relation": relation, "dst_name": dst_name,
+                            "src_type": src_type, "dst_type": dst_type}
+    if company_id:
+        body["company_id"] = company_id
+    if source_item_id:
+        body["source_item_id"] = source_item_id
+    return _result(await api.post("/api/v1/kb/edges", body))
+
+
+# ==============================================================================
 # PHASE 4 — org context (spaces, projects, departments, memberships, agents)
 # ==============================================================================
 
@@ -1691,75 +2014,108 @@ async def deploy_agent(
 async def update_agent(
     agent_name: str,
     company_id: Optional[str] = None,
-    display_name: Optional[str] = None,
-    display_description: Optional[str] = None,
-    persona: Optional[str] = None,
-    role_summary: Optional[str] = None,
-    role_md: Optional[str] = None,
+    # Dispatch plane — applied live, no restart (owner / agent:instructions:write scope):
+    system: Optional[str] = None,
+    skills: Optional[list[str]] = None,
+    # Infra / registry — proxied to the agent factory, may trigger a revision (admin):
     model: Optional[str] = None,
     visibility: Optional[str] = None,
+    display_name: Optional[str] = None,
+    display_description: Optional[str] = None,
+    # Lifecycle — high-power, requires ENABLE_AGENT_LIFECYCLE:
+    action: Optional[str] = None,
 ) -> str:
-    """[GATED] Update a deployed agent's persona, model, or visibility."""
-    gate = _gate_or_error()
-    if gate:
-        return gate
+    """The single tool for every change to a deployed agent. Pass the fields you
+    want to change, OR an `action` — not both. (To create an agent, use
+    deploy_agent.)
+
+    Field updates (routed + authorized per field):
+      - system / skills — the dispatch plane (identity + declared skills).
+        Applied live by the platform composer on the agent's next dispatch — no
+        restart. Works for ANY agent (self-hosted or company). Authorized by
+        ownership or the `agent:instructions:write` scope. `system` supersedes
+        the legacy persona/role identity. This is the self-improving apply path —
+        use it only after a human approved the change (e.g. an inbox
+        approval-required item). `skills` replaces the declared-slug list; each
+        slug must resolve to an active Skill. `system=""` clears to the fallback.
+      - model / visibility / display_name / display_description — infra/registry.
+        Proxied to the agent factory and may trigger a container revision.
+        Authorized as company admin/owner.
+
+    Lifecycle (`action`, high-power — requires ENABLE_AGENT_LIFECYCLE):
+      - action="restart" — force a new container revision.
+      - action="delete"  — permanently delete the agent (irreversible).
+    """
     if not agent_name or not agent_name.strip():
         return _result(_error("agent_name is required"))
+    try:
+        _validate_agent_name(agent_name)
+    except ValueError as e:
+        return _result(_error(str(e)))
+
+    field_args = (system, skills, model, visibility, display_name, display_description)
+
+    # --- Lifecycle actions (high-power, gated, company-scoped) ---
+    if action is not None:
+        act = action.strip().lower()
+        if act not in ("restart", "delete"):
+            return _result(_error("action must be 'restart' or 'delete'"))
+        if any(v is not None for v in field_args):
+            return _result(_error("pass EITHER field updates OR an action, not both"))
+        gate = _gate_or_error()
+        if gate:
+            return gate
+        try:
+            cid = _resolve_company_id(company_id)
+        except ValueError as e:
+            return _result(_error(str(e)))
+        if act == "restart":
+            return _result(await api.post(f"/api/v1/companies/{cid}/agents/{agent_name}/restart", {}))
+        return _result(await api.delete(f"/api/v1/companies/{cid}/agents/{agent_name}"))
+
+    # --- Field updates (per-field routing + auth) ---
     err = _enum_check(visibility, _VALID_VISIBILITIES, "visibility")
     if err:
         return _result(err)
-    try:
-        cid = _resolve_company_id(company_id)
-        _validate_agent_name(agent_name)
-    except ValueError as e:
-        return _result(_error(str(e)))
-    body: dict[str, Any] = {}
+
+    results: dict[str, Any] = {}
+
+    # Dispatch plane (system/skills) -> by-name route; live; scope/owner auth.
+    dispatch_body: dict[str, Any] = {}
+    if system is not None:
+        dispatch_body["system"] = system
+    if skills is not None:
+        dispatch_body["skills"] = skills
+    if dispatch_body:
+        results["dispatch"] = await api.patch(
+            f"/api/v1/agents/{agent_name}/system", dispatch_body
+        )
+
+    # Infra/registry (model/visibility/display) -> company route; admin; may revise.
+    infra_body: dict[str, Any] = {}
     for k, v in (
-        ("display_name", display_name),
-        ("display_description", display_description),
-        ("persona", persona),
-        ("role_summary", role_summary),
-        ("role_md", role_md),
         ("model", model),
         ("visibility", visibility),
+        ("display_name", display_name),
+        ("display_description", display_description),
     ):
         if v is not None:
-            body[k] = v
-    if not body:
-        return _result(_error("no fields to update"))
-    return _result(await api.patch(f"/api/v1/companies/{cid}/agents/{agent_name}", body))
+            infra_body[k] = v
+    if infra_body:
+        try:
+            cid = _resolve_company_id(company_id)
+        except ValueError as e:
+            return _result(_error(str(e)))
+        results["infra"] = await api.patch(
+            f"/api/v1/companies/{cid}/agents/{agent_name}", infra_body
+        )
 
-
-@mcp.tool()
-async def restart_agent(agent_name: str, company_id: Optional[str] = None) -> str:
-    """[GATED] Force a new container revision for a deployed agent."""
-    gate = _gate_or_error()
-    if gate:
-        return gate
-    if not agent_name or not agent_name.strip():
-        return _result(_error("agent_name is required"))
-    try:
-        cid = _resolve_company_id(company_id)
-        _validate_agent_name(agent_name)
-    except ValueError as e:
-        return _result(_error(str(e)))
-    return _result(await api.post(f"/api/v1/companies/{cid}/agents/{agent_name}/restart", {}))
-
-
-@mcp.tool()
-async def delete_agent(agent_name: str, company_id: Optional[str] = None) -> str:
-    """[GATED] Permanently delete a deployed agent. Irreversible."""
-    gate = _gate_or_error()
-    if gate:
-        return gate
-    if not agent_name or not agent_name.strip():
-        return _result(_error("agent_name is required"))
-    try:
-        cid = _resolve_company_id(company_id)
-        _validate_agent_name(agent_name)
-    except ValueError as e:
-        return _result(_error(str(e)))
-    return _result(await api.delete(f"/api/v1/companies/{cid}/agents/{agent_name}"))
+    if not results:
+        return _result(_error(
+            "nothing to update — pass system/skills, model/visibility/display, "
+            "or action='restart'|'delete'"
+        ))
+    return _result(results)
 
 
 # ==============================================================================
