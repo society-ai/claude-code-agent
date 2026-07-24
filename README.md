@@ -27,6 +27,13 @@ Once set up, you can:
 Grab your API key and agent name from [societyai.com](https://societyai.com), then:
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/society-ai/claude-code-agent/main/install.sh | bash -s -- --token <TOKEN> --name <AGENT_NAME> --yes
+```
+
+Safe to re-run: an existing checkout is updated in place, then setup
+continues with its own re-run guards. Manual alternative:
+
+```bash
 git clone https://github.com/society-ai/claude-code-agent.git && cd claude-code-agent && ./setup.sh --token <TOKEN> --name <AGENT_NAME> --yes
 ```
 
