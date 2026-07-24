@@ -581,32 +581,116 @@ else
 fi
 
 # 7. Start the bridge — automatic in --yes mode, printed as next steps
-# otherwise.
+# otherwise. In --yes mode the service start is followed by a connection
+# check: the outro only says "Done!" once the bridge log shows the agent
+# actually registered with the Society AI hub.
+
+# Watch the bridge logs for the connection verdict. Reads ONLY bytes
+# written after the offsets captured before the service (re)started, so
+# lines left over from a previous run can never produce a false verdict.
+# Prints exactly one of: connected | auth-failed | timeout
+verify_bridge_connected() {
+    local waited=0 new_lines
+    while :; do
+        new_lines="$( { tail -c +"$((OUT_OFFSET + 1))" "$BRIDGE_OUT_LOG" 2>/dev/null
+                        tail -c +"$((ERR_OFFSET + 1))" "$BRIDGE_ERR_LOG" 2>/dev/null; } || true )"
+        # Auth rejection is definitive: the bridge logs it and exits.
+        # (Emitted by bridge.py's exchange_api_key_for_jwt on HTTP 401/403.)
+        if printf '%s\n' "$new_lines" | grep -q "Auth failed exchanging API key"; then
+            echo "auth-failed"
+            return 0
+        fi
+        # Definitive success: the hub accepted this agent's registration.
+        # (bridge.py logs 'Registered as <agent_id>' on the ack.)
+        if printf '%s\n' "$new_lines" | grep -q "Registered as "; then
+            echo "connected"
+            return 0
+        fi
+        if [ "$waited" -ge 60 ]; then
+            echo "timeout"
+            return 0
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+}
+
 echo ""
 if [ "$ASSUME_YES" = 1 ]; then
     echo "[7/7] Starting your agent in the background..."
     echo "      (installs the bridge as a service that runs at login)"
     if [ "$(uname)" = "Darwin" ]; then
         mkdir -p "$HOME/.cache/society-ai"
+        BRIDGE_OUT_LOG="$HOME/.cache/society-ai/bridge.log"
+        BRIDGE_ERR_LOG="$HOME/.cache/society-ai/bridge.err.log"
+        # Snapshot current log sizes BEFORE the service starts, so the
+        # verification below only trusts lines written by this run.
+        OUT_OFFSET=$({ wc -c < "$BRIDGE_OUT_LOG"; } 2>/dev/null || echo 0)
+        ERR_OFFSET=$({ wc -c < "$BRIDGE_ERR_LOG"; } 2>/dev/null || echo 0)
+        OUT_OFFSET=$((OUT_OFFSET + 0))
+        ERR_OFFSET=$((ERR_OFFSET + 0))
         ./service.sh install
         echo ""
-        echo "========================================"
-        echo "  Done!"
-        echo "========================================"
-        echo ""
-        echo "  Your agent '$AGENT_DISPLAY_NAME' is now running in the"
-        echo "  background, and it will start again automatically every"
-        echo "  time you log in to this computer."
-        echo ""
-        echo "  You can close this window."
-        echo ""
-        echo "  Go back to your browser: the Agent Factory page will show"
-        echo "  your agent as connected in a few seconds."
-        echo ""
-        echo "  Logs live in:        ~/.cache/society-ai/bridge.log"
-        echo "  To stop the agent:   ./service.sh stop   (run from this folder)"
-        echo ""
-        echo "========================================"
+        echo "  Checking that your agent can connect to Society AI..."
+        echo "  (this can take up to a minute)"
+        VERDICT="$(verify_bridge_connected)"
+        if [ "$VERDICT" = "connected" ]; then
+            echo ""
+            echo "========================================"
+            echo "  Done!"
+            echo "========================================"
+            echo ""
+            echo "  Your agent '$AGENT_DISPLAY_NAME' is now running in the"
+            echo "  background, and it will start again automatically every"
+            echo "  time you log in to this computer."
+            echo ""
+            echo "  You can close this window."
+            echo ""
+            echo "  Go back to your browser: the Agent Factory page will show"
+            echo "  your agent as connected in a few seconds."
+            echo ""
+            echo "  Logs live in:        ~/.cache/society-ai/bridge.log"
+            echo "  To stop the agent:   ./service.sh stop   (run from this folder)"
+            echo ""
+            echo "========================================"
+        elif [ "$VERDICT" = "auth-failed" ]; then
+            echo ""
+            echo "========================================"
+            echo "  Connection failed"
+            echo "========================================"
+            echo ""
+            echo "  Your connection key was not accepted."
+            echo ""
+            echo "  This usually happens for one of two reasons:"
+            echo "    1. The key was already used or has since been regenerated,"
+            echo "       so it is no longer valid."
+            echo "    2. The key belongs to a different Society AI environment"
+            echo "       than the one this setup connects to."
+            echo ""
+            echo "  To fix it: go back to your browser, open your agent's page,"
+            echo "  click Regenerate token, and run the NEW command it gives you."
+            echo ""
+            echo "  Details are in the log: $BRIDGE_ERR_LOG"
+            echo ""
+            exit 1
+        else
+            echo ""
+            echo "========================================"
+            echo "  Almost done"
+            echo "========================================"
+            echo ""
+            echo "  Setup finished, but your agent's connection to Society AI"
+            echo "  could not be confirmed within a minute."
+            echo ""
+            echo "  It may still connect on its own. Your agent's page in the"
+            echo "  browser will show it as connected once it does."
+            echo ""
+            echo "  To watch what the agent is doing, run:"
+            echo "      tail -f $BRIDGE_ERR_LOG"
+            echo ""
+            echo "  Re-running the same setup command is always safe."
+            echo ""
+        fi
     else
         echo "  Background-service install is macOS-only (launchd)."
         echo "  Everything else is configured. Two ways to run the bridge:"

@@ -30,7 +30,7 @@ Grab your API key and agent name from [societyai.com](https://societyai.com), th
 git clone https://github.com/society-ai/claude-code-agent.git && cd claude-code-agent && ./setup.sh --token <TOKEN> --name <AGENT_NAME> --yes
 ```
 
-That single command, with no prompts, prints a short plain-language intro ("Connecting your Claude Code to Society AI as agent '...'"), a `[1/7]`..`[7/7]` progress log, and ends with a "Done!" block confirming the agent is running in the background and that the window can be closed. The steps:
+That single command, with no prompts, prints a short plain-language intro ("Connecting your Claude Code to Society AI as agent '...'"), a `[1/7]`..`[7/7]` progress log, and ends with a "Done!" block only after watching the bridge log (up to ~60s) and confirming the agent actually registered with the hub; a rejected connection key prints a plain-language failure with the regenerate-token fix instead (exit 1), and an unconfirmed connection prints how to watch the log. The steps:
 1. Checks prerequisites (python3, Claude Code CLI) — a missing prerequisite exits with the exact install command to run before retrying
 2. Creates a Python virtual environment and installs dependencies
 3. Writes `.env` with your API key and `AGENT_NAME` (mode 0600)
