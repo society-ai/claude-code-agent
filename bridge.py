@@ -1713,7 +1713,13 @@ class Bridge:
                 continue
 
             try:
-                ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+                # TLS only for wss:// - websockets rejects an ssl context
+                # for plain ws:// (local/dev hubs).
+                ssl_ctx = (
+                    ssl.create_default_context(cafile=certifi.where())
+                    if url.startswith("wss://")
+                    else None
+                )
                 async with websockets.connect(url, ping_interval=None, ssl=ssl_ctx) as ws:
                     self.ws = ws
                     self.registered = False
