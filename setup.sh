@@ -20,6 +20,12 @@
 #                      same machine, each its own bridge + identity). Writes
 #                      .env.<name>, creates the per-persona log/socket dir,
 #                      and installs the persona's LaunchAgent.
+#   --url <url>        Society AI backend base URL (must start with http://
+#                      or https://). Only needed when connecting to a
+#                      non-production Society AI environment. Written into
+#                      the env file as AGENT_ROUTER_API_URL; when omitted
+#                      nothing is written and the production default
+#                      (https://api.societyai.com) applies.
 #
 # Without flags the script runs the original interactive flow: it prompts
 # for the API key, derives a per-host AGENT_NAME, and prints next steps.
@@ -46,7 +52,7 @@ cd "$REPO_DIR"
 
 usage() {
     cat <<EOF
-Usage: ./setup.sh [--token sai_...] [--name <agent-name>] [--yes] [--persona <name>]
+Usage: ./setup.sh [--token sai_...] [--name <agent-name>] [--yes] [--persona <name>] [--url <url>]
 
   --token <sai_...>   Society AI API key (get one at https://societyai.com).
                       Falls back to \$SOCIETY_AI_AUTH_TOKEN; flag wins.
@@ -56,6 +62,10 @@ Usage: ./setup.sh [--token sai_...] [--name <agent-name>] [--yes] [--persona <na
   --yes, -y           Non-interactive: never prompt, install + start the
                       bridge service. Requires a token via --token or env.
   --persona <name>    Set up an additional persona explicitly.
+  --url <url>         Society AI backend base URL (http:// or https://).
+                      Only needed for a non-production Society AI
+                      environment; written into the env file as
+                      AGENT_ROUTER_API_URL. Default: https://api.societyai.com
   -h, --help          Show this help.
 
 One-command install:
@@ -67,6 +77,7 @@ EOF
 PERSONA=""
 CLI_TOKEN=""
 CLI_NAME=""
+CLI_URL=""
 ASSUME_YES=0
 
 need_value() {
@@ -84,6 +95,8 @@ while [ $# -gt 0 ]; do
         --token=*)   CLI_TOKEN="${1#*=}"; shift ;;
         --name)      need_value "$1" $#; CLI_NAME="$2"; shift 2 ;;
         --name=*)    CLI_NAME="${1#*=}"; shift ;;
+        --url)       need_value "$1" $#; CLI_URL="$2"; shift 2 ;;
+        --url=*)     CLI_URL="${1#*=}"; shift ;;
         --yes|-y)    ASSUME_YES=1; shift ;;
         -h|--help)   usage; exit 0 ;;
         *)
@@ -122,8 +135,79 @@ if [ -n "$PERSONA" ] && [ -n "$CLI_NAME" ] && [ "$PERSONA" != "$CLI_NAME" ]; the
     exit 1
 fi
 
+CLI_URL="$(trim "$CLI_URL")"
+if [ -n "$CLI_URL" ]; then
+    case "$CLI_URL" in
+        http://*|https://*) ;;
+        *)
+            echo "Error: --url must be a web address that starts with http:// or https://" >&2
+            echo "Got: '$CLI_URL'" >&2
+            echo "Example: --url https://staging.societyai.com" >&2
+            exit 1
+            ;;
+    esac
+fi
+
 # Token precedence: --token flag > $SOCIETY_AI_AUTH_TOKEN env.
 TOKEN="$(trim "${CLI_TOKEN:-${SOCIETY_AI_AUTH_TOKEN:-}}")"
+
+# ── Never-clobber guard ────────────────────────────────────────────────────
+# A .env with no AGENT_NAME line means this folder holds a setup this script
+# does not recognize (older layout, hand-edited file, or a different tool's
+# .env). Proceeding could overwrite a live agent's identity and token, so
+# stop before touching anything. An explicit --persona run is still fine:
+# it only ever writes .env.<persona>, never .env.
+if [ -z "$PERSONA" ] && [ -f ".env" ] && ! grep -qE '^AGENT_NAME=' .env; then
+    echo "This folder already contains a Society AI setup that this script" >&2
+    echo "does not recognize. Nothing was changed." >&2
+    echo "" >&2
+    echo "To add another agent on this machine, run again with --persona <name>." >&2
+    echo "Or run the setup command from a fresh folder to start a new install." >&2
+    exit 1
+fi
+
+# Before overwriting an EXISTING env file, keep a timestamped copy so the
+# previous identity and token are always recoverable.
+backup_env_file() {
+    local file="$1"
+    [ -f "$file" ] || return 0
+    local backup
+    backup="$file.bak-$(date +%s)"
+    cp "$file" "$backup"
+    chmod 600 "$backup"
+    echo "  Kept a backup of the previous $file at $backup"
+}
+
+# In-place reconfigure of an existing env file: replaces only the API key
+# and/or AGENT_ROUTER_API_URL lines, leaving every other setting (AGENT_NAME,
+# WORK_DIR, EXTRA_DIRS, ...) exactly as it was.
+update_env_file() {
+    python3 - "$1" "$2" "$3" <<'PYEOF'
+import os, re, sys
+path, token, url = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path) as f:
+    content = f.read()
+
+def set_line(text, key, value):
+    line = f"{key}={value}"
+    if re.search(rf"^{key}=", text, re.M):
+        return re.sub(rf"^{key}=.*$", lambda m: line, text, count=1, flags=re.M)
+    return text.rstrip("\n") + "\n" + line + "\n"
+
+if token:
+    content = set_line(content, "SOCIETY_AI_AUTH_TOKEN", token)
+    print(f"  Updated the API key in {path}")
+if url:
+    content = set_line(content, "AGENT_ROUTER_API_URL", url)
+    print(f"  Set AGENT_ROUTER_API_URL={url} in {path}")
+with open(path, "w") as f:
+    f.write(content)
+try:
+    os.chmod(path, 0o600)
+except OSError:
+    pass
+PYEOF
+}
 
 # ── --name → persona mapping ───────────────────────────────────────────────
 # Identities on one machine: the FIRST is the primary persona (.env); every
@@ -150,8 +234,24 @@ if [ -n "$PERSONA" ]; then
 
     ENV_FILE=".env.$PERSONA"
     if [ -f "$ENV_FILE" ]; then
-        echo "  $ENV_FILE already exists. Leaving it alone."
-        echo "  To reconfigure, delete it and re-run."
+        if [ -n "$CLI_TOKEN" ] || [ -n "$CLI_URL" ]; then
+            # The re-run explicitly provides new settings for this same
+            # persona: update the existing file in place, backup first.
+            if [ -n "$CLI_TOKEN" ]; then
+                case "$TOKEN" in
+                    sai_*) ;;
+                    *)
+                        echo "  Error: API key must start with 'sai_'." >&2
+                        exit 1
+                        ;;
+                esac
+            fi
+            backup_env_file "$ENV_FILE"
+            update_env_file "$ENV_FILE" "${CLI_TOKEN:+$TOKEN}" "$CLI_URL"
+        else
+            echo "  $ENV_FILE already exists. Leaving it alone."
+            echo "  To reconfigure, delete it and re-run."
+        fi
     else
         API_KEY="$TOKEN"
         if [ -z "$API_KEY" ]; then
@@ -176,8 +276,12 @@ if [ -n "$PERSONA" ]; then
                 ;;
         esac
 
-        # Inherit the API URL from the default persona's .env when set.
-        API_URL="$(grep -E '^AGENT_ROUTER_API_URL=' .env 2>/dev/null | head -1 | cut -d= -f2- || true)"
+        # API URL: --url wins; otherwise inherit from the default
+        # persona's .env when set there.
+        API_URL="$CLI_URL"
+        if [ -z "$API_URL" ]; then
+            API_URL="$(grep -E '^AGENT_ROUTER_API_URL=' .env 2>/dev/null | head -1 | cut -d= -f2- || true)"
+        fi
 
         umask 077
         {
@@ -309,8 +413,26 @@ echo ""
 echo "[3/7] Saving your connection key..."
 echo "      (your Society AI API key, stored in the .env file in this folder)"
 if [ -f ".env" ]; then
-    echo "  A connection key is already saved (.env exists). Leaving it alone."
-    echo "  To reconfigure, delete .env and re-run ./setup.sh"
+    if [ -n "$CLI_TOKEN" ] || [ -n "$CLI_URL" ]; then
+        # Same identity, explicitly new settings: update the existing .env
+        # in place. A timestamped backup is kept first, and AGENT_NAME plus
+        # every other setting in the file stay untouched.
+        if [ -n "$CLI_TOKEN" ]; then
+            case "$TOKEN" in
+                sai_*) ;;
+                *)
+                    echo "  Error: API key must start with 'sai_'. Got: ${TOKEN:0:8}..." >&2
+                    echo "  Get your key at https://societyai.com" >&2
+                    exit 1
+                    ;;
+            esac
+        fi
+        backup_env_file ".env"
+        update_env_file ".env" "${CLI_TOKEN:+$TOKEN}" "$CLI_URL"
+    else
+        echo "  A connection key is already saved (.env exists). Leaving it alone."
+        echo "  To reconfigure, delete .env and re-run ./setup.sh"
+    fi
 else
     API_KEY="$TOKEN"
     if [ -z "$API_KEY" ]; then
@@ -351,9 +473,9 @@ else
     fi
 
     # Write .env safely via Python to avoid sed/shell injection
-    python3 - "$API_KEY" "$DEFAULT_AGENT_NAME" <<'PYEOF'
+    python3 - "$API_KEY" "$DEFAULT_AGENT_NAME" "$CLI_URL" <<'PYEOF'
 import os, sys, shutil, re
-key, agent_name = sys.argv[1], sys.argv[2]
+key, agent_name, url = sys.argv[1], sys.argv[2], sys.argv[3]
 shutil.copy(".env.example", ".env")
 with open(".env") as f:
     content = f.read()
@@ -361,6 +483,16 @@ content = content.replace("sai_your_api_key_here", key)
 # Inject AGENT_NAME default if user didn't already uncomment it
 if not re.search(r"^AGENT_NAME=", content, re.M):
     content = re.sub(r"# AGENT_NAME=claude-code", f"AGENT_NAME={agent_name}", content)
+# --url: point the agent at a non-production Society AI backend. Absent the
+# flag, nothing is written and config.py's production default applies.
+if url:
+    line = f"AGENT_ROUTER_API_URL={url}"
+    if re.search(r"^AGENT_ROUTER_API_URL=", content, re.M):
+        content = re.sub(r"^AGENT_ROUTER_API_URL=.*$", lambda m: line, content, count=1, flags=re.M)
+    elif re.search(r"^# AGENT_ROUTER_API_URL=", content, re.M):
+        content = re.sub(r"^# AGENT_ROUTER_API_URL=.*$", lambda m: line, content, count=1, flags=re.M)
+    else:
+        content = content.rstrip("\n") + "\n" + line + "\n"
 with open(".env", "w") as f:
     f.write(content)
 # .env holds the API key — restrict to owner-only.
@@ -370,6 +502,8 @@ except OSError:
     pass
 print(f"  API key saved to .env (mode 0600)")
 print(f"  AGENT_NAME set to {agent_name}")
+if url:
+    print(f"  AGENT_ROUTER_API_URL set to {url}")
 PYEOF
 fi
 

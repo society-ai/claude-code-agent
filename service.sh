@@ -112,6 +112,22 @@ cmd_install() {
 
     mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
 
+    # Never-clobber guard: if a plist for this label already exists and its
+    # WorkingDirectory points at a DIFFERENT install directory, this install
+    # is taking the label over from another checkout. Keep a timestamped
+    # backup of the old plist so that agent's service definition is
+    # recoverable, and say so clearly.
+    if [ -f "$PLIST_PATH" ]; then
+        OLD_WORKDIR="$(python3 -c 'import plistlib, sys
+with open(sys.argv[1], "rb") as f:
+    print(plistlib.load(f).get("WorkingDirectory", ""))' "$PLIST_PATH" 2>/dev/null || true)"
+        if [ -n "$OLD_WORKDIR" ] && [ "$OLD_WORKDIR" != "$REPO_DIR" ]; then
+            PLIST_BACKUP="$PLIST_PATH.bak-$(date +%s)"
+            cp "$PLIST_PATH" "$PLIST_BACKUP"
+            echo "  Replacing a previous agent service that pointed at $OLD_WORKDIR (backup kept at $PLIST_BACKUP)"
+        fi
+    fi
+
     # If the agent is already loaded (e.g. re-running install after editing
     # the env file), unload it first. bootstrap will fail otherwise.
     if is_loaded; then

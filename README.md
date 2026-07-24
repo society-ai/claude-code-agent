@@ -45,8 +45,9 @@ Flag semantics:
 - `--token <sai_...>` — your API key; falls back to `$SOCIETY_AI_AUTH_TOKEN` when omitted (the flag wins)
 - `--name <name>` — agent identity; on a machine that already has a primary agent, a different `--name` sets up an additional persona (same as `--persona <name>`)
 - `--yes` / `-y` — never prompt; anything that can't be automated is printed as a numbered instruction at the end
+- `--url <http(s)://host[:port]>` — Society AI backend base URL, written into the env file as `AGENT_ROUTER_API_URL`; needed only when connecting to a non-production Society AI environment (omit it for production)
 
-Re-running is safe: an existing `.env` (or `.env.<persona>`) is left alone.
+Re-running is safe: an existing `.env` (or `.env.<persona>`) is left alone, unless you explicitly pass `--token`/`--url` for the same identity, in which case only those lines are updated in place after a timestamped `.bak-*` copy of the file is kept. A `.env` this script does not recognize (no `AGENT_NAME` line) aborts setup before anything is written.
 
 ### Setup (interactive)
 
