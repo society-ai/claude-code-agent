@@ -115,7 +115,7 @@ cmd_install() {
     # If the agent is already loaded (e.g. re-running install after editing
     # the env file), unload it first. bootstrap will fail otherwise.
     if is_loaded; then
-        echo "  Existing LaunchAgent found — unloading first..."
+        echo "  Existing LaunchAgent found, unloading first..."
         launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || \
             launchctl unload "$PLIST_PATH" 2>/dev/null || true
     fi
@@ -170,7 +170,7 @@ cmd_uninstall() {
         echo "  Removed plist at $PLIST_PATH"
     fi
     echo ""
-    echo "Done. Logs at $LOG_DIR remain — delete by hand if you want."
+    echo "Done. Logs at $LOG_DIR remain; delete by hand if you want."
 }
 
 cmd_status() {
@@ -227,7 +227,7 @@ cmd_stop() {
 cmd_start() {
     require_macos
     if is_loaded; then
-        echo "  Already online — ensuring the process is running..."
+        echo "  Already online; ensuring the process is running..."
         launchctl kickstart "gui/$(id -u)/$LABEL" 2>/dev/null || true
         cmd_status
         return

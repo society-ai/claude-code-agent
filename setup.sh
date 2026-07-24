@@ -1,48 +1,172 @@
 #!/usr/bin/env bash
 # Society AI + Claude Code — one-command setup
 #
-# Default run sets up the primary persona (.env). Additional personas
-# (more agents on this same machine, each its own bridge + identity):
+# Fully non-interactive install (what the product page shows):
 #
-#   ./setup.sh --persona <name>
+#   ./setup.sh --token sai_... --name my-agent --yes
 #
-# Reads the persona's sai_… key from $SOCIETY_AI_AUTH_TOKEN when set
-# (non-interactive), otherwise prompts. Writes .env.<name>, creates the
-# per-persona log/socket dir, and installs the persona's LaunchAgent.
+# Flags:
+#   --token <sai_...>  Society AI API key. Wins over $SOCIETY_AI_AUTH_TOKEN.
+#   --name <name>      Agent identity. On a fresh machine this becomes the
+#                      primary persona's AGENT_NAME; on a machine that already
+#                      has a primary persona (.env) a different --name is set
+#                      up as an additional persona (same as --persona <name>).
+#   --yes | -y         Never prompt. Every input must come from a flag, the
+#                      environment, or a derivable default; anything that
+#                      can't be automated is printed as a numbered instruction
+#                      at the end instead of a mid-run prompt. Also installs
+#                      and starts the bridge background service (macOS).
+#   --persona <name>   Explicit additional-persona mode (more agents on this
+#                      same machine, each its own bridge + identity). Writes
+#                      .env.<name>, creates the per-persona log/socket dir,
+#                      and installs the persona's LaunchAgent.
+#
+# Without flags the script runs the original interactive flow: it prompts
+# for the API key, derives a per-host AGENT_NAME, and prints next steps.
+# Env-var fallback: the API key is also read from $SOCIETY_AI_AUTH_TOKEN
+# when no --token is given.
 set -euo pipefail
+set -E
+
+# If any step fails unexpectedly, tell the user (in plain language) that
+# re-running the same command is safe. Explicit `exit` paths print their
+# own guidance and do not trigger this trap.
+on_error() {
+    status=$?
+    echo "" >&2
+    echo "Setup did not finish (a step above failed)." >&2
+    echo "This is safe to retry: fix the issue shown above, then run the" >&2
+    echo "same setup command again. It picks up where it left off." >&2
+    exit "$status"
+}
+trap on_error ERR
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$REPO_DIR"
 
-# ── Additional-persona mode ────────────────────────────────────────────────
-if [ "${1:-}" = "--persona" ]; then
-    PERSONA="${2:-}"
-    if ! printf '%s' "$PERSONA" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,62}$'; then
-        echo "Error: invalid persona name: '${PERSONA}'" >&2
-        echo "(lowercase alphanumerics plus - _ . , max 63 chars)" >&2
+usage() {
+    cat <<EOF
+Usage: ./setup.sh [--token sai_...] [--name <agent-name>] [--yes] [--persona <name>]
+
+  --token <sai_...>   Society AI API key (get one at https://societyai.com).
+                      Falls back to \$SOCIETY_AI_AUTH_TOKEN; flag wins.
+  --name <name>       Agent name. Fresh machine: primary persona's AGENT_NAME.
+                      Existing primary: a different name creates an
+                      additional persona (equivalent to --persona <name>).
+  --yes, -y           Non-interactive: never prompt, install + start the
+                      bridge service. Requires a token via --token or env.
+  --persona <name>    Set up an additional persona explicitly.
+  -h, --help          Show this help.
+
+One-command install:
+  ./setup.sh --token sai_... --name my-agent --yes
+EOF
+}
+
+# ── Flag parsing ───────────────────────────────────────────────────────────
+PERSONA=""
+CLI_TOKEN=""
+CLI_NAME=""
+ASSUME_YES=0
+
+need_value() {
+    if [ "$2" -lt 2 ]; then
+        echo "Error: $1 requires a value" >&2
         exit 1
     fi
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --persona)   need_value "$1" $#; PERSONA="$2"; shift 2 ;;
+        --persona=*) PERSONA="${1#*=}"; shift ;;
+        --token)     need_value "$1" $#; CLI_TOKEN="$2"; shift 2 ;;
+        --token=*)   CLI_TOKEN="${1#*=}"; shift ;;
+        --name)      need_value "$1" $#; CLI_NAME="$2"; shift 2 ;;
+        --name=*)    CLI_NAME="${1#*=}"; shift ;;
+        --yes|-y)    ASSUME_YES=1; shift ;;
+        -h|--help)   usage; exit 0 ;;
+        *)
+            echo "Error: unknown option: $1" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Same shape the WS hub accepts for agent names.
+valid_name() {
+    printf '%s' "$1" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,62}$'
+}
+
+trim() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+if [ -n "$CLI_NAME" ] && ! valid_name "$CLI_NAME"; then
+    echo "Error: invalid agent name: '${CLI_NAME}'" >&2
+    echo "(lowercase alphanumerics plus - _ . , max 63 chars)" >&2
+    exit 1
+fi
+if [ -n "$PERSONA" ] && ! valid_name "$PERSONA"; then
+    echo "Error: invalid persona name: '${PERSONA}'" >&2
+    echo "(lowercase alphanumerics plus - _ . , max 63 chars)" >&2
+    exit 1
+fi
+if [ -n "$PERSONA" ] && [ -n "$CLI_NAME" ] && [ "$PERSONA" != "$CLI_NAME" ]; then
+    echo "Error: --persona '$PERSONA' and --name '$CLI_NAME' conflict." >&2
+    echo "Pass just one of them (they mean the same identity)." >&2
+    exit 1
+fi
+
+# Token precedence: --token flag > $SOCIETY_AI_AUTH_TOKEN env.
+TOKEN="$(trim "${CLI_TOKEN:-${SOCIETY_AI_AUTH_TOKEN:-}}")"
+
+# ── --name → persona mapping ───────────────────────────────────────────────
+# Identities on one machine: the FIRST is the primary persona (.env); every
+# further named identity is an additional persona (.env.<name>). So --name
+# maps onto the primary on a fresh machine, and onto the persona flow when a
+# primary already exists under a different name. Re-running with the
+# primary's own name stays in the primary flow (idempotent).
+if [ -z "$PERSONA" ] && [ -n "$CLI_NAME" ] && [ -f ".env" ]; then
+    EXISTING_NAME="$(grep -E '^AGENT_NAME=' .env 2>/dev/null | head -1 | cut -d= -f2- || true)"
+    if [ "$EXISTING_NAME" != "$CLI_NAME" ]; then
+        PERSONA="$CLI_NAME"
+    fi
+fi
+
+# ── Additional-persona mode ────────────────────────────────────────────────
+if [ -n "$PERSONA" ]; then
     if [ ! -f ".env" ] || [ ! -x "venv/bin/python" ]; then
-        echo "Error: run ./setup.sh (no args) once first to set up the" >&2
-        echo "default persona — additional personas reuse its venv, MCP" >&2
-        echo "registration, hooks, and CLAUDE.md." >&2
+        echo "Error: set up the default persona first. Additional personas" >&2
+        echo "reuse its venv, MCP registration, hooks, and CLAUDE.md. Run:" >&2
+        echo "  ./setup.sh                      (interactive)" >&2
+        echo "  ./setup.sh --token sai_... --yes  (non-interactive)" >&2
         exit 1
     fi
 
     ENV_FILE=".env.$PERSONA"
     if [ -f "$ENV_FILE" ]; then
-        echo "  $ENV_FILE already exists — leaving it alone."
+        echo "  $ENV_FILE already exists. Leaving it alone."
         echo "  To reconfigure, delete it and re-run."
     else
-        API_KEY="${SOCIETY_AI_AUTH_TOKEN:-}"
+        API_KEY="$TOKEN"
         if [ -z "$API_KEY" ]; then
+            if [ "$ASSUME_YES" = 1 ]; then
+                echo "Error: --yes given but no API key available." >&2
+                echo "Pass --token sai_... (or export SOCIETY_AI_AUTH_TOKEN)." >&2
+                echo "Create the agent + key at: https://societyai.com" >&2
+                exit 1
+            fi
             echo ""
             echo "  Persona '$PERSONA' needs its own Society AI API key."
             echo "  Create the agent + key at: https://societyai.com"
             echo ""
             read -rp "  Enter the API key for $PERSONA (sai_...): " API_KEY || true
-            API_KEY="${API_KEY#"${API_KEY%%[![:space:]]*}"}"
-            API_KEY="${API_KEY%"${API_KEY##*[![:space:]]}"}"
+            API_KEY="$(trim "$API_KEY")"
         fi
         case "$API_KEY" in
             sai_*) ;;
@@ -57,7 +181,7 @@ if [ "${1:-}" = "--persona" ]; then
 
         umask 077
         {
-            echo "# Persona '$PERSONA' — created by setup.sh --persona"
+            echo "# Persona '$PERSONA' - created by setup.sh"
             echo "SOCIETY_AI_AUTH_TOKEN=$API_KEY"
             echo "AGENT_NAME=$PERSONA"
             [ -n "$API_URL" ] && echo "AGENT_ROUTER_API_URL=$API_URL"
@@ -81,31 +205,84 @@ if [ "${1:-}" = "--persona" ]; then
     exit 0
 fi
 
+# Per-host default agent name, so two users on the same org don't collide
+# on the WS hub (which rejects duplicate connections). Used by the intro
+# below and by step 3 when no --name was given.
+derive_host_agent_name() {
+    local host_short user_short
+    host_short="$(hostname -s 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/^-*//;s/-*$//' || true)"
+    user_short="$(id -un 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/^-*//;s/-*$//' || true)"
+    if [ -n "$user_short" ] && [ -n "$host_short" ]; then
+        printf 'claude-code-%s-%s' "$user_short" "$host_short"
+    elif [ -n "$host_short" ]; then
+        printf 'claude-code-%s' "$host_short"
+    else
+        printf 'claude-code'
+    fi
+}
+
+# The name this setup will connect as (for the intro and the final block):
+# --name wins; otherwise an existing .env's AGENT_NAME; otherwise the
+# per-host default.
+AGENT_DISPLAY_NAME="$CLI_NAME"
+if [ -z "$AGENT_DISPLAY_NAME" ] && [ -f ".env" ]; then
+    AGENT_DISPLAY_NAME="$(grep -E '^AGENT_NAME=' .env 2>/dev/null | head -1 | cut -d= -f2- || true)"
+fi
+if [ -z "$AGENT_DISPLAY_NAME" ]; then
+    AGENT_DISPLAY_NAME="$(derive_host_agent_name)"
+fi
+
 echo "========================================"
 echo "  Society AI + Claude Code Setup"
 echo "========================================"
 echo ""
 
+if [ "$ASSUME_YES" = 1 ]; then
+    echo "  Connecting your Claude Code to Society AI as agent '$AGENT_DISPLAY_NAME'."
+    echo "  This takes about 2 minutes. It is safe to leave this window open"
+    echo "  until it says Done."
+    echo ""
+fi
+
 # 1. Check prerequisites
-echo "[1/7] Checking prerequisites..."
+echo "[1/7] Checking that Python and Claude Code are installed..."
 
 if ! command -v python3 &>/dev/null; then
-    echo "Error: python3 is required. Install it from https://python.org" >&2
+    echo "" >&2
+    echo "  Python 3 is not installed. Python is a free tool this agent" >&2
+    echo "  needs in order to run." >&2
+    echo "" >&2
+    echo "  On a Mac, install it by running this command and following the" >&2
+    echo "  popup window:" >&2
+    echo "" >&2
+    echo "      xcode-select --install" >&2
+    echo "" >&2
+    echo "  (Or download it from https://python.org for any system.)" >&2
+    echo "" >&2
+    echo "  When the install finishes, run this setup command again." >&2
     exit 1
 fi
 
 if ! command -v claude &>/dev/null; then
-    echo "Error: Claude Code CLI is required." >&2
-    echo "Install it: npm install -g @anthropic-ai/claude-code" >&2
+    echo "" >&2
+    echo "  Claude Code is not installed. Claude Code is Anthropic's AI" >&2
+    echo "  coding assistant that will power your agent. Install it first:" >&2
+    echo "" >&2
+    echo "      npm install -g @anthropic-ai/claude-code" >&2
+    echo "" >&2
+    echo "  (More ways to install: https://claude.com/claude-code)" >&2
+    echo "" >&2
+    echo "  Then run this setup command again." >&2
     exit 1
 fi
 
-echo "  python3 ... OK"
-echo "  claude  ... OK"
+echo "  Python ....... OK"
+echo "  Claude Code .. OK"
 
 # 2. Create virtual environment
 echo ""
-echo "[2/7] Setting up Python virtual environment..."
+echo "[2/7] Setting up a private workspace for your agent..."
+echo "      (a Python virtual environment in venv/, plus dependencies)"
 if [ ! -d "venv" ]; then
     python3 -m venv venv
     echo "  Created venv/"
@@ -129,20 +306,28 @@ fi
 
 # 3. Get API key + agent name
 echo ""
-echo "[3/7] Configuring API key..."
+echo "[3/7] Saving your connection key..."
+echo "      (your Society AI API key, stored in the .env file in this folder)"
 if [ -f ".env" ]; then
-    echo "  .env already exists — leaving it alone."
+    echo "  A connection key is already saved (.env exists). Leaving it alone."
     echo "  To reconfigure, delete .env and re-run ./setup.sh"
 else
-    echo ""
-    echo "  You need a Society AI API key to connect."
-    echo "  Get one at: https://societyai.com"
-    echo ""
-    # Read the key (suppress -r warning if not a real terminal)
-    API_KEY=""
-    read -rp "  Enter your API key (sai_...): " API_KEY || true
-    API_KEY="${API_KEY#"${API_KEY%%[![:space:]]*}"}"  # trim leading whitespace
-    API_KEY="${API_KEY%"${API_KEY##*[![:space:]]}"}"  # trim trailing whitespace
+    API_KEY="$TOKEN"
+    if [ -z "$API_KEY" ]; then
+        if [ "$ASSUME_YES" = 1 ]; then
+            echo "  Error: --yes given but no API key available." >&2
+            echo "  Pass --token sai_... (or export SOCIETY_AI_AUTH_TOKEN)." >&2
+            echo "  Get your key at https://societyai.com" >&2
+            exit 1
+        fi
+        echo ""
+        echo "  You need a Society AI API key to connect."
+        echo "  Get one at: https://societyai.com"
+        echo ""
+        # Read the key (suppress -r warning if not a real terminal)
+        read -rp "  Enter your API key (sai_...): " API_KEY || true
+        API_KEY="$(trim "$API_KEY")"
+    fi
 
     if [ -z "$API_KEY" ]; then
         echo "  Error: API key is required to continue. Re-run ./setup.sh and paste your sai_... key." >&2
@@ -157,15 +342,12 @@ else
             ;;
     esac
 
-    # Default AGENT_NAME to a per-host value so two users on the same org
-    # don't collide on the WS hub (which rejects duplicate connections).
-    HOST_SHORT="$(hostname -s 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/^-*//;s/-*$//' || true)"
-    USER_SHORT="$(id -un 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/^-*//;s/-*$//' || true)"
-    DEFAULT_AGENT_NAME="claude-code"
-    if [ -n "$USER_SHORT" ] && [ -n "$HOST_SHORT" ]; then
-        DEFAULT_AGENT_NAME="claude-code-${USER_SHORT}-${HOST_SHORT}"
-    elif [ -n "$HOST_SHORT" ]; then
-        DEFAULT_AGENT_NAME="claude-code-${HOST_SHORT}"
+    # Agent name: --name wins; otherwise default AGENT_NAME to the per-host
+    # value derived above.
+    if [ -n "$CLI_NAME" ]; then
+        DEFAULT_AGENT_NAME="$CLI_NAME"
+    else
+        DEFAULT_AGENT_NAME="$(derive_host_agent_name)"
     fi
 
     # Write .env safely via Python to avoid sed/shell injection
@@ -187,13 +369,14 @@ try:
 except OSError:
     pass
 print(f"  API key saved to .env (mode 0600)")
-print(f"  AGENT_NAME defaulted to {agent_name}")
+print(f"  AGENT_NAME set to {agent_name}")
 PYEOF
 fi
 
 # 4. Configure Claude Code MCP server
 echo ""
-echo "[4/7] Configuring Claude Code MCP server..."
+echo "[4/7] Connecting your agent to Claude Code..."
+echo "      (registers the Society AI MCP server in Claude Code's settings)"
 
 # Load env vars for the config script (set -a exports them)
 set -a
@@ -218,7 +401,8 @@ python3 "$REPO_DIR/configure_claude.py"
 # marker-wrapped block this installer wrote is touched; everything else
 # in the user's CLAUDE.md is preserved.
 echo ""
-echo "[5/7] Removing legacy Society AI section from ~/.claude/CLAUDE.md (if installed)..."
+echo "[5/7] Cleaning up settings from older versions..."
+echo "      (removes the legacy Society AI section from ~/.claude/CLAUDE.md)"
 
 python3 - << 'PYEOF'
 import os
@@ -253,7 +437,8 @@ PYEOF
 # to ask. Idempotent (replaces in place). Skip on SKIP_HOOKS=1 for users
 # who manage ~/.claude/settings.json by hand.
 echo ""
-echo "[6/7] Installing Society AI hooks (SessionStart + Stop)..."
+echo "[6/7] Giving Claude Code awareness of your Society AI tasks..."
+echo "      (installs the SessionStart and Stop hooks)"
 
 if [ "${SKIP_HOOKS:-}" = "1" ]; then
     echo "  Skipped (SKIP_HOOKS=1)"
@@ -261,23 +446,66 @@ else
     python3 "$REPO_DIR/configure_hooks.py"
 fi
 
-# 7. Done
+# 7. Start the bridge — automatic in --yes mode, printed as next steps
+# otherwise.
 echo ""
-echo "[7/7] Setup complete!"
-echo ""
-echo "========================================"
-echo "  Next steps:"
-echo "========================================"
-echo ""
-echo "  1. Start the bridge (keeps Claude Code connected to Society AI):"
-echo ""
-echo "     source .env && source venv/bin/activate && python bridge.py"
-echo ""
-echo "  2. Chat with your Claude Code agent from societyai.com"
-echo ""
-echo "  3. Or use Society AI tools directly in Claude Code:"
-echo ""
-echo "     claude"
-echo "     > list my tasks"
-echo ""
-echo "========================================"
+if [ "$ASSUME_YES" = 1 ]; then
+    echo "[7/7] Starting your agent in the background..."
+    echo "      (installs the bridge as a service that runs at login)"
+    if [ "$(uname)" = "Darwin" ]; then
+        mkdir -p "$HOME/.cache/society-ai"
+        ./service.sh install
+        echo ""
+        echo "========================================"
+        echo "  Done!"
+        echo "========================================"
+        echo ""
+        echo "  Your agent '$AGENT_DISPLAY_NAME' is now running in the"
+        echo "  background, and it will start again automatically every"
+        echo "  time you log in to this computer."
+        echo ""
+        echo "  You can close this window."
+        echo ""
+        echo "  Go back to your browser: the Agent Factory page will show"
+        echo "  your agent as connected in a few seconds."
+        echo ""
+        echo "  Logs live in:        ~/.cache/society-ai/bridge.log"
+        echo "  To stop the agent:   ./service.sh stop   (run from this folder)"
+        echo ""
+        echo "========================================"
+    else
+        echo "  Background-service install is macOS-only (launchd)."
+        echo "  Everything else is configured. Two ways to run the bridge:"
+        echo ""
+        echo "  1. Foreground (quick test):"
+        echo "       source .env && source venv/bin/activate && python bridge.py"
+        echo "  2. As a systemd user service (recommended): copy the template"
+        echo "     from the README's 'Linux users' section into"
+        echo "     ~/.config/systemd/user/claude-code-bridge.service, then run:"
+        echo "       systemctl --user enable --now claude-code-bridge"
+        echo "  3. Then go to https://societyai.com and chat with your agent."
+    fi
+else
+    echo "[7/7] Setup complete!"
+    echo ""
+    echo "========================================"
+    echo "  Next steps:"
+    echo "========================================"
+    echo ""
+    echo "  1. Start the bridge (keeps Claude Code connected to Society AI):"
+    echo ""
+    echo "     source .env && source venv/bin/activate && python bridge.py"
+    echo ""
+    echo "     Or install it as a background service (recommended):"
+    echo ""
+    echo "     ./service.sh install"
+    echo ""
+    echo "  2. Chat with your Claude Code agent from societyai.com"
+    echo ""
+    echo "  3. Or use Society AI tools directly in Claude Code:"
+    echo ""
+    echo "     claude"
+    echo "     > list my tasks"
+    echo ""
+    echo "========================================"
+fi

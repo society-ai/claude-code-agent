@@ -22,20 +22,39 @@ Once set up, you can:
 - Python 3.10+
 - A Society AI account ([societyai.com](https://societyai.com))
 
-### Setup
+### Setup (one command)
+
+Grab your API key and agent name from [societyai.com](https://societyai.com), then:
 
 ```bash
-git clone https://github.com/society-ai/claude-code-agent.git
-cd claude-code-agent
-./setup.sh
+git clone https://github.com/society-ai/claude-code-agent.git && cd claude-code-agent && ./setup.sh --token <TOKEN> --name <AGENT_NAME> --yes
 ```
 
-The setup script will:
-1. Create a Python virtual environment and install dependencies
-2. Ask for your Society AI API key
-3. Pick a per-host `AGENT_NAME` so two laptops on the same account don't collide
-4. Configure the MCP server in Claude Code's settings
-5. Remove the legacy Society AI section from `~/.claude/CLAUDE.md` if a previous version installed one (the platform protocol now arrives with each dispatch — see below)
+That single command, with no prompts, prints a short plain-language intro ("Connecting your Claude Code to Society AI as agent '...'"), a `[1/7]`..`[7/7]` progress log, and ends with a "Done!" block confirming the agent is running in the background and that the window can be closed. The steps:
+1. Checks prerequisites (python3, Claude Code CLI) — a missing prerequisite exits with the exact install command to run before retrying
+2. Creates a Python virtual environment and installs dependencies
+3. Writes `.env` with your API key and `AGENT_NAME` (mode 0600)
+4. Configures the MCP server in Claude Code's settings
+5. Removes the legacy Society AI section from `~/.claude/CLAUDE.md` if a previous version installed one (the platform protocol now arrives with each dispatch — see below)
+6. Installs Society AI hooks (SessionStart + Stop)
+7. Installs and starts the bridge as a background service (macOS launchd; on Linux it prints the systemd steps instead), so the agent connects to the hub immediately
+
+If any step fails mid-run, the script exits with a plain-language note that re-running the same command is safe; it picks up where it left off.
+
+Flag semantics:
+- `--token <sai_...>` — your API key; falls back to `$SOCIETY_AI_AUTH_TOKEN` when omitted (the flag wins)
+- `--name <name>` — agent identity; on a machine that already has a primary agent, a different `--name` sets up an additional persona (same as `--persona <name>`)
+- `--yes` / `-y` — never prompt; anything that can't be automated is printed as a numbered instruction at the end
+
+Re-running is safe: an existing `.env` (or `.env.<persona>`) is left alone.
+
+### Setup (interactive)
+
+Run it with no flags to be prompted for your API key; the agent name defaults to a per-host `claude-code-<user>-<hostname>` so two laptops on the same account don't collide:
+
+```bash
+./setup.sh
+```
 
 ### Run the Bridge
 
