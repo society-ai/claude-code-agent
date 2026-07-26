@@ -242,6 +242,11 @@ def discover_personas() -> list[dict]:
             persona_arg = entry[len(".env."):]
             if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,62}", persona_arg):
                 continue
+            # setup.sh keeps timestamped backups (.env.bak-<epoch>,
+            # .env.<persona>.bak-<epoch>) before overwriting a config. They
+            # are not agents; listing them invents personas that don't exist.
+            if re.search(r"\.?bak-\d+$", persona_arg):
+                continue
             pid = persona_arg
         else:
             continue
