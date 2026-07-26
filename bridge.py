@@ -1824,6 +1824,12 @@ def discover_roster() -> "list[AgentContext]":
             persona_arg = entry[len(".env."):]
             if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,62}", persona_arg):
                 continue
+            # setup.sh keeps timestamped backups (.env.bak-<epoch>,
+            # .env.<persona>.bak-<epoch>) before overwriting a config. Running
+            # them would connect a duplicate of a live agent under its old
+            # credentials, so they are never part of the roster.
+            if re.search(r"\.?bak-\d+$", persona_arg):
+                continue
         else:
             continue
         ctx = _context_from_env_file(repo, entry, persona_arg)
@@ -1922,6 +1928,28 @@ class Harness:
 
 def main():
     roster = discover_roster()
+
+    # Single-agent mode. bridge_launcher.sh sources one agent's env file
+    # (which always carries AGENT_NAME) before exec'ing us, so a per-agent
+    # LaunchAgent must run ONLY that agent. Without this every per-agent
+    # service would start the whole roster, so each agent got connected once
+    # per installed service; the hub accepts the first and rejects the rest
+    # with "already connected", and the losers reconnect forever. That churn
+    # makes the agent undeliverable: tasks never reach a stable connection.
+    # harness_launcher.sh deliberately sources only .env.defaults (no
+    # AGENT_NAME), so the machine-wide harness still runs the full roster.
+    only = (os.getenv("AGENT_NAME") or "").strip()
+    if only:
+        roster = [c for c in roster if c.name == only]
+        if not roster:
+            print(
+                f"Error: AGENT_NAME={only} is set, but no .env file in this "
+                "folder defines that agent. Check the env file this service "
+                "sources, or run ./setup.sh again.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
     if not roster:
         print(
             "Error: no agents found. Set SOCIETY_AI_AUTH_TOKEN + AGENT_NAME in "
