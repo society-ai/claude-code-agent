@@ -22,10 +22,12 @@
 #                      and installs the persona's LaunchAgent.
 #   --url <url>        Society AI backend base URL (must start with http://
 #                      or https://). Only needed when connecting to a
-#                      non-production Society AI environment. Written into
-#                      the env file as AGENT_ROUTER_API_URL; when omitted
-#                      nothing is written and the production default
-#                      (https://api.societyai.com) applies.
+#                      non-production Society AI environment. Every env file
+#                      this script writes always states its target
+#                      explicitly as AGENT_ROUTER_API_URL; when the flag is
+#                      omitted the production default ($PROD_API_URL below,
+#                      https://api.societyai.com) is written. A persona
+#                      NEVER inherits the URL from the primary .env.
 #
 # Without flags the script runs the original interactive flow: it prompts
 # for the API key, derives a per-host AGENT_NAME, and prints next steps.
@@ -50,6 +52,11 @@ trap on_error ERR
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$REPO_DIR"
 
+# The Society AI environment every install targets unless --url says
+# otherwise. Single source of truth: the usage text, the primary .env and
+# every persona env file all resolve through this one constant.
+PROD_API_URL="https://api.societyai.com"
+
 usage() {
     cat <<EOF
 Usage: ./setup.sh [--token sai_...] [--name <agent-name>] [--yes] [--persona <name>] [--url <url>]
@@ -65,7 +72,7 @@ Usage: ./setup.sh [--token sai_...] [--name <agent-name>] [--yes] [--persona <na
   --url <url>         Society AI backend base URL (http:// or https://).
                       Only needed for a non-production Society AI
                       environment; written into the env file as
-                      AGENT_ROUTER_API_URL. Default: https://api.societyai.com
+                      AGENT_ROUTER_API_URL. Default: $PROD_API_URL
   -h, --help          Show this help.
 
 One-command install:
@@ -209,6 +216,85 @@ except OSError:
 PYEOF
 }
 
+# Read AGENT_ROUTER_API_URL out of ONE specific env file. Only ever called
+# with the file that belongs to the identity being set up: a persona reads
+# its own .env.<persona> and never the primary .env, so a persona's target
+# environment can never drift with the primary's.
+env_file_api_url() {
+    local file="$1" value=""
+    if [ -f "$file" ]; then
+        value="$(grep -E '^AGENT_ROUTER_API_URL=' "$file" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+    fi
+    trim "$value"
+}
+
+# ── Bridge connection verification (shared by primary + persona) ───────────
+# Defined up here (no side effects) so the persona path, which exits before
+# the primary path's step 7, can run the same check.
+
+# Watch the bridge logs for the connection verdict. Reads ONLY bytes
+# written after the offsets captured before the service (re)started, so
+# lines left over from a previous run can never produce a false verdict.
+# Prints exactly one of: connected | auth-failed | timeout
+# Reads globals: BRIDGE_OUT_LOG, BRIDGE_ERR_LOG, OUT_OFFSET, ERR_OFFSET.
+verify_bridge_connected() {
+    local waited=0 new_lines
+    while :; do
+        new_lines="$( { tail -c +"$((OUT_OFFSET + 1))" "$BRIDGE_OUT_LOG" 2>/dev/null
+                        tail -c +"$((ERR_OFFSET + 1))" "$BRIDGE_ERR_LOG" 2>/dev/null; } || true )"
+        # Auth rejection is definitive: the bridge logs it and exits.
+        # (Emitted by bridge.py's exchange_api_key_for_jwt on HTTP 401/403.)
+        if printf '%s\n' "$new_lines" | grep -q "Auth failed exchanging API key"; then
+            echo "auth-failed"
+            return 0
+        fi
+        # Definitive success: the hub accepted this agent's registration.
+        # (bridge.py logs 'Registered as <agent_id>' on the ack.)
+        if printf '%s\n' "$new_lines" | grep -q "Registered as "; then
+            echo "connected"
+            return 0
+        fi
+        if [ "$waited" -ge 60 ]; then
+            echo "timeout"
+            return 0
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+}
+
+# Snapshot the byte sizes of the two bridge logs BEFORE the service starts,
+# so verify_bridge_connected only trusts lines written by this run.
+# $1 = stdout log, $2 = stderr log. Sets the four globals above.
+snapshot_bridge_logs() {
+    BRIDGE_OUT_LOG="$1"
+    BRIDGE_ERR_LOG="$2"
+    OUT_OFFSET=$({ wc -c < "$BRIDGE_OUT_LOG"; } 2>/dev/null || echo 0)
+    ERR_OFFSET=$({ wc -c < "$BRIDGE_ERR_LOG"; } 2>/dev/null || echo 0)
+    OUT_OFFSET=$((OUT_OFFSET + 0))
+    ERR_OFFSET=$((ERR_OFFSET + 0))
+}
+
+# The plain-language "your key was not accepted" explanation, shared by the
+# primary and persona paths. $1 = the API URL this install tried,
+# $2 = path to the error log.
+print_auth_failed_help() {
+    echo "  Your connection key was not accepted."
+    echo ""
+    echo "  This usually happens for one of two reasons:"
+    echo "    1. The key was already used or has since been regenerated,"
+    echo "       so it is no longer valid."
+    echo "    2. The key belongs to a different Society AI environment"
+    echo "       than the one this setup connects to."
+    echo ""
+    echo "  It tried to connect to $1."
+    echo ""
+    echo "  To fix it: go back to your browser, open your agent's page,"
+    echo "  click Regenerate token, and run the NEW command it gives you."
+    echo ""
+    echo "  Details are in the log: $2"
+}
+
 # ── --name → persona mapping ───────────────────────────────────────────────
 # Identities on one machine: the FIRST is the primary persona (.env); every
 # further named identity is an additional persona (.env.<name>). So --name
@@ -233,6 +319,24 @@ if [ -n "$PERSONA" ]; then
     fi
 
     ENV_FILE=".env.$PERSONA"
+
+    # Which Society AI environment this persona talks to. --url wins;
+    # otherwise the persona's OWN env file if it already has a line; else
+    # production. The primary .env is deliberately never consulted: a
+    # persona set up with a production key must not silently inherit a
+    # local or staging URL from whatever the primary happens to use.
+    PERSONA_API_URL="$CLI_URL"
+    if [ -z "$PERSONA_API_URL" ]; then
+        PERSONA_API_URL="$(env_file_api_url "$ENV_FILE")"
+    fi
+    if [ -z "$PERSONA_API_URL" ]; then
+        PERSONA_API_URL="$PROD_API_URL"
+    fi
+    echo ""
+    echo "  Setting up persona '$PERSONA'."
+    echo "  Environment: $PERSONA_API_URL"
+    echo ""
+
     if [ -f "$ENV_FILE" ]; then
         if [ -n "$CLI_TOKEN" ] || [ -n "$CLI_URL" ]; then
             # The re-run explicitly provides new settings for this same
@@ -247,7 +351,9 @@ if [ -n "$PERSONA" ]; then
                 esac
             fi
             backup_env_file "$ENV_FILE"
-            update_env_file "$ENV_FILE" "${CLI_TOKEN:+$TOKEN}" "$CLI_URL"
+            # Always write the resolved URL, so the file states its target
+            # explicitly instead of relying on an implicit default.
+            update_env_file "$ENV_FILE" "${CLI_TOKEN:+$TOKEN}" "$PERSONA_API_URL"
         else
             echo "  $ENV_FILE already exists. Leaving it alone."
             echo "  To reconfigure, delete it and re-run."
@@ -276,36 +382,108 @@ if [ -n "$PERSONA" ]; then
                 ;;
         esac
 
-        # API URL: --url wins; otherwise inherit from the default
-        # persona's .env when set there.
-        API_URL="$CLI_URL"
-        if [ -z "$API_URL" ]; then
-            API_URL="$(grep -E '^AGENT_ROUTER_API_URL=' .env 2>/dev/null | head -1 | cut -d= -f2- || true)"
-        fi
-
+        # API URL is PERSONA_API_URL, resolved above from --url or the
+        # production default. Always written, never inherited from .env.
         umask 077
         {
             echo "# Persona '$PERSONA' - created by setup.sh"
             echo "SOCIETY_AI_AUTH_TOKEN=$API_KEY"
             echo "AGENT_NAME=$PERSONA"
-            [ -n "$API_URL" ] && echo "AGENT_ROUTER_API_URL=$API_URL"
+            echo "AGENT_ROUTER_API_URL=$PERSONA_API_URL"
             echo "SOCIETY_AI_BRIDGE_SOCKET=$HOME/.cache/society-ai/$PERSONA/bridge.sock"
         } > "$ENV_FILE"
         chmod 600 "$ENV_FILE"
         echo "  Wrote $ENV_FILE (mode 0600)"
+        echo "  AGENT_ROUTER_API_URL set to $PERSONA_API_URL"
     fi
 
     mkdir -p "$HOME/.cache/society-ai/$PERSONA"
-    ./service.sh install "$PERSONA"
 
-    echo ""
-    echo "Persona '$PERSONA' is set up."
-    echo "  - Its bridge runs as LaunchAgent io.societyai.claude-code-bridge.$PERSONA"
-    echo "  - Sessions it spawns authenticate as '$PERSONA' (env expansion in"
-    echo "    the shared MCP registration; interactive terminal sessions still"
-    echo "    default to the primary persona)."
-    echo "  - Optional: edit $ENV_FILE to set WORK_DIR / EXTRA_DIRS for this"
-    echo "    persona's file scope, then: ./service.sh restart $PERSONA"
+    print_persona_summary() {
+        echo "  - Its bridge runs as LaunchAgent io.societyai.claude-code-bridge.$PERSONA"
+        echo "  - Sessions it spawns authenticate as '$PERSONA' (env expansion in"
+        echo "    the shared MCP registration; interactive terminal sessions still"
+        echo "    default to the primary persona)."
+        echo "  - Optional: edit $ENV_FILE to set WORK_DIR / EXTRA_DIRS for this"
+        echo "    persona's file scope, then: ./service.sh restart $PERSONA"
+    }
+
+    if [ "$ASSUME_YES" = 1 ] && [ "$(uname)" = "Darwin" ]; then
+        snapshot_bridge_logs \
+            "$HOME/.cache/society-ai/$PERSONA/bridge.log" \
+            "$HOME/.cache/society-ai/$PERSONA/bridge.err.log"
+        ./service.sh install "$PERSONA"
+        echo ""
+        echo "  Checking that persona '$PERSONA' can connect to Society AI..."
+        echo "  (this can take up to a minute)"
+        VERDICT="$(verify_bridge_connected)"
+        if [ "$VERDICT" = "connected" ]; then
+            echo ""
+            echo "========================================"
+            echo "  Done!"
+            echo "========================================"
+            echo ""
+            echo "  Persona '$PERSONA' is now running in the background, and it"
+            echo "  will start again automatically every time you log in to"
+            echo "  this computer."
+            echo ""
+            echo "  Environment: $PERSONA_API_URL"
+            echo ""
+            echo "  You can close this window."
+            echo ""
+            echo "  Go back to your browser: the Agent Factory page will show"
+            echo "  '$PERSONA' as connected in a few seconds."
+            echo ""
+            print_persona_summary
+            echo ""
+            echo "  Logs live in:        $BRIDGE_OUT_LOG"
+            echo "  To stop this agent:  ./service.sh stop $PERSONA   (run from this folder)"
+            echo "  All agents on this computer:  ./status.sh"
+            echo ""
+            echo "========================================"
+        elif [ "$VERDICT" = "auth-failed" ]; then
+            echo ""
+            echo "========================================"
+            echo "  Connection failed"
+            echo "========================================"
+            echo ""
+            echo "  Persona '$PERSONA' could not sign in to Society AI."
+            echo ""
+            print_auth_failed_help "$PERSONA_API_URL" "$BRIDGE_ERR_LOG"
+            echo ""
+            echo "  If that key belongs to a different environment, re-run this"
+            echo "  setup with --url <that environment's address>."
+            echo ""
+            exit 1
+        else
+            echo ""
+            echo "========================================"
+            echo "  Almost done"
+            echo "========================================"
+            echo ""
+            echo "  Persona '$PERSONA' is set up, but its connection to Society AI"
+            echo "  could not be confirmed within a minute."
+            echo ""
+            echo "  Environment: $PERSONA_API_URL"
+            echo ""
+            echo "  It may still connect on its own. Your agent's page in the"
+            echo "  browser will show it as connected once it does."
+            echo ""
+            echo "  To watch what the agent is doing, run:"
+            echo "      tail -f $BRIDGE_ERR_LOG"
+            echo ""
+            echo "  Re-running the same setup command is always safe."
+            echo ""
+            print_persona_summary
+            echo ""
+        fi
+    else
+        ./service.sh install "$PERSONA"
+        echo ""
+        echo "Persona '$PERSONA' is set up."
+        echo "  - Environment: $PERSONA_API_URL"
+        print_persona_summary
+    fi
     exit 0
 fi
 
@@ -336,6 +514,18 @@ if [ -z "$AGENT_DISPLAY_NAME" ]; then
     AGENT_DISPLAY_NAME="$(derive_host_agent_name)"
 fi
 
+# Which Society AI environment the primary persona talks to. --url wins;
+# otherwise this folder's own .env when it already names one; else
+# production. Resolved once here so the intro can show it and step 3 can
+# write it out explicitly.
+API_URL_RESOLVED="$CLI_URL"
+if [ -z "$API_URL_RESOLVED" ]; then
+    API_URL_RESOLVED="$(env_file_api_url .env)"
+fi
+if [ -z "$API_URL_RESOLVED" ]; then
+    API_URL_RESOLVED="$PROD_API_URL"
+fi
+
 echo "========================================"
 echo "  Society AI + Claude Code Setup"
 echo "========================================"
@@ -343,6 +533,7 @@ echo ""
 
 if [ "$ASSUME_YES" = 1 ]; then
     echo "  Connecting your Claude Code to Society AI as agent '$AGENT_DISPLAY_NAME'."
+    echo "  Environment: $API_URL_RESOLVED"
     echo "  This takes about 2 minutes. It is safe to leave this window open"
     echo "  until it says Done."
     echo ""
@@ -428,7 +619,11 @@ if [ -f ".env" ]; then
             esac
         fi
         backup_env_file ".env"
-        update_env_file ".env" "${CLI_TOKEN:+$TOKEN}" "$CLI_URL"
+        # Always write the resolved URL, so .env states its target
+        # explicitly instead of relying on an implicit default. Without
+        # --url this is whatever the file already said (a no-op), or the
+        # production default when it said nothing.
+        update_env_file ".env" "${CLI_TOKEN:+$TOKEN}" "$API_URL_RESOLVED"
     else
         echo "  A connection key is already saved (.env exists). Leaving it alone."
         echo "  To reconfigure, delete .env and re-run ./setup.sh"
@@ -472,8 +667,10 @@ else
         DEFAULT_AGENT_NAME="$(derive_host_agent_name)"
     fi
 
-    # Write .env safely via Python to avoid sed/shell injection
-    python3 - "$API_KEY" "$DEFAULT_AGENT_NAME" "$CLI_URL" <<'PYEOF'
+    # Write .env safely via Python to avoid sed/shell injection.
+    # The URL passed here is always the resolved one (--url or the
+    # production default), never empty: a fresh .env states its target.
+    python3 - "$API_KEY" "$DEFAULT_AGENT_NAME" "$API_URL_RESOLVED" <<'PYEOF'
 import os, sys, shutil, re
 key, agent_name, url = sys.argv[1], sys.argv[2], sys.argv[3]
 shutil.copy(".env.example", ".env")
@@ -483,8 +680,8 @@ content = content.replace("sai_your_api_key_here", key)
 # Inject AGENT_NAME default if user didn't already uncomment it
 if not re.search(r"^AGENT_NAME=", content, re.M):
     content = re.sub(r"# AGENT_NAME=claude-code", f"AGENT_NAME={agent_name}", content)
-# --url: point the agent at a non-production Society AI backend. Absent the
-# flag, nothing is written and config.py's production default applies.
+# The target Society AI backend, always written explicitly so the file is
+# self-describing (production default unless --url said otherwise).
 if url:
     line = f"AGENT_ROUTER_API_URL={url}"
     if re.search(r"^AGENT_ROUTER_API_URL=", content, re.M):
@@ -584,36 +781,8 @@ fi
 # otherwise. In --yes mode the service start is followed by a connection
 # check: the outro only says "Done!" once the bridge log shows the agent
 # actually registered with the Society AI hub.
-
-# Watch the bridge logs for the connection verdict. Reads ONLY bytes
-# written after the offsets captured before the service (re)started, so
-# lines left over from a previous run can never produce a false verdict.
-# Prints exactly one of: connected | auth-failed | timeout
-verify_bridge_connected() {
-    local waited=0 new_lines
-    while :; do
-        new_lines="$( { tail -c +"$((OUT_OFFSET + 1))" "$BRIDGE_OUT_LOG" 2>/dev/null
-                        tail -c +"$((ERR_OFFSET + 1))" "$BRIDGE_ERR_LOG" 2>/dev/null; } || true )"
-        # Auth rejection is definitive: the bridge logs it and exits.
-        # (Emitted by bridge.py's exchange_api_key_for_jwt on HTTP 401/403.)
-        if printf '%s\n' "$new_lines" | grep -q "Auth failed exchanging API key"; then
-            echo "auth-failed"
-            return 0
-        fi
-        # Definitive success: the hub accepted this agent's registration.
-        # (bridge.py logs 'Registered as <agent_id>' on the ack.)
-        if printf '%s\n' "$new_lines" | grep -q "Registered as "; then
-            echo "connected"
-            return 0
-        fi
-        if [ "$waited" -ge 60 ]; then
-            echo "timeout"
-            return 0
-        fi
-        sleep 2
-        waited=$((waited + 2))
-    done
-}
+# (verify_bridge_connected and its helpers are defined near the top, so the
+# persona path can run the same check.)
 
 echo ""
 if [ "$ASSUME_YES" = 1 ]; then
@@ -621,14 +790,9 @@ if [ "$ASSUME_YES" = 1 ]; then
     echo "      (installs the bridge as a service that runs at login)"
     if [ "$(uname)" = "Darwin" ]; then
         mkdir -p "$HOME/.cache/society-ai"
-        BRIDGE_OUT_LOG="$HOME/.cache/society-ai/bridge.log"
-        BRIDGE_ERR_LOG="$HOME/.cache/society-ai/bridge.err.log"
-        # Snapshot current log sizes BEFORE the service starts, so the
-        # verification below only trusts lines written by this run.
-        OUT_OFFSET=$({ wc -c < "$BRIDGE_OUT_LOG"; } 2>/dev/null || echo 0)
-        ERR_OFFSET=$({ wc -c < "$BRIDGE_ERR_LOG"; } 2>/dev/null || echo 0)
-        OUT_OFFSET=$((OUT_OFFSET + 0))
-        ERR_OFFSET=$((ERR_OFFSET + 0))
+        snapshot_bridge_logs \
+            "$HOME/.cache/society-ai/bridge.log" \
+            "$HOME/.cache/society-ai/bridge.err.log"
         ./service.sh install
         echo ""
         echo "  Checking that your agent can connect to Society AI..."
@@ -644,6 +808,8 @@ if [ "$ASSUME_YES" = 1 ]; then
             echo "  background, and it will start again automatically every"
             echo "  time you log in to this computer."
             echo ""
+            echo "  Environment: $API_URL_RESOLVED"
+            echo ""
             echo "  You can close this window."
             echo ""
             echo "  Go back to your browser: the Agent Factory page will show"
@@ -651,6 +817,7 @@ if [ "$ASSUME_YES" = 1 ]; then
             echo ""
             echo "  Logs live in:        ~/.cache/society-ai/bridge.log"
             echo "  To stop the agent:   ./service.sh stop   (run from this folder)"
+            echo "  All agents on this computer:  ./status.sh"
             echo ""
             echo "========================================"
         elif [ "$VERDICT" = "auth-failed" ]; then
@@ -659,18 +826,7 @@ if [ "$ASSUME_YES" = 1 ]; then
             echo "  Connection failed"
             echo "========================================"
             echo ""
-            echo "  Your connection key was not accepted."
-            echo ""
-            echo "  This usually happens for one of two reasons:"
-            echo "    1. The key was already used or has since been regenerated,"
-            echo "       so it is no longer valid."
-            echo "    2. The key belongs to a different Society AI environment"
-            echo "       than the one this setup connects to."
-            echo ""
-            echo "  To fix it: go back to your browser, open your agent's page,"
-            echo "  click Regenerate token, and run the NEW command it gives you."
-            echo ""
-            echo "  Details are in the log: $BRIDGE_ERR_LOG"
+            print_auth_failed_help "$API_URL_RESOLVED" "$BRIDGE_ERR_LOG"
             echo ""
             exit 1
         else
@@ -681,6 +837,8 @@ if [ "$ASSUME_YES" = 1 ]; then
             echo ""
             echo "  Setup finished, but your agent's connection to Society AI"
             echo "  could not be confirmed within a minute."
+            echo ""
+            echo "  Environment: $API_URL_RESOLVED"
             echo ""
             echo "  It may still connect on its own. Your agent's page in the"
             echo "  browser will show it as connected once it does."
