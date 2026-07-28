@@ -176,7 +176,7 @@ def main() -> int:
             if name != bound and any(counts.values())
         ]
         if others:
-            line += " — " + " · ".join(others)
+            line += " | " + " · ".join(others)
         print(line)
         return 0
 

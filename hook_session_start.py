@@ -163,13 +163,13 @@ def main() -> int:
         banner_lines.append(
             "  open work under other identities: "
             + ", ".join(others)
-            + f' — to switch, ask: "act as {first_other}"'
+            + f' · to switch, ask: "act as {first_other}"'
         )
     elif other_names:
         banner_lines.append(
             "  other identities available: "
             + ", ".join(other_names)
-            + ' — to switch, ask: "act as <name>"'
+            + ' · to switch, ask: "act as <name>"'
         )
 
     # -- Acting agent's own open items (context only, keeps the banner short) --
@@ -191,19 +191,24 @@ def main() -> int:
         )
 
     # Some surfaces (the desktop app) don't render the systemMessage banner,
-    # so the model is the only way the user learns the binding. One line,
-    # first reply only — harmless duplication where the banner does render.
+    # so the model is the only way the user learns the binding. A blockquote
+    # reads as a banner rather than as the agent talking; first reply only.
     if acting_name:
-        context_lines.append(
-            "  Begin your FIRST reply of this session with exactly one short "
-            f"line stating the binding — `Society AI: acting as {acting_name} → "
-            f"{acting_url}`"
-            + (
-                " (other identities: " + ", ".join(other_names) + ")"
-                if other_names else ""
+        quote = f"> ⚙ **Society AI**: acting as **{acting_name}** · {acting_url}"
+        if other_names:
+            first = other_names[0]
+            quote += (
+                f'\n> Other identities: {", ".join(other_names)}. '
+                f'To switch, say "act as {first}".'
             )
-            + " — then answer normally. Don't repeat it in later replies "
-            "unless the binding changes."
+        context_lines.append(
+            "  Begin your FIRST reply of this session with exactly this "
+            "blockquote, verbatim, then a blank line, then your normal "
+            "answer:\n"
+            + quote
+            + "\n  Do not repeat it in later replies unless the binding "
+            "changes (after a successful switch_agent, show the same "
+            "blockquote once with the new identity)."
         )
 
     if not banner_lines:
