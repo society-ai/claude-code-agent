@@ -43,8 +43,10 @@ DEFAULT_SOCKET_PATH = os.path.join(
 
 
 def socket_path() -> str:
-    """Resolve the IPC socket path from env, with a per-user default."""
-    return os.environ.get("SOCIETY_AI_BRIDGE_SOCKET", DEFAULT_SOCKET_PATH)
+    """Resolve the IPC socket path from env, with a per-user default.
+    Empty counts as unset — un-injected sessions get SOCIETY_AI_BRIDGE_SOCKET
+    as an empty string via the MCP config's ${VAR:-} expansion."""
+    return os.environ.get("SOCIETY_AI_BRIDGE_SOCKET", "").strip() or DEFAULT_SOCKET_PATH
 
 
 # Type alias: handler maps method name -> async callable(params: dict) -> result

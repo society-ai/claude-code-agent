@@ -45,7 +45,14 @@ class Identity:
     company_id: str = ""
     bridge_socket: str = ""
     display_name: str = ""  # user-given name, e.g. "kilo"; "" if unknown
-    source: str = "env"  # "env" (spawn-time) or "switch" (rebound in-session)
+    # "env" (spawn-time), "auto" (single persona on the machine), "switch"
+    # (rebound in-session), or "unbound" (no identity yet — several
+    # personas exist and none was injected; tools refuse until bound).
+    source: str = "env"
+
+    @property
+    def bound(self) -> bool:
+        return bool(self.token)
 
     def headers(self) -> dict[str, str]:
         return {
@@ -66,15 +73,48 @@ def _display_name_for(name: str) -> str:
     return ""
 
 
-_current = Identity(
-    name=config.AGENT_NAME,
-    token=config.SOCIETY_AI_AUTH_TOKEN,
-    api_url=config.AGENT_ROUTER_API_URL,
-    company_id=config.COMPANY_ID,
-    bridge_socket=config.SOCIETY_AI_BRIDGE_SOCKET,
-    display_name=_display_name_for(config.AGENT_NAME),
-    source="env",
-)
+def _initial_identity() -> Identity:
+    """Spawn-time binding. Injected env wins (harness dispatch, old-style
+    baked configs). With no token in the env: exactly one persona on the
+    machine auto-binds (the common single-agent install stays zero-config);
+    several personas start UNBOUND — the user picks with switch_agent.
+    Keep this rule in sync with hook_session_start's banner logic."""
+    if config.SOCIETY_AI_AUTH_TOKEN:
+        return Identity(
+            name=config.AGENT_NAME,
+            token=config.SOCIETY_AI_AUTH_TOKEN,
+            api_url=config.AGENT_ROUTER_API_URL,
+            company_id=config.COMPANY_ID,
+            bridge_socket=config.SOCIETY_AI_BRIDGE_SOCKET,
+            display_name=_display_name_for(config.AGENT_NAME),
+            source="env",
+        )
+    try:
+        available = discover_personas()
+    except Exception:
+        available = []
+    if len(available) == 1:
+        p = available[0]
+        if p.get("bridge_socket"):
+            os.environ["SOCIETY_AI_BRIDGE_SOCKET"] = p["bridge_socket"]
+        return Identity(
+            name=p["name"],
+            token=p["token"],
+            api_url=p["api_url"],
+            company_id=p.get("company_id", ""),
+            bridge_socket=p.get("bridge_socket", ""),
+            display_name=p.get("display_name", ""),
+            source="auto",
+        )
+    return Identity(
+        name="",
+        token="",
+        api_url=config.AGENT_ROUTER_API_URL,
+        source="unbound",
+    )
+
+
+_current = _initial_identity()
 
 
 def current() -> Identity:
@@ -171,6 +211,49 @@ def _reap_dead() -> None:
             except PermissionError:
                 pass  # alive, not ours
     except Exception:
+        pass
+
+
+def refresh_display_name(fetched: str) -> Identity:
+    """Adopt a display name fetched from the platform (/api/v1/agents/me)
+    for the CURRENT identity, and persist it to the persona's env file so
+    the hooks (which read env files, not the API) pick it up too. Called
+    by switch_agent after a successful bind; best-effort."""
+    global _current
+    # Same sanitization as setup.sh: the value lands in a shell-sourced
+    # env file, so strip quoting/expansion characters and cap the length.
+    fetched = (fetched or "").translate(str.maketrans("", "", '"`$\\\n\r'))[:80].strip()
+    if not fetched or fetched == _current.display_name or not _current.name:
+        return _current
+    _current = replace(_current, display_name=fetched)
+    write_binding()
+    try:
+        for p in discover_personas():
+            if p["name"] == _current.name and p.get("env_file"):
+                _set_env_line(p["env_file"], "DISPLAY_NAME", f'"{fetched}"')
+                break
+    except Exception:
+        pass
+    return _current
+
+
+def _set_env_line(path: str, key: str, value: str) -> None:
+    """Insert or replace one KEY=value line in an env file, preserving the
+    rest byte-for-byte and the 0600 mode."""
+    import re
+
+    with open(path) as f:
+        content = f.read()
+    line = f"{key}={value}"
+    if re.search(rf"^{key}=", content, flags=re.M):
+        content = re.sub(rf"^{key}=.*$", lambda m: line, content, count=1, flags=re.M)
+    else:
+        content = content.rstrip("\n") + "\n" + line + "\n"
+    with open(path, "w") as f:
+        f.write(content)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
         pass
 
 

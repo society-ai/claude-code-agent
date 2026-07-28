@@ -85,19 +85,15 @@ def main() -> None:
     repo_dir = os.path.dirname(os.path.abspath(__file__))
 
     auth_token = os.environ.get("SOCIETY_AI_AUTH_TOKEN", "").strip()
-    agent_name = os.environ.get("AGENT_NAME", "claude-code").strip()
-    company_id = os.environ.get("COMPANY_ID", "").strip()
-    api_url = os.environ.get("AGENT_ROUTER_API_URL", "https://api.societyai.com").strip()
-    bridge_socket = os.environ.get(
-        "SOCIETY_AI_BRIDGE_SOCKET",
-        os.path.join(os.path.expanduser("~"), ".cache", "society-ai", "bridge.sock"),
-    ).strip()
     lifecycle_flag = os.environ.get("ENABLE_AGENT_LIFECYCLE", "").strip()
 
+    # The registered entry no longer bakes the token (identity is a runtime
+    # binding — see identity.py), but an empty token here still means
+    # setup.sh didn't write .env correctly, so fail fast on the setup bug.
     if not auth_token:
         print(
-            "  Error: SOCIETY_AI_AUTH_TOKEN is empty — refusing to register an MCP "
-            "entry that would 401 on every call. Set it in .env and re-run setup.sh.",
+            "  Error: SOCIETY_AI_AUTH_TOKEN is empty — setup did not produce "
+            "a usable .env. Set it in .env and re-run setup.sh.",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -129,26 +125,23 @@ def main() -> None:
         sys.exit(2)
 
     # Multi-persona support: register every identity-bearing env var as
-    # ${VAR:-<default>} rather than a baked literal. Claude Code expands
-    # these at MCP-server spawn time from the *Claude Code process's* own
-    # environment — so a session spawned by a persona's bridge (whose env
-    # carries that persona's AGENT_NAME / token / socket) authenticates as
-    # that persona, while interactive terminal sessions fall back to the
-    # default persona configured here. Verified working at user scope.
+    # ${VAR:-} — expanded at MCP-server spawn time from the *Claude Code
+    # process's* own environment. A session spawned by a persona's bridge
+    # (whose env carries that persona's AGENT_NAME / token / socket)
+    # authenticates as that persona. Interactive sessions get NO baked
+    # fallback on purpose: identity.py auto-binds when the machine has
+    # exactly one persona, and starts UNBOUND when it has several — the
+    # user picks with "act as <name>" (switch_agent). Baking a default
+    # here would silently make every session whoever ran setup.sh last,
+    # which is exactly the failure mode the runtime binding removed.
     env_pairs = [
-        _env_value_for_cli(
-            "SOCIETY_AI_AUTH_TOKEN",
-            "${SOCIETY_AI_AUTH_TOKEN:-" + auth_token + "}",
-        ),
-        _env_value_for_cli("AGENT_NAME", "${AGENT_NAME:-" + agent_name + "}"),
-        _env_value_for_cli("COMPANY_ID", "${COMPANY_ID:-" + company_id + "}"),
-        _env_value_for_cli(
-            "AGENT_ROUTER_API_URL",
-            "${AGENT_ROUTER_API_URL:-" + api_url + "}",
-        ),
+        _env_value_for_cli("SOCIETY_AI_AUTH_TOKEN", "${SOCIETY_AI_AUTH_TOKEN:-}"),
+        _env_value_for_cli("AGENT_NAME", "${AGENT_NAME:-}"),
+        _env_value_for_cli("COMPANY_ID", "${COMPANY_ID:-}"),
+        _env_value_for_cli("AGENT_ROUTER_API_URL", "${AGENT_ROUTER_API_URL:-}"),
         _env_value_for_cli(
             "SOCIETY_AI_BRIDGE_SOCKET",
-            "${SOCIETY_AI_BRIDGE_SOCKET:-" + bridge_socket + "}",
+            "${SOCIETY_AI_BRIDGE_SOCKET:-}",
         ),
     ]
     if lifecycle_flag:

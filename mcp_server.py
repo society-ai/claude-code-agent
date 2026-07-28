@@ -105,10 +105,11 @@ def _result(data: Any) -> str:
     Prefixed with the acting identity so a wrong binding is visible on the
     first read — not after a write lands under the wrong agent."""
     ident = _ident()
-    return (
-        f"[acting as {ident.name} @ {ident.api_url}]\n"
-        + json.dumps(data, indent=2, default=str)
+    label = (
+        f"[acting as {ident.name} @ {ident.api_url}]"
+        if ident.bound else "[no agent bound]"
     )
+    return label + "\n" + json.dumps(data, indent=2, default=str)
 
 
 def _resolve_company_id(company_id: Optional[str]) -> str:
@@ -206,8 +207,16 @@ async def switch_agent(agent_name: str = "") -> str:
     except ValueError as e:
         return _result(_error(str(e)))
 
-    # Verify the new binding actually authenticates before reporting success.
-    check = await api.get("/api/v1/agent-tasks", params={"limit": 1})
+    # Verify the new binding actually authenticates before reporting
+    # success. /api/v1/agents/me both proves the token works and returns
+    # the platform's current display name, which we adopt (and persist to
+    # the persona env file) so UI renames self-heal. Older servers without
+    # the endpoint fall back to a plain authenticated read.
+    check = await api.get("/api/v1/agents/me")
+    if isinstance(check, dict) and not check.get("error"):
+        new = identity.refresh_display_name(check.get("display_name", ""))
+    elif isinstance(check, dict) and check.get("status") == 404:
+        check = await api.get("/api/v1/agent-tasks", params={"limit": 1})
     verified = not (isinstance(check, dict) and check.get("error"))
     out: dict[str, Any] = {
         "switched_to": new.name,
@@ -834,6 +843,15 @@ async def dismiss_inbox(item_id: str) -> str:
 
 async def _ipc_call(method: str, params: dict, timeout: float = 60.0) -> Any:
     """Wrap bridge_ipc.call to convert IPCClientError into our error dict shape."""
+    if not _ident().bound:
+        names = ", ".join(
+            (p.get("display_name") or p["name"]) for p in identity.personas()
+        ) or "(none configured)"
+        return _error(
+            "No Society AI agent is bound to this session. Ask the user "
+            f"which agent to act as (available: {names}), then call "
+            "switch_agent with that name."
+        )
     try:
         return await bridge_ipc.call(method, params, timeout=timeout)
     except bridge_ipc.IPCClientError as e:

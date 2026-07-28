@@ -15,16 +15,21 @@ __version__ = "0.12.0"
 
 # -- Required / core ---------------------------------------------------------
 
-AGENT_ROUTER_API_URL: str = os.getenv("AGENT_ROUTER_API_URL", "https://api.societyai.com").rstrip("/")
+# NOTE: `or` (not the getenv default) on purpose — the MCP config registers
+# these as ${VAR:-} so an un-injected session gets EMPTY strings, which must
+# behave exactly like unset (empty AGENT_NAME = unbound, see identity.py).
+AGENT_ROUTER_API_URL: str = (
+    os.getenv("AGENT_ROUTER_API_URL", "").strip() or "https://api.societyai.com"
+).rstrip("/")
 SOCIETY_AI_AUTH_TOKEN: str = os.getenv("SOCIETY_AI_AUTH_TOKEN", "").strip()
-AGENT_NAME: str = os.getenv("AGENT_NAME", "claude-code").strip()
+AGENT_NAME: str = os.getenv("AGENT_NAME", "").strip()
 COMPANY_ID: str = os.getenv("COMPANY_ID", "").strip()
 
 # IPC socket path for bridge <-> MCP server communication (delegation, search).
-SOCIETY_AI_BRIDGE_SOCKET: str = os.getenv(
-    "SOCIETY_AI_BRIDGE_SOCKET",
-    os.path.join(os.path.expanduser("~"), ".cache", "society-ai", "bridge.sock"),
-).strip()
+SOCIETY_AI_BRIDGE_SOCKET: str = (
+    os.getenv("SOCIETY_AI_BRIDGE_SOCKET", "").strip()
+    or os.path.join(os.path.expanduser("~"), ".cache", "society-ai", "bridge.sock")
+)
 
 # Gate for high-power agent lifecycle tools (deploy/update/restart/delete).
 # Disabled by default — an LLM accidentally deploying or deleting agents is

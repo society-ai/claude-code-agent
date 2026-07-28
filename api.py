@@ -86,6 +86,15 @@ async def request(
     switch_agent rebind takes effect immediately.
     """
     ident = identity.current()
+    if not ident.bound:
+        names = ", ".join(
+            (p.get("display_name") or p["name"]) for p in identity.personas()
+        ) or "(none configured)"
+        return error(
+            "No Society AI agent is bound to this session. Ask the user "
+            f"which agent to act as (available: {names}), then call "
+            "switch_agent with that name."
+        )
     base = (base_url or ident.api_url).rstrip("/")
     url = f"{base}{path}"
     hdrs = headers if headers is not None else ident.headers()
