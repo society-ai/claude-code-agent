@@ -600,6 +600,15 @@ class Bridge:
         self.registered = False
         self.running = True
         self._active_tasks: set[str] = set()
+        # Self-update (agent.update RPC). _inflight_dispatches counts
+        # task.execute dispatches from acceptance (synchronously, in
+        # handle_message) to completion — unlike _active_tasks it also
+        # covers dispatches still queued on the semaphore, so an update
+        # can never slip in between accepting a task and starting it.
+        # _pending_update holds the approved update while work is in
+        # flight; the last dispatch to finish starts it.
+        self._inflight_dispatches = 0
+        self._pending_update: dict | None = None
         # Shared scheduler = machine-wide concurrency cap across ALL agents in
         # a harness. Standalone falls back to a private per-agent cap.
         self._semaphore = scheduler or asyncio.Semaphore(MAX_CONCURRENT_TASKS)
@@ -853,7 +862,14 @@ class Bridge:
             logger.debug("Heartbeat ack received")
 
         elif method == "task.execute":
+            # Counted here (synchronously) rather than inside the task so a
+            # just-accepted dispatch already defers an agent.update that
+            # arrives on the very next frame.
+            self._inflight_dispatches += 1
             asyncio.create_task(self.handle_task_execute(msg_id, params))
+
+        elif method == "agent.update":
+            await self.handle_agent_update(msg_id, params)
 
         elif method == "delegation.result":
             # Two-phase delegation: the hub correlates the result back to
@@ -1149,6 +1165,163 @@ class Bridge:
                     )
                 finally:
                     self._active_tasks.discard(task_id)
+                    self._inflight_dispatches = max(0, self._inflight_dispatches - 1)
+                    # A user-approved update that arrived mid-work runs once
+                    # the last in-flight dispatch drains.
+                    if self._pending_update and self._inflight_dispatches == 0:
+                        logger.info("Last in-flight task finished; starting the deferred update")
+                        self._start_pending_update()
+
+    # -- Self-update (agent.update) ------------------------------------------
+
+    async def handle_agent_update(self, msg_id: str | None, params: dict):
+        """Handle an `agent.update` RPC from the hub (sent when the owner
+        approves an update). Ack immediately, then either start the update
+        now (idle) or defer it until the last in-flight dispatch finishes.
+
+        The update itself runs in ./update.sh, spawned fully detached — the
+        updater restarts (and can roll back) this very process, so none of
+        that logic may live in here.
+        """
+        latest = str((params or {}).get("latest_version") or "").strip()
+        reason = str((params or {}).get("reason") or "").strip()
+        if msg_id is not None:
+            await self.send({"jsonrpc": "2.0", "id": msg_id, "result": {"status": "accepted"}})
+        logger.info(
+            "Update requested (latest_version=%s, reason=%s)", latest or "?", reason or "?"
+        )
+        self._pending_update = {"latest_version": latest, "reason": reason}
+        if self._inflight_dispatches > 0:
+            logger.info(
+                "Update deferred: %d dispatch(es) in flight; it starts when the last one finishes",
+                self._inflight_dispatches,
+            )
+        else:
+            self._start_pending_update()
+
+    def _start_pending_update(self) -> None:
+        """Spawn ./update.sh fully detached and clear the pending flag.
+
+        Detachment (start_new_session=True → its own session + process
+        group, stdio to a log file, never waited on) is what lets the
+        updater outlive this bridge: the restart it performs kills our
+        process group, and the updater must survive that to verify the new
+        version or roll back.
+        """
+        update = self._pending_update
+        if not update:
+            return
+        self._pending_update = None
+        repo_dir = os.path.dirname(os.path.abspath(__file__))
+        script = os.path.join(repo_dir, "update.sh")
+        persona = self._derive_persona()
+        cmd = [script] + ([persona] if persona else [])
+        log_path = os.path.join(self.ctx.state_dir, "update.log")
+        try:
+            os.makedirs(self.ctx.state_dir, exist_ok=True)
+            with open(log_path, "ab") as log_file:
+                subprocess.Popen(
+                    cmd,
+                    cwd=repo_dir,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_file,
+                    stderr=log_file,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+            logger.info(
+                "Updater spawned detached (%s); progress in %s",
+                " ".join(cmd), log_path,
+            )
+        except Exception:
+            logger.exception("Failed to spawn the updater")
+
+    def _derive_persona(self) -> str:
+        """Which persona this bridge runs as ("" = the primary), derived the
+        same way the launchers map personas to env files: the primary sources
+        .env, a persona sources .env.<name>. We reverse that mapping by
+        finding the env file whose AGENT_NAME is ours (mirrors the
+        discover_roster filters for backups/special files)."""
+        repo_dir = os.path.dirname(os.path.abspath(__file__))
+        primary = _read_env_file(os.path.join(repo_dir, ".env"))
+        if (primary.get("AGENT_NAME") or "").strip() == self.ctx.name:
+            return ""
+        try:
+            entries = sorted(os.listdir(repo_dir))
+        except OSError:
+            return ""
+        for entry in entries:
+            if not entry.startswith(".env.") or entry in (".env.example", ".env.defaults"):
+                continue
+            persona = entry[len(".env."):]
+            if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,62}", persona):
+                continue
+            if re.search(r"\.?bak-\d+$", persona):
+                continue
+            env = _read_env_file(os.path.join(repo_dir, entry))
+            if (env.get("AGENT_NAME") or "").strip() == self.ctx.name:
+                return persona
+        return ""
+
+    async def _report_update_outcome(self) -> None:
+        """If update.sh left an outcome marker, post it to the owner's feed
+        and delete the marker. Fire-and-forget at startup: never blocks or
+        fails the boot, and the marker is only deleted after a successful
+        post so a failed post retries at the next start."""
+        marker = os.path.join(self.ctx.state_dir, "update-result.json")
+        try:
+            if not os.path.exists(marker):
+                return
+            try:
+                with open(marker, encoding="utf-8") as f:
+                    data = json.load(f)
+            except (ValueError, OSError) as e:
+                # Unreadable marker: nothing to report, and retrying next
+                # boot won't help — drop it.
+                logger.warning("Unreadable update marker %s (%s); removing it", marker, e)
+                try:
+                    os.remove(marker)
+                except OSError:
+                    pass
+                return
+
+            from_v = str(data.get("from") or "an earlier version")
+            to_v = str(data.get("to") or "the new version")
+            if data.get("ok"):
+                message = f"Updated from {from_v} to {to_v}."
+            else:
+                error = str(data.get("error") or "unknown error")
+                if data.get("rolled_back"):
+                    message = f"Update to {to_v} failed ({error}), rolled back to {from_v}."
+                else:
+                    message = f"Update to {to_v} failed ({error}); still on {from_v}."
+
+            # Same endpoint + auth the MCP post_feed tool uses
+            # (POST /api/v1/feed with the agent's own token) — but sent with
+            # this bridge's ctx.token, so each harness agent reports as itself.
+            headers = {
+                "Authorization": f"Bearer {self.ctx.token}",
+                "Content-Type": "application/json",
+                "User-Agent": f"claude-code-agent/{__version__}",
+            }
+            resp = await _get_http_client().post(
+                f"{AGENT_ROUTER_API_URL}/api/v1/feed",
+                json={"message": message},
+                headers=headers,
+            )
+            if resp.status_code < 400:
+                try:
+                    os.remove(marker)
+                except OSError:
+                    pass
+                logger.info("Update outcome posted to the feed: %s", message)
+            else:
+                logger.warning(
+                    "Feed post for the update outcome failed (HTTP %s); retrying next start",
+                    resp.status_code,
+                )
+        except Exception as e:
+            logger.warning("Could not report the update outcome: %s", e)
 
     def _record_chat_turn(self, task_id: str, user_msg: str, assistant_msg: str) -> None:
         """Append a (user, assistant) pair to a task's chat history.
@@ -1755,6 +1928,10 @@ class Bridge:
 
     async def run(self):
         """Connect to hub and process messages with auto-reconnect."""
+        # If an update ran while we were down, report how it went (fire and
+        # forget — a failed post retries at the next start, never blocks boot).
+        asyncio.ensure_future(self._report_update_outcome())
+
         # Start sandbox in secured mode (hard fail if it can't start)
         if self._sandbox:
             try:
