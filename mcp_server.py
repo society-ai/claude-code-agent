@@ -48,11 +48,12 @@ from mcp.server.fastmcp import FastMCP
 
 import api
 import bridge_ipc
-from config import (
-    AGENT_NAME,
-    COMPANY_ID,
-    ENABLE_AGENT_LIFECYCLE,
-)
+import identity
+from config import ENABLE_AGENT_LIFECYCLE
+
+# Session identity is a runtime binding (see identity.py) — resolve it at
+# call time everywhere, never capture it in a module constant.
+_ident = identity.current
 
 # -- Validation primitives ---------------------------------------------------
 
@@ -99,13 +100,20 @@ def _error(message: str, status: int | None = None, body: str | None = None) -> 
 
 
 def _result(data: Any) -> str:
-    """Serialize a success or error dict for MCP transport."""
-    return json.dumps(data, indent=2, default=str)
+    """Serialize a success or error dict for MCP transport.
+
+    Prefixed with the acting identity so a wrong binding is visible on the
+    first read — not after a write lands under the wrong agent."""
+    ident = _ident()
+    return (
+        f"[acting as {ident.name} @ {ident.api_url}]\n"
+        + json.dumps(data, indent=2, default=str)
+    )
 
 
 def _resolve_company_id(company_id: Optional[str]) -> str:
     """Use provided company_id or fall back to env default. Raises ValueError."""
-    cid = (company_id or COMPANY_ID or "").strip()
+    cid = (company_id or _ident().company_id or "").strip()
     if not cid:
         raise ValueError("company_id is required (pass it or set COMPANY_ID env var)")
     if not _UUID_RE.match(cid):
@@ -144,6 +152,66 @@ mcp = FastMCP("society-ai", instructions="Society AI tools for Claude Code")
 
 
 # ==============================================================================
+# IDENTITY
+# ==============================================================================
+
+
+@mcp.tool()
+async def switch_agent(agent_name: str = "") -> str:
+    """Switch which Society AI agent this session acts as, or list the
+    identities available on this machine.
+
+    Every session starts bound to one agent (shown in the session-start
+    banner and prefixed on every tool result). When the user asks to act as
+    a different agent — e.g. "act as agent-8u6qy3ba" — call this with that
+    name. All subsequent Society AI tools use the new agent's token, API
+    endpoint, and bridge.
+
+    Args:
+        agent_name: Persona to switch to. Empty → list available identities
+            and the current binding without switching.
+    """
+    ident = _ident()
+    available = [
+        {"name": p["name"], "api_url": p["api_url"]} for p in identity.personas()
+    ]
+    if not agent_name.strip():
+        return _result({
+            "acting_as": ident.name,
+            "api_url": ident.api_url,
+            "available": available,
+        })
+
+    if agent_name.strip() == ident.name:
+        return _result({
+            "acting_as": ident.name,
+            "api_url": ident.api_url,
+            "unchanged": True,
+        })
+
+    try:
+        new = identity.bind(agent_name)
+    except ValueError as e:
+        return _result(_error(str(e)))
+
+    # Verify the new binding actually authenticates before reporting success.
+    check = await api.get("/api/v1/agent-tasks", params={"limit": 1})
+    verified = not (isinstance(check, dict) and check.get("error"))
+    out: dict[str, Any] = {
+        "switched_to": new.name,
+        "api_url": new.api_url,
+        "verified": verified,
+    }
+    if not verified:
+        out["warning"] = (
+            "switched, but a test API call failed — the token may be stale "
+            "or the endpoint unreachable"
+        )
+        out["check"] = check
+    return _result(out)
+
+
+# ==============================================================================
 # CORE (existing)
 # ==============================================================================
 
@@ -173,7 +241,7 @@ async def list_tasks(
     filter, the platform defaults to tasks where this agent is creator or assignee
     across every scope it touches.
     """
-    cid = (company_id or COMPANY_ID or "").strip()
+    cid = (company_id or _ident().company_id or "").strip()
     if cid:
         try:
             _validate_uuid(cid, "company_id")
@@ -292,7 +360,7 @@ async def send_inbox_item(
     except ValueError as e:
         return _result(_error(str(e)))
 
-    cid = (company_id or COMPANY_ID or "").strip()
+    cid = (company_id or _ident().company_id or "").strip()
     if cid:
         try:
             _validate_uuid(cid, "company_id")
@@ -303,7 +371,7 @@ async def send_inbox_item(
         "title": title,
         "body": body,
         "type": type,
-        "from_agent": AGENT_NAME,
+        "from_agent": _ident().name,
         "priority": priority,
     }
     if cid:
@@ -329,7 +397,7 @@ async def list_inbox(
     err = _enum_check(type, _VALID_INBOX_TYPES, "type")
     if err:
         return _result(err)
-    cid = (company_id or COMPANY_ID or "").strip()
+    cid = (company_id or _ident().company_id or "").strip()
     if cid:
         try:
             _validate_uuid(cid, "company_id")
@@ -340,7 +408,7 @@ async def list_inbox(
     params: dict[str, Any] = {"limit": limit}
     if cid:
         params["company_id"] = cid
-    agent = to_agent if to_agent is not None else AGENT_NAME
+    agent = to_agent if to_agent is not None else _ident().name
     if agent:
         params["to_agent"] = agent
     if status:
@@ -560,7 +628,7 @@ async def create_task(
     """
     if not title or not title.strip():
         return _result(_error("title is required"))
-    cid = (company_id or COMPANY_ID or "").strip()
+    cid = (company_id or _ident().company_id or "").strip()
     try:
         if cid:
             _validate_uuid(cid, "company_id")
@@ -586,7 +654,7 @@ async def create_task(
 
     body: dict[str, Any] = {
         "title": title.strip(),
-        "created_by_agent": AGENT_NAME,
+        "created_by_agent": _ident().name,
     }
     if cid:
         body["company_id"] = cid
@@ -636,7 +704,7 @@ async def review_task(
     err = _enum_check(decision, _VALID_REVIEW_DECISIONS, "decision")
     if err:
         return _result(err)
-    body: dict[str, Any] = {"decision": decision, "reviewed_by_agent": AGENT_NAME}
+    body: dict[str, Any] = {"decision": decision, "reviewed_by_agent": _ident().name}
     if review_notes is not None:
         body["review_notes"] = review_notes
     return _result(await api.post(f"/api/v1/agent-tasks/{task_id}/review", body))
@@ -666,7 +734,7 @@ async def reassign_task(
         return _result(_error(str(e)))
     body: dict[str, Any] = {
         "new_agent": new_agent.strip(),
-        "assigned_by_agent": AGENT_NAME,
+        "assigned_by_agent": _ident().name,
     }
     if reason is not None:
         body["reason"] = reason
@@ -692,7 +760,7 @@ async def get_my_tasks(
         return _result(err)
     limit = max(1, min(200, int(limit)))
     params: dict[str, Any] = {
-        "assigned_to_agent": AGENT_NAME,
+        "assigned_to_agent": _ident().name,
         "limit": limit,
     }
     if status:
@@ -727,7 +795,7 @@ async def respond_to_inbox(
         return _result(_error("response is required"))
     body: dict[str, Any] = {
         "response": response,
-        "responded_by_agent": AGENT_NAME,
+        "responded_by_agent": _ident().name,
     }
     if response_data is not None:
         body["response_data"] = response_data
@@ -742,7 +810,7 @@ async def dismiss_inbox(item_id: str) -> str:
     except ValueError as e:
         return _result(_error(str(e)))
     return _result(await api.post(f"/api/v1/inbox/{item_id}/dismiss", {
-        "dismissed_by_agent": AGENT_NAME,
+        "dismissed_by_agent": _ident().name,
     }))
 
 
@@ -889,7 +957,7 @@ async def save_artifact(
     if not name or not name.strip() or len(name) > 255:
         return _result(_error("name is required and must be 1-255 chars"))
     if cache_key:
-        if not company_id and not COMPANY_ID:
+        if not company_id and not _ident().company_id:
             return _result(_error("cache_key requires company_id (also reads COMPANY_ID env)"))
         if not (1 <= len(cache_key) <= 255):
             return _result(_error("cache_key must be 1-255 chars"))
@@ -929,13 +997,13 @@ async def save_artifact(
         "mime_type": mime_type.strip(),
         "bytes_base64": base64.b64encode(content).decode("ascii"),
         "source_type": "agent",
-        "source_agent": AGENT_NAME,
+        "source_agent": _ident().name,
     }
     if title is not None:
         body["title"] = title
     if description is not None:
         body["description"] = description
-    cid = (company_id or COMPANY_ID or "").strip()
+    cid = (company_id or _ident().company_id or "").strip()
     if cid:
         body["company_id"] = cid
     if space_id:
@@ -987,7 +1055,7 @@ async def pin_artifact(
         "entity_type": entity_type,
         "entity_id": entity_id,
         "artifact_id": artifact_id,
-        "pinned_by_agent": AGENT_NAME,
+        "pinned_by_agent": _ident().name,
     }
     if label is not None:
         body["label"] = label
@@ -1040,7 +1108,7 @@ async def search_kb(
     """
     if not query or not query.strip():
         return _result(_error("query is required"))
-    resolved_org = (org_id or COMPANY_ID or "").strip()
+    resolved_org = (org_id or _ident().company_id or "").strip()
     if not resolved_org:
         return _result(_error("org_id is required (or set COMPANY_ID env var)"))
     top_k = max(1, min(20, int(top_k)))
@@ -1057,7 +1125,7 @@ async def search_kb(
         except ValueError as e:
             return _result(_error(str(e)))
         body["project_id"] = project_id
-    body["agent_id"] = AGENT_NAME
+    body["agent_id"] = _ident().name
     return _result(await api.post("/api/v1/kb/retrieve", body))
 
 
@@ -1069,7 +1137,7 @@ async def list_kb_items(
     chat_id: Optional[str] = None,
 ) -> str:
     """List Knowledge Base documents within a scope."""
-    resolved_org = (org_id or COMPANY_ID or "").strip()
+    resolved_org = (org_id or _ident().company_id or "").strip()
     if not resolved_org:
         return _result(_error("org_id is required (or set COMPANY_ID env var)"))
     params: dict[str, Any] = {"org_id": resolved_org}
@@ -1612,7 +1680,7 @@ async def create_schedule(
         return _result(_error("agent_task_id is required when trigger_type=task"))
     if trigger_type == "workflow" and not workflow_id:
         return _result(_error("workflow_id is required when trigger_type=workflow"))
-    cid = (company_id or COMPANY_ID or "").strip()
+    cid = (company_id or _ident().company_id or "").strip()
     if cid:
         try:
             _validate_uuid(cid, "company_id")
@@ -1651,7 +1719,7 @@ async def create_schedule(
 async def list_schedules(company_id: Optional[str] = None) -> str:
     """List schedules for the current user or company."""
     params: dict[str, Any] = {}
-    cid = (company_id or COMPANY_ID or "").strip()
+    cid = (company_id or _ident().company_id or "").strip()
     if cid:
         try:
             _validate_uuid(cid, "company_id")
@@ -1683,7 +1751,7 @@ async def create_workflow(
         return _result(_error("name is required"))
     if not isinstance(steps, list) or not steps:
         return _result(_error("steps must be a non-empty list"))
-    cid = (company_id or COMPANY_ID or "").strip()
+    cid = (company_id or _ident().company_id or "").strip()
     if cid:
         try:
             _validate_uuid(cid, "company_id")
@@ -1706,7 +1774,7 @@ async def list_workflows(
     """List workflows."""
     limit = max(1, min(200, int(limit)))
     params: dict[str, Any] = {"limit": limit}
-    cid = (company_id or COMPANY_ID or "").strip()
+    cid = (company_id or _ident().company_id or "").strip()
     if cid:
         try:
             _validate_uuid(cid, "company_id")
@@ -1804,7 +1872,7 @@ async def create_dashboard(
         cid = _resolve_company_id(company_id)
     except ValueError as e:
         return _result(_error(str(e)))
-    body: dict[str, Any] = {"title": title.strip(), "createdByAgent": AGENT_NAME}
+    body: dict[str, Any] = {"title": title.strip(), "createdByAgent": _ident().name}
     if slug is not None:
         body["slug"] = slug
     if description is not None:
@@ -1863,7 +1931,7 @@ async def create_panel(
         "size": size,
         "height": int(height),
         "position": int(position),
-        "createdByAgent": AGENT_NAME,
+        "createdByAgent": _ident().name,
     }
     if html_content is not None:
         body["htmlContent"] = html_content
@@ -2121,4 +2189,8 @@ async def update_agent(
 # ==============================================================================
 
 if __name__ == "__main__":
+    # Mirror the spawn-time binding for the status-line hook (best-effort;
+    # our PPID here is the `claude` process that spawned us — the same PPID
+    # the status-line hook sees).
+    identity.write_binding()
     mcp.run(transport="stdio")

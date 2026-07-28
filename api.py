@@ -17,7 +17,8 @@ from typing import Any
 import certifi
 import httpx
 
-from config import AGENT_ROUTER_API_URL, API_HEADERS, __version__
+import identity
+from config import __version__
 
 DEFAULT_TIMEOUT = 30
 
@@ -79,10 +80,15 @@ async def request(
         headers: Override headers (default: API_HEADERS).
         timeout: Override timeout in seconds.
         base_url: Override base URL (e.g. for ai-chatbot service routes).
+
+    Base URL and auth headers resolve from the CURRENT session identity on
+    every call (identity.current()), not from import-time constants — a
+    switch_agent rebind takes effect immediately.
     """
-    base = (base_url or AGENT_ROUTER_API_URL).rstrip("/")
+    ident = identity.current()
+    base = (base_url or ident.api_url).rstrip("/")
     url = f"{base}{path}"
-    hdrs = headers if headers is not None else API_HEADERS
+    hdrs = headers if headers is not None else ident.headers()
     try:
         c = client()
         if timeout is not None:

@@ -114,6 +114,33 @@ def _segment(counts: dict[str, int]) -> str:
     return " · ".join(parts)
 
 
+def _read_session_binding() -> dict[str, Any] | None:
+    """This session's identity, written by the MCP server (identity.py).
+
+    Keyed by PPID: this hook and the MCP server are both direct children of
+    the same `claude` process, so os.getppid() is the same number in both.
+    Read directly (no identity/config import — config validates env at
+    import and may exit; the status line must never die over a bad env).
+    """
+    try:
+        path = CACHE_DIR / "session-binding" / f"{os.getppid()}.json"
+        with path.open() as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) and data.get("agent") else None
+    except Exception:
+        return None
+
+
+def _compact(counts: dict[str, int]) -> str:
+    return (
+        _segment(counts)
+        .replace(" · ", " ")
+        .replace("📥 ", "📥")
+        .replace("✅ ", "✅")
+        .replace("🔔 ", "🔔")
+    )
+
+
 def main() -> int:
     by_persona: dict[str, dict[str, int]] | None = None
 
@@ -133,9 +160,31 @@ def main() -> int:
         if by_persona:
             _write_cache(by_persona)
 
-    if not by_persona:
+    binding = _read_session_binding()
+
+    if binding:
+        # Session-aware: the bound agent leads — ALWAYS shown, even with
+        # nothing open ("bound, zero tasks" is exactly the state that must
+        # be visible when another persona is showing counts). Other
+        # personas' counts follow after a dash, clearly not this session.
+        bound = binding["agent"]
+        seg = _segment((by_persona or {}).get(bound) or {})
+        line = f"as {bound}" + (f" · {seg}" if seg else "")
+        others = [
+            f"{name} {_compact(counts)}"
+            for name, counts in (by_persona or {}).items()
+            if name != bound and any(counts.values())
+        ]
+        if others:
+            line += " — " + " · ".join(others)
+        print(line)
         return 0
 
+    # No binding file (MCP server not loaded, or the PPID correlation ever
+    # breaks): fall back to the machine-wide listing — honest-but-vague,
+    # never wrong-but-confident about a session identity.
+    if not by_persona:
+        return 0
     active = {n: c for n, c in by_persona.items() if any(c.values())}
     if not active:
         return 0
@@ -144,13 +193,8 @@ def main() -> int:
         # Single persona keeps the original compact format.
         print(_segment(next(iter(active.values()))))
     else:
-        # Multi-persona: name-prefixed compact segments, only for personas
-        # with anything open.
-        segs = []
-        for name, counts in active.items():
-            compact = _segment(counts).replace(" · ", " ").replace("📥 ", "📥").replace("✅ ", "✅").replace("🔔 ", "🔔")
-            segs.append(f"{name} {compact}")
-        print(" · ".join(segs))
+        segs = [f"{name} {_compact(counts)}" for name, counts in active.items()]
+        print("machine: " + " · ".join(segs))
     return 0
 
 
