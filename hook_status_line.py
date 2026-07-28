@@ -25,13 +25,12 @@ import sys
 import time
 from typing import Any
 
-from hook_common import discover_personas
+from hook_common import OPEN_TASK_STATUSES, discover_personas
 
 CACHE_DIR = pathlib.Path(os.path.expanduser("~")) / ".cache" / "society-ai"
 CACHE_PATH = CACHE_DIR / "statusline.json"
 CACHE_TTL_S = 30
 HTTP_TIMEOUT_S = 1.5
-OPEN_TASK_STATUSES = {"backlog", "todo", "in_progress", "in_review", "blocked"}
 
 
 def _read_cache() -> dict[str, Any] | None:
@@ -126,7 +125,9 @@ def _read_session_binding() -> dict[str, Any] | None:
         path = CACHE_DIR / "session-binding" / f"{os.getppid()}.json"
         with path.open() as f:
             data = json.load(f)
-        return data if isinstance(data, dict) and data.get("agent") else None
+        # agent == "" is a real state (unbound session), so key presence is
+        # the signal, not truthiness.
+        return data if isinstance(data, dict) and "agent" in data else None
     except Exception:
         return None
 
@@ -168,14 +169,17 @@ def main() -> int:
         # be visible when another persona is showing counts). Other
         # personas' counts follow after a dash, clearly not this session.
         bound = binding["agent"]
-        label = binding.get("display_name") or bound
-        seg = _segment((by_persona or {}).get(bound) or {})
-        line = f"as {label}" + (f" · {seg}" if seg else "")
         others = [
             f"{name} {_compact(counts)}"
             for name, counts in (by_persona or {}).items()
             if name != bound and any(counts.values())
         ]
+        if bound:
+            label = binding.get("display_name") or bound
+            seg = _segment((by_persona or {}).get(bound) or {})
+            line = f"as {label}" + (f" · {seg}" if seg else "")
+        else:
+            line = "no agent bound"
         if others:
             line += " | " + " · ".join(others)
         print(line)

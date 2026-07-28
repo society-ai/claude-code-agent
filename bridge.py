@@ -561,6 +561,7 @@ class AgentContext:
     work_dir: str
     extra_dirs: list[str]
     company_id: str
+    api_url: str       # the Society AI backend this agent belongs to
     socket: str        # this agent's IPC socket path
     state_dir: str     # shipper state + channel sock live here (= dirname(socket))
 
@@ -574,6 +575,7 @@ class AgentContext:
             work_dir=WORK_DIR,
             extra_dirs=list(EXTRA_DIRS),
             company_id=COMPANY_ID,
+            api_url=AGENT_ROUTER_API_URL,
             socket=SOCIETY_AI_BRIDGE_SOCKET,
             state_dir=os.path.dirname(SOCIETY_AI_BRIDGE_SOCKET) or ".",
         )
@@ -585,6 +587,10 @@ class AgentContext:
             "SOCIETY_AI_AUTH_TOKEN": self.token,
             "AGENT_NAME": self.name,
             "COMPANY_ID": self.company_id or "",
+            # Explicit, not inherited: a session must hit the same backend
+            # its token was minted for even if the launching process's env
+            # says otherwise.
+            "AGENT_ROUTER_API_URL": self.api_url,
             "SOCIETY_AI_BRIDGE_SOCKET": self.socket,
         }
 
@@ -2083,6 +2089,7 @@ def _context_from_env_file(repo_dir: str, env_file: str, persona_arg: str) -> "A
         name=name, token=token,
         work_dir=env.get("WORK_DIR") or os.getcwd(),
         extra_dirs=extra, company_id=env.get("COMPANY_ID", ""),
+        api_url=(env.get("AGENT_ROUTER_API_URL") or AGENT_ROUTER_API_URL).rstrip("/"),
         socket=socket, state_dir=os.path.dirname(socket) or ".",
     )
 

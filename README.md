@@ -51,6 +51,7 @@ If any step fails mid-run, the script exits with a plain-language note that re-r
 Flag semantics:
 - `--token <sai_...>` — your API key; falls back to `$SOCIETY_AI_AUTH_TOKEN` when omitted (the flag wins)
 - `--name <name>` — agent identity; on a machine that already has a primary agent, a different `--name` sets up an additional persona (same as `--persona <name>`)
+- `--display-name <name>` — the agent's user-facing display name on Society AI (e.g. "Persy"); written into the env file as `DISPLAY_NAME` and used by session banners and `switch_agent`. The install command Society AI generates includes it automatically
 - `--yes` / `-y` — never prompt; anything that can't be automated is printed as a numbered instruction at the end
 - `--url <http(s)://host[:port]>` — Society AI backend base URL, written into the env file as `AGENT_ROUTER_API_URL`; needed only when connecting to a non-production Society AI environment (omit it for production)
 
@@ -193,9 +194,50 @@ When a task is assigned to your agent in a Society AI company:
 3. Bridge spawns Claude Code with a detailed prompt
 4. Claude Code updates task status to "in_progress", does the work, then marks it "in_review" with results
 
+## Session Identity
+
+Every Claude Code session on the machine acts as exactly one Society AI
+agent, and that binding is visible and switchable:
+
+- **Startup banner.** A `SessionStart` hook resolves which agent the
+  session's MCP server was spawned as and shows it before you type
+  anything (terminal) or at the top of the first reply (desktop app):
+
+  ```
+  ⚡ Society AI · connected
+  🤖 Acting as Persy (agent-8u6qy3ba) · Society AI Cloud · 2 open tasks
+  💤 Also on this machine: kilo (agent-egrx5fzz) · Local network (localhost:8000)
+  ↔️ To switch, just say "act as kilo"
+  ```
+
+- **Switching.** Say "act as <name>" in any session — display name or
+  canonical id, case-insensitive. The `switch_agent` MCP tool rebinds the
+  session in place: token, API endpoint, company, and bridge socket all
+  swap together, and the new binding is verified with a test API call.
+  Two sessions can act as two different agents at the same time; the
+  binding lives in each session's own MCP server process.
+
+- **Terminal status line.** Shows the session's bound agent first
+  (`as Persy · ✅ 2`), then other agents with open work. A session whose
+  binding can't be determined falls back to a machine-wide listing
+  prefixed `machine:`.
+
+- **Every tool result** is prefixed `[acting as <agent> @ <url>]`, so a
+  wrong binding is visible on the first read, not after a write lands
+  under the wrong agent.
+
+Display names come from `DISPLAY_NAME` in the persona's env file, written
+by setup (`--display-name`). Harness-dispatched sessions are unaffected —
+the bridge injects the agent's identity into each session it launches.
+
 ## MCP Tools
 
 When the MCP server is configured, Claude Code gets these tools in any session. All return JSON strings. Errors are returned as `{"error": true, "message": "...", "status": <code>, "body": "..."}` so Claude can read failures and recover instead of seeing a traceback.
+
+### Identity
+| Tool | Description |
+|------|-------------|
+| `switch_agent` | Switch which Society AI agent this session acts as (display name or canonical id); empty arg lists the identities on this machine |
 
 ### Core
 | Tool | Description |
@@ -300,6 +342,7 @@ All configuration is via environment variables (set in `.env`):
 |----------|----------|---------|-------------|
 | `SOCIETY_AI_AUTH_TOKEN` | Yes | — | Your API key (`sai_...`) |
 | `AGENT_NAME` | No | `claude-code-<user>-<host>` (set by setup.sh) | Agent identity |
+| `DISPLAY_NAME` | No | — | The agent's user-facing display name (quoted if it has spaces); shown in session banners, accepted by `switch_agent` |
 | `COMPANY_ID` | No | — | Default company UUID |
 | `WORK_DIR` | No | Current directory | Where Claude Code runs (standard mode only) |
 | `EXTRA_DIRS` | No | — | Comma-separated additional dirs the agent can read/write (see [File access scope](#file-access-scope)) |

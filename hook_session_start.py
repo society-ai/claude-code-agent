@@ -35,10 +35,13 @@ import json
 import sys
 from typing import Any
 
-from hook_common import discover_personas, resolve_mcp_identity
+from hook_common import (
+    OPEN_TASK_STATUSES,
+    discover_personas,
+    resolve_mcp_identity,
+)
 
 HTTP_TIMEOUT_S = 3
-OPEN_TASK_STATUSES = {"backlog", "todo", "in_progress", "in_review", "blocked"}
 MAX_LISTED = 10
 
 
@@ -142,12 +145,39 @@ def _banner(
 ) -> list[str]:
     """The 4-line banner, in plain text (systemMessage) or markdown
     blockquote flavor (first-reply). `others` entries: {name, display_name,
-    api_url, tasks, inbox} with tasks/inbox possibly None."""
+    api_url, tasks, inbox} with tasks/inbox possibly None.
+
+    With an empty `acting_name` the session is UNBOUND: every persona is
+    listed as a candidate and the switch hint reads as "connect"."""
+    q = "> " if md else ""
+    if not acting_name:
+        n = len(others)
+        lines = [
+            q + (f"⚡ {'**Society AI**' if md else 'Society AI'} · "
+                 f"{n} agent{'' if n == 1 else 's'} on this machine, none "
+                 "bound to this session")
+        ]
+        for o in others:
+            seg = (
+                f"🤖 {_agent_label(o['name'], o.get('display_name', ''), md)}"
+                + f" · {_network_label(o['api_url'])}"
+                + f" · {_workload(o.get('tasks'), o.get('inbox'), md)}"
+            )
+            lines.append(q + seg)
+        if others:
+            target = next((o for o in others if o.get("tasks")), others[0])
+            say = target.get("display_name") or target["name"]
+            if md:
+                lines.append(f'> ↔️ To connect, just say *"act as {say}"*')
+            else:
+                lines.append(f'↔️ To connect, just say "act as {say}"')
+        return lines
+
     lines = [
-        ("> " if md else "") + ("⚡ **Society AI** · connected" if md else "⚡ Society AI · connected"),
+        q + ("⚡ **Society AI** · connected" if md else "⚡ Society AI · connected"),
     ]
     lines.append(
-        ("> " if md else "")
+        q
         + f"🤖 Acting as {_agent_label(acting_name, acting_display, md)}"
         + f" · {_network_label(acting_url)}"
         + f" · {_workload(acting_tasks, acting_inbox, md)}"
@@ -189,7 +219,17 @@ def main() -> int:
 
     acting_name = (acting or {}).get("name", "")
     acting_url = (acting or {}).get("api_url", "")
-    if not acting_name:
+
+    # No identity injected (the MCP config bakes no defaults). Mirror
+    # identity.py's spawn rule: a single-persona machine auto-binds to it;
+    # several personas start UNBOUND and the user picks via switch_agent.
+    if not (acting or {}).get("bound"):
+        if len(personas) == 1:
+            acting_name = personas[0]["name"]
+            acting_url = personas[0]["api_url"]
+        else:
+            acting_name, acting_url = "", ""
+    if not acting_name and not personas:
         return 0
 
     context_lines: list[str] = ["[Society AI session identity]"]
@@ -204,11 +244,19 @@ def main() -> int:
         if fetched is not None:
             acting_tasks, acting_inbox = fetched
 
-    context_lines.append(
-        f"This session's society-ai MCP is acting as "
-        f"{_agent_label(acting_name, acting_display, md=False)} "
-        f"on {_network_label(acting_url)} ({acting_url})."
-    )
+    if acting_name:
+        context_lines.append(
+            f"This session's society-ai MCP is acting as "
+            f"{_agent_label(acting_name, acting_display, md=False)} "
+            f"on {_network_label(acting_url)} ({acting_url})."
+        )
+    else:
+        context_lines.append(
+            "This session is NOT bound to a Society AI agent yet. "
+            "Identity-dependent society-ai tools will refuse until bound. "
+            "When the user asks for Society AI work, ask which agent to act "
+            "as (or bind directly if they name one) and call `switch_agent`."
+        )
 
     # -- Other personas -------------------------------------------------------
     others: list[dict[str, Any]] = []
@@ -267,8 +315,8 @@ def main() -> int:
         "blockquote, verbatim, then a blank line, then your normal answer:\n"
         + quote
         + "\n  Do not repeat it in later replies unless the binding changes "
-        "(after a successful switch_agent, show the same blockquote once "
-        "with the identities updated)."
+        "(after a successful switch_agent, show the bound version of the "
+        "blockquote once with the identities updated)."
     )
 
     banner_lines = _banner(

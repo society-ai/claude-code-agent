@@ -17,6 +17,14 @@ import re
 REPO_DIR = pathlib.Path(__file__).resolve().parent
 DEFAULT_API_URL = "https://api.societyai.com"
 
+# Task statuses that count as "open work" in the session banner and the
+# status line. `failed` is included deliberately: a failed task is
+# outstanding work that needs attention, not a closed one (terminal
+# statuses are `done` and `cancelled`).
+OPEN_TASK_STATUSES = {
+    "backlog", "todo", "in_progress", "in_review", "blocked", "failed",
+}
+
 # .env.<persona> — same name shape the WS hub accepts for agents.
 _PERSONA_ENV_RE = re.compile(r"^\.env\.([a-z0-9][a-z0-9._-]{0,62})$")
 _EXCLUDED = {".env.example"}
@@ -86,12 +94,21 @@ def resolve_mcp_identity(cwd: str | None = None) -> dict[str, str] | None:
         return None
 
     env = entry.get("env") or {}
-    name = _expand(env.get("AGENT_NAME", "")) or "claude-code"
+    # An empty expansion means no identity was injected (the config bakes
+    # no defaults) — the session starts unbound or single-persona
+    # auto-bound; callers decide (mirror identity.py's rule).
+    name = _expand(env.get("AGENT_NAME", ""))
+    token = _expand(env.get("SOCIETY_AI_AUTH_TOKEN", ""))
     api_url = (
         _expand(env.get("AGENT_ROUTER_API_URL", "")) or DEFAULT_API_URL
     ).rstrip("/")
     company_id = _expand(env.get("COMPANY_ID", ""))
-    return {"name": name, "api_url": api_url, "company_id": company_id}
+    return {
+        "name": name,
+        "api_url": api_url,
+        "company_id": company_id,
+        "bound": bool(token),
+    }
 
 
 def discover_personas() -> list[dict[str, str]]:
