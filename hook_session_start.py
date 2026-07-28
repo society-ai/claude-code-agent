@@ -190,6 +190,22 @@ def main() -> int:
             "society-ai `switch_agent` tool with that name."
         )
 
+    # Some surfaces (the desktop app) don't render the systemMessage banner,
+    # so the model is the only way the user learns the binding. One line,
+    # first reply only — harmless duplication where the banner does render.
+    if acting_name:
+        context_lines.append(
+            "  Begin your FIRST reply of this session with exactly one short "
+            f"line stating the binding — `Society AI: acting as {acting_name} → "
+            f"{acting_url}`"
+            + (
+                " (other identities: " + ", ".join(other_names) + ")"
+                if other_names else ""
+            )
+            + " — then answer normally. Don't repeat it in later replies "
+            "unless the binding changes."
+        )
+
     if not banner_lines:
         return 0
 
