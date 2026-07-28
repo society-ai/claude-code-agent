@@ -168,8 +168,9 @@ def main() -> int:
         # be visible when another persona is showing counts). Other
         # personas' counts follow after a dash, clearly not this session.
         bound = binding["agent"]
+        label = binding.get("display_name") or bound
         seg = _segment((by_persona or {}).get(bound) or {})
-        line = f"as {bound}" + (f" · {seg}" if seg else "")
+        line = f"as {label}" + (f" · {seg}" if seg else "")
         others = [
             f"{name} {_compact(counts)}"
             for name, counts in (by_persona or {}).items()

@@ -4,16 +4,21 @@ Registered via configure_hooks.py as a Claude Code `SessionStart` hook.
 
 Two outputs, emitted as the JSON hook contract:
 
-- `systemMessage` — a platform-rendered banner (terminal AND desktop app,
-  no model turn involved) stating which agent this session is acting as,
-  against which API, with its open task/inbox counts — plus any OTHER
-  configured personas that have open work, and how to switch ("act as
-  <name>"). This makes the session's true identity visible before the
-  user types anything.
+- `systemMessage` — a platform-rendered banner (the terminal shows it
+  before the user types; the desktop app currently doesn't render it)
+  stating which agent this session acts as, on which network, with its
+  open workload, the other agents configured on this machine, and how to
+  switch.
 
-- `additionalContext` — the same facts for the model, so it can answer
-  "which agent are you?" and execute a switch request via the
-  `switch_agent` MCP tool without guessing.
+- `additionalContext` — the same facts for the model, plus an instruction
+  to open its FIRST reply with a blockquote version of the banner — the
+  only identity surface app users actually see — and to execute switch
+  requests via the `switch_agent` MCP tool (which accepts canonical ids
+  and display names alike).
+
+Agents are labeled with the user-given display name when known
+(`DISPLAY_NAME` in the persona's env file) alongside the canonical id,
+and API URLs are labeled by network (Society AI Cloud / Local network).
 
 The acting identity is resolved by expanding the `${VAR:-default}` values
 of the society-ai MCP entry (project .mcp.json first, then ~/.claude.json)
@@ -57,6 +62,38 @@ def _format_inbox(i: dict[str, Any]) -> str:
     return f"{typ}{src}: {title}".rstrip()
 
 
+def _network_label(url: str) -> str:
+    """Friendly network name for an API URL, keeping the technical
+    reference where it isn't obvious from the name."""
+    host = (url or "").split("://", 1)[-1].split("/", 1)[0]
+    bare = host.split(":")[0].lower()
+    if bare in ("localhost", "127.0.0.1", "0.0.0.0"):
+        return f"Local network ({host})"
+    if bare == "api.societyai.com":
+        return "Society AI Cloud"
+    return host or "unknown network"
+
+
+def _agent_label(name: str, display: str, md: bool) -> str:
+    """'kilo (`agent-egrx5fzz`)' when a display name is known, else the id."""
+    if display and display.lower() != (name or "").lower():
+        return f"**{display}** (`{name}`)" if md else f"{display} ({name})"
+    return f"**{name}**" if md else name
+
+
+def _workload(tasks: list | None, inbox: list | None, md: bool) -> str:
+    if tasks is None:
+        return "status unavailable"
+    if not tasks and not inbox:
+        return "no open work"
+    n = len(tasks)
+    s = f"{n} open task" + ("" if n == 1 else "s")
+    parts = [f"**{s}**" if md else s]
+    if inbox:
+        parts.append(f"{len(inbox)} inbox")
+    return " · ".join(parts)
+
+
 def _fetch(api_url: str, token: str, agent_name: str) -> tuple[list, list] | None:
     """Return (open_tasks, pending_inbox), or None if unreachable."""
     try:
@@ -94,6 +131,50 @@ def _fetch(api_url: str, token: str, agent_name: str) -> tuple[list, list] | Non
         return None
 
 
+def _banner(
+    acting_name: str,
+    acting_display: str,
+    acting_url: str,
+    acting_tasks: list | None,
+    acting_inbox: list | None,
+    others: list[dict[str, Any]],
+    md: bool,
+) -> list[str]:
+    """The 4-line banner, in plain text (systemMessage) or markdown
+    blockquote flavor (first-reply). `others` entries: {name, display_name,
+    api_url, tasks, inbox} with tasks/inbox possibly None."""
+    lines = [
+        ("> " if md else "") + ("⚡ **Society AI** · connected" if md else "⚡ Society AI · connected"),
+    ]
+    lines.append(
+        ("> " if md else "")
+        + f"🤖 Acting as {_agent_label(acting_name, acting_display, md)}"
+        + f" · {_network_label(acting_url)}"
+        + f" · {_workload(acting_tasks, acting_inbox, md)}"
+    )
+    if others:
+        segs = []
+        for o in others:
+            seg = (
+                _agent_label(o["name"], o.get("display_name", ""), md)
+                + f" · {_network_label(o['api_url'])}"
+            )
+            if o.get("tasks") is not None and (o["tasks"] or o.get("inbox")):
+                seg += f" · {_workload(o['tasks'], o.get('inbox'), md)}"
+            segs.append(seg)
+        lines.append(("> " if md else "") + "💤 Also on this machine: " + "; ".join(segs))
+
+        # Point the switch hint at the most relevant other agent — the one
+        # with open work if any, else the first.
+        target = next((o for o in others if o.get("tasks")), others[0])
+        say = target.get("display_name") or target["name"]
+        if md:
+            lines.append(f'> ↔️ To switch, just say *"act as {say}"*')
+        else:
+            lines.append(f'↔️ To switch, just say "act as {say}"')
+    return lines
+
+
 def main() -> int:
     try:
         hook_input = json.load(sys.stdin)
@@ -106,14 +187,16 @@ def main() -> int:
     if acting is None and not personas:
         return 0  # society-ai not configured on this machine
 
-    banner_lines: list[str] = []
-    context_lines: list[str] = ["[Society AI session identity]"]
-
     acting_name = (acting or {}).get("name", "")
     acting_url = (acting or {}).get("api_url", "")
+    if not acting_name:
+        return 0
+
+    context_lines: list[str] = ["[Society AI session identity]"]
 
     # -- Acting identity + its counts -----------------------------------------
     acting_persona = next((p for p in personas if p["name"] == acting_name), None)
+    acting_display = (acting_persona or {}).get("display_name", "")
     acting_tasks: list | None = None
     acting_inbox: list | None = None
     if acting_persona:
@@ -121,58 +204,36 @@ def main() -> int:
         if fetched is not None:
             acting_tasks, acting_inbox = fetched
 
-    if acting_name:
-        line = f"Society AI: acting as {acting_name} → {acting_url}"
-        if acting_tasks is not None:
-            line += f" · {len(acting_tasks)} tasks · {len(acting_inbox or [])} inbox"
-        elif acting_persona is None:
-            line += " (no matching .env persona — counts unavailable)"
-        else:
-            line += " (unreachable — counts unavailable)"
-        banner_lines.append(line)
-        context_lines.append(
-            f"This session's society-ai MCP is acting as {acting_name} "
-            f"against {acting_url}."
-        )
+    context_lines.append(
+        f"This session's society-ai MCP is acting as "
+        f"{_agent_label(acting_name, acting_display, md=False)} "
+        f"on {_network_label(acting_url)} ({acting_url})."
+    )
 
-    # -- Other personas with open work ----------------------------------------
-    others: list[str] = []
-    other_names: list[str] = []
+    # -- Other personas -------------------------------------------------------
+    others: list[dict[str, Any]] = []
     for p in personas:
         if p["name"] == acting_name:
             continue
-        other_names.append(p["name"])
         fetched = _fetch(p["api_url"], p["token"], p["name"])
-        if fetched is None:
-            continue
-        tasks, inbox = fetched
+        tasks, inbox = fetched if fetched is not None else (None, None)
+        others.append({
+            "name": p["name"],
+            "display_name": p.get("display_name", ""),
+            "api_url": p["api_url"],
+            "tasks": tasks,
+            "inbox": inbox,
+        })
         if tasks or inbox:
-            seg = f"{p['name']} ({len(tasks)} tasks"
-            if inbox:
-                seg += f", {len(inbox)} inbox"
-            seg += ")"
-            others.append(seg)
-            context_lines.append(f"  Open work under {p['name']}:")
-            for t in tasks[:MAX_LISTED]:
+            context_lines.append(
+                f"  Open work under {_agent_label(p['name'], p.get('display_name', ''), md=False)}:"
+            )
+            for t in (tasks or [])[:MAX_LISTED]:
                 context_lines.append(f"    - {_format_task(t)}")
-            for i in inbox[:MAX_LISTED]:
+            for i in (inbox or [])[:MAX_LISTED]:
                 context_lines.append(f"    - {_format_inbox(i)}")
 
-    if others:
-        first_other = others[0].split(" ")[0]
-        banner_lines.append(
-            "  open work under other identities: "
-            + ", ".join(others)
-            + f' · to switch, ask: "act as {first_other}"'
-        )
-    elif other_names:
-        banner_lines.append(
-            "  other identities available: "
-            + ", ".join(other_names)
-            + ' · to switch, ask: "act as <name>"'
-        )
-
-    # -- Acting agent's own open items (context only, keeps the banner short) --
+    # -- Acting agent's own open items (context only) --------------------------
     if acting_tasks:
         context_lines.append(f"  Open tasks assigned to {acting_name}:")
         for t in acting_tasks[:MAX_LISTED]:
@@ -182,37 +243,38 @@ def main() -> int:
         for i in acting_inbox[:MAX_LISTED]:
             context_lines.append(f"    - {_format_inbox(i)}")
 
-    if other_names:
+    if others:
         context_lines.append(
-            "  Other personas on this machine: "
-            + ", ".join(other_names)
-            + ". If the user asks to act as one of them, call the "
-            "society-ai `switch_agent` tool with that name."
+            "  Other agents on this machine: "
+            + ", ".join(
+                _agent_label(o["name"], o.get("display_name", ""), md=False)
+                for o in others
+            )
+            + ". The user may refer to an agent by display name or canonical "
+            "id — the society-ai `switch_agent` tool accepts both. Call it "
+            "when the user asks to act as / switch to another agent."
         )
 
     # Some surfaces (the desktop app) don't render the systemMessage banner,
     # so the model is the only way the user learns the binding. A blockquote
     # reads as a banner rather than as the agent talking; first reply only.
-    if acting_name:
-        quote = f"> ⚙ **Society AI**: acting as **{acting_name}** · {acting_url}"
-        if other_names:
-            first = other_names[0]
-            quote += (
-                f'\n> Other identities: {", ".join(other_names)}. '
-                f'To switch, say "act as {first}".'
-            )
-        context_lines.append(
-            "  Begin your FIRST reply of this session with exactly this "
-            "blockquote, verbatim, then a blank line, then your normal "
-            "answer:\n"
-            + quote
-            + "\n  Do not repeat it in later replies unless the binding "
-            "changes (after a successful switch_agent, show the same "
-            "blockquote once with the new identity)."
-        )
+    quote = "\n".join(
+        _banner(acting_name, acting_display, acting_url,
+                acting_tasks, acting_inbox, others, md=True)
+    )
+    context_lines.append(
+        "  Begin your FIRST reply of this session with exactly this "
+        "blockquote, verbatim, then a blank line, then your normal answer:\n"
+        + quote
+        + "\n  Do not repeat it in later replies unless the binding changes "
+        "(after a successful switch_agent, show the same blockquote once "
+        "with the identities updated)."
+    )
 
-    if not banner_lines:
-        return 0
+    banner_lines = _banner(
+        acting_name, acting_display, acting_url,
+        acting_tasks, acting_inbox, others, md=False,
+    )
 
     print(json.dumps({
         "hookSpecificOutput": {

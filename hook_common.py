@@ -132,6 +132,7 @@ def discover_personas() -> list[dict[str, str]]:
             "api_url": api_url,
             "company_id": (env.get("COMPANY_ID") or "").strip(),
             "bridge_socket": (env.get("SOCIETY_AI_BRIDGE_SOCKET") or "").strip(),
+            "display_name": (env.get("DISPLAY_NAME") or "").strip(),
             "env_file": str(path),
         })
 

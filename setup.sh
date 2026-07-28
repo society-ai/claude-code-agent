@@ -59,13 +59,17 @@ PROD_API_URL="https://api.societyai.com"
 
 usage() {
     cat <<EOF
-Usage: ./setup.sh [--token sai_...] [--name <agent-name>] [--yes] [--persona <name>] [--url <url>]
+Usage: ./setup.sh [--token sai_...] [--name <agent-name>] [--display-name <name>] [--yes] [--persona <name>] [--url <url>]
 
   --token <sai_...>   Society AI API key (get one at https://societyai.com).
                       Falls back to \$SOCIETY_AI_AUTH_TOKEN; flag wins.
   --name <name>       Agent name. Fresh machine: primary persona's AGENT_NAME.
                       Existing primary: a different name creates an
                       additional persona (equivalent to --persona <name>).
+  --display-name <n>  The agent's user-facing display name on Society AI
+                      (e.g. "Kilo"). Written to the env file as
+                      DISPLAY_NAME; shown in session banners and accepted
+                      by switch_agent alongside the canonical name.
   --yes, -y           Non-interactive: never prompt, install + start the
                       bridge service. Requires a token via --token or env.
   --persona <name>    Set up an additional persona explicitly.
@@ -84,6 +88,7 @@ EOF
 PERSONA=""
 CLI_TOKEN=""
 CLI_NAME=""
+CLI_DISPLAY_NAME=""
 CLI_URL=""
 ASSUME_YES=0
 
@@ -102,6 +107,8 @@ while [ $# -gt 0 ]; do
         --token=*)   CLI_TOKEN="${1#*=}"; shift ;;
         --name)      need_value "$1" $#; CLI_NAME="$2"; shift 2 ;;
         --name=*)    CLI_NAME="${1#*=}"; shift ;;
+        --display-name)   need_value "$1" $#; CLI_DISPLAY_NAME="$2"; shift 2 ;;
+        --display-name=*) CLI_DISPLAY_NAME="${1#*=}"; shift ;;
         --url)       need_value "$1" $#; CLI_URL="$2"; shift 2 ;;
         --url=*)     CLI_URL="${1#*=}"; shift ;;
         --yes|-y)    ASSUME_YES=1; shift ;;
@@ -130,6 +137,14 @@ if [ -n "$CLI_NAME" ] && ! valid_name "$CLI_NAME"; then
     echo "Error: invalid agent name: '${CLI_NAME}'" >&2
     echo "(lowercase alphanumerics plus - _ . , max 63 chars)" >&2
     exit 1
+fi
+
+# Display name is free text but lands in a shell-sourced env file
+# (bridge_launcher.sh sources it), so strip quotes/newlines and cap the
+# length; the value itself is written double-quoted.
+if [ -n "$CLI_DISPLAY_NAME" ]; then
+    CLI_DISPLAY_NAME="$(printf '%s' "$CLI_DISPLAY_NAME" | tr -d '"`$\\\n\r' | cut -c1-80)"
+    CLI_DISPLAY_NAME="$(trim "$CLI_DISPLAY_NAME")"
 fi
 if [ -n "$PERSONA" ] && ! valid_name "$PERSONA"; then
     echo "Error: invalid persona name: '${PERSONA}'" >&2
@@ -189,9 +204,10 @@ backup_env_file() {
 # and/or AGENT_ROUTER_API_URL lines, leaving every other setting (AGENT_NAME,
 # WORK_DIR, EXTRA_DIRS, ...) exactly as it was.
 update_env_file() {
-    python3 - "$1" "$2" "$3" <<'PYEOF'
+    python3 - "$1" "$2" "$3" "${4:-}" <<'PYEOF'
 import os, re, sys
 path, token, url = sys.argv[1], sys.argv[2], sys.argv[3]
+display = sys.argv[4] if len(sys.argv) > 4 else ""
 with open(path) as f:
     content = f.read()
 
@@ -207,6 +223,9 @@ if token:
 if url:
     content = set_line(content, "AGENT_ROUTER_API_URL", url)
     print(f"  Set AGENT_ROUTER_API_URL={url} in {path}")
+if display:
+    content = set_line(content, "DISPLAY_NAME", f'"{display}"')
+    print(f"  Set DISPLAY_NAME={display} in {path}")
 with open(path, "w") as f:
     f.write(content)
 try:
@@ -353,7 +372,7 @@ if [ -n "$PERSONA" ]; then
             backup_env_file "$ENV_FILE"
             # Always write the resolved URL, so the file states its target
             # explicitly instead of relying on an implicit default.
-            update_env_file "$ENV_FILE" "${CLI_TOKEN:+$TOKEN}" "$PERSONA_API_URL"
+            update_env_file "$ENV_FILE" "${CLI_TOKEN:+$TOKEN}" "$PERSONA_API_URL" "$CLI_DISPLAY_NAME"
         else
             echo "  $ENV_FILE already exists. Leaving it alone."
             echo "  To reconfigure, delete it and re-run."
@@ -389,6 +408,7 @@ if [ -n "$PERSONA" ]; then
             echo "# Persona '$PERSONA' - created by setup.sh"
             echo "SOCIETY_AI_AUTH_TOKEN=$API_KEY"
             echo "AGENT_NAME=$PERSONA"
+            [ -n "$CLI_DISPLAY_NAME" ] && echo "DISPLAY_NAME=\"$CLI_DISPLAY_NAME\""
             echo "AGENT_ROUTER_API_URL=$PERSONA_API_URL"
             echo "SOCIETY_AI_BRIDGE_SOCKET=$HOME/.cache/society-ai/$PERSONA/bridge.sock"
         } > "$ENV_FILE"
@@ -623,7 +643,7 @@ if [ -f ".env" ]; then
         # explicitly instead of relying on an implicit default. Without
         # --url this is whatever the file already said (a no-op), or the
         # production default when it said nothing.
-        update_env_file ".env" "${CLI_TOKEN:+$TOKEN}" "$API_URL_RESOLVED"
+        update_env_file ".env" "${CLI_TOKEN:+$TOKEN}" "$API_URL_RESOLVED" "$CLI_DISPLAY_NAME"
     else
         echo "  A connection key is already saved (.env exists). Leaving it alone."
         echo "  To reconfigure, delete .env and re-run ./setup.sh"
@@ -670,9 +690,10 @@ else
     # Write .env safely via Python to avoid sed/shell injection.
     # The URL passed here is always the resolved one (--url or the
     # production default), never empty: a fresh .env states its target.
-    python3 - "$API_KEY" "$DEFAULT_AGENT_NAME" "$API_URL_RESOLVED" <<'PYEOF'
+    python3 - "$API_KEY" "$DEFAULT_AGENT_NAME" "$API_URL_RESOLVED" "$CLI_DISPLAY_NAME" <<'PYEOF'
 import os, sys, shutil, re
 key, agent_name, url = sys.argv[1], sys.argv[2], sys.argv[3]
+display = sys.argv[4] if len(sys.argv) > 4 else ""
 shutil.copy(".env.example", ".env")
 with open(".env") as f:
     content = f.read()
@@ -680,6 +701,13 @@ content = content.replace("sai_your_api_key_here", key)
 # Inject AGENT_NAME default if user didn't already uncomment it
 if not re.search(r"^AGENT_NAME=", content, re.M):
     content = re.sub(r"# AGENT_NAME=claude-code", f"AGENT_NAME={agent_name}", content)
+# The agent's user-facing display name (banners, switch_agent matching).
+if display and not re.search(r"^DISPLAY_NAME=", content, re.M):
+    content = re.sub(
+        r"^(AGENT_NAME=.*)$",
+        lambda m: m.group(1) + f'\nDISPLAY_NAME="{display}"',
+        content, count=1, flags=re.M,
+    )
 # The target Society AI backend, always written explicitly so the file is
 # self-describing (production default unless --url said otherwise).
 if url:

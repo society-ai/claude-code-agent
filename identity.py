@@ -44,6 +44,7 @@ class Identity:
     api_url: str
     company_id: str = ""
     bridge_socket: str = ""
+    display_name: str = ""  # user-given name, e.g. "kilo"; "" if unknown
     source: str = "env"  # "env" (spawn-time) or "switch" (rebound in-session)
 
     def headers(self) -> dict[str, str]:
@@ -54,12 +55,24 @@ class Identity:
         }
 
 
+def _display_name_for(name: str) -> str:
+    """Best-effort display-name lookup from the persona env files."""
+    try:
+        for p in discover_personas():
+            if p["name"] == name:
+                return p.get("display_name", "")
+    except Exception:
+        pass
+    return ""
+
+
 _current = Identity(
     name=config.AGENT_NAME,
     token=config.SOCIETY_AI_AUTH_TOKEN,
     api_url=config.AGENT_ROUTER_API_URL,
     company_id=config.COMPANY_ID,
     bridge_socket=config.SOCIETY_AI_BRIDGE_SOCKET,
+    display_name=_display_name_for(config.AGENT_NAME),
     source="env",
 )
 
@@ -74,13 +87,24 @@ def personas() -> list[dict[str, str]]:
 
 
 def bind(agent_name: str) -> Identity:
-    """Rebind this session to the named persona. Raises ValueError if the
-    persona isn't configured on this machine."""
+    """Rebind this session to the named persona — by canonical name
+    (agent-8u6qy3ba) or by the user-given display name (case-insensitive).
+    Raises ValueError if the persona isn't configured on this machine."""
     global _current
     agent_name = (agent_name or "").strip()
-    matches = [p for p in personas() if p["name"] == agent_name]
+    all_personas = personas()
+    matches = [p for p in all_personas if p["name"] == agent_name]
     if not matches:
-        available = ", ".join(p["name"] for p in personas()) or "(none)"
+        wanted = agent_name.lower()
+        matches = [
+            p for p in all_personas
+            if p.get("display_name", "").lower() == wanted
+        ]
+    if not matches:
+        available = ", ".join(
+            p["name"] + (f' ("{p["display_name"]}")' if p.get("display_name") else "")
+            for p in all_personas
+        ) or "(none)"
         raise ValueError(
             f"No persona named {agent_name!r} on this machine. Available: {available}"
         )
@@ -91,6 +115,7 @@ def bind(agent_name: str) -> Identity:
         api_url=p["api_url"],
         company_id=p.get("company_id", ""),
         bridge_socket=p.get("bridge_socket", ""),
+        display_name=p.get("display_name", ""),
         source="switch",
     )
     # bridge_ipc resolves its socket from env at call time — repoint
@@ -117,6 +142,7 @@ def write_binding() -> None:
         _reap_dead()
         payload = {
             "agent": _current.name,
+            "display_name": _current.display_name,
             "api_url": _current.api_url,
             "source": _current.source,
             "pid": os.getpid(),

@@ -168,29 +168,41 @@ async def switch_agent(agent_name: str = "") -> str:
     endpoint, and bridge.
 
     Args:
-        agent_name: Persona to switch to. Empty → list available identities
-            and the current binding without switching.
+        agent_name: Persona to switch to — canonical id (agent-8u6qy3ba) OR
+            the user-given display name (e.g. "kilo"), case-insensitive.
+            Empty → list available identities and the current binding
+            without switching.
     """
     ident = _ident()
     available = [
-        {"name": p["name"], "api_url": p["api_url"]} for p in identity.personas()
+        {
+            "name": p["name"],
+            "display_name": p.get("display_name", ""),
+            "api_url": p["api_url"],
+        }
+        for p in identity.personas()
     ]
     if not agent_name.strip():
         return _result({
             "acting_as": ident.name,
+            "display_name": ident.display_name,
             "api_url": ident.api_url,
             "available": available,
         })
 
-    if agent_name.strip() == ident.name:
+    wanted = agent_name.strip()
+    if wanted == ident.name or (
+        ident.display_name and wanted.lower() == ident.display_name.lower()
+    ):
         return _result({
             "acting_as": ident.name,
+            "display_name": ident.display_name,
             "api_url": ident.api_url,
             "unchanged": True,
         })
 
     try:
-        new = identity.bind(agent_name)
+        new = identity.bind(wanted)
     except ValueError as e:
         return _result(_error(str(e)))
 
@@ -199,6 +211,7 @@ async def switch_agent(agent_name: str = "") -> str:
     verified = not (isinstance(check, dict) and check.get("error"))
     out: dict[str, Any] = {
         "switched_to": new.name,
+        "display_name": new.display_name,
         "api_url": new.api_url,
         "verified": verified,
     }
