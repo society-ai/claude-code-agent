@@ -28,7 +28,9 @@ import os
 import re
 import signal
 import ssl
+import subprocess
 import sys
+import threading
 import uuid
 
 import certifi
@@ -81,6 +83,96 @@ HTTP_FETCH_TIMEOUT = 30
 
 # UUID pattern for input validation
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+# -- Runtime identity ---------------------------------------------------------
+#
+# Two version axes travel with every registration, and they are easy to
+# confuse:
+#   framework / framework_version — the software we run *on top of*, i.e. the
+#       Claude Code CLI installed on this machine (e.g. "2.1.220"). It changes
+#       whenever the user updates the CLI, independently of this package.
+#   adapter_version — the version of *this* integration package (config
+#       __version__), i.e. the bridge code speaking to the hub.
+# Both fields are optional on the wire: older hubs simply ignore unknown
+# params, so nothing needs to negotiate.
+
+FRAMEWORK = "claude_code"
+
+CLAUDE_VERSION_TIMEOUT = 2  # seconds — `claude --version` must never stall us
+
+# "2.1.220 (Claude Code)" / "2.1.220" -> "2.1.220"
+_CLI_VERSION_RE = re.compile(r"\b(\d+\.\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.]+)?)\b")
+
+_claude_cli_version: str | None = None
+_claude_cli_version_probed = False
+_claude_cli_version_lock = threading.Lock()
+
+
+def parse_claude_version(output: str | None) -> str | None:
+    """Extract the bare version token from `claude --version` output.
+
+    Returns None for empty or unrecognized output rather than guessing.
+    """
+    if not output:
+        return None
+    match = _CLI_VERSION_RE.search(output.strip())
+    return match.group(1) if match else None
+
+
+def claude_cli_version() -> str | None:
+    """Detected Claude Code CLI version, or None if it can't be determined.
+
+    Probed at most once per process (the answer — including "unknown" — is
+    cached), because registration happens on every reconnect and must never
+    pay for a subprocess. Never raises: a missing binary, a non-zero exit,
+    unexpected output or a hung process all resolve to None so that
+    registration proceeds regardless.
+    """
+    global _claude_cli_version, _claude_cli_version_probed
+    with _claude_cli_version_lock:
+        if _claude_cli_version_probed:
+            return _claude_cli_version
+        _claude_cli_version_probed = True
+        try:
+            proc = subprocess.run(
+                ["claude", "--version"],
+                capture_output=True,
+                text=True,
+                timeout=CLAUDE_VERSION_TIMEOUT,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            # Binary missing, not executable, or timed out.
+            logger.debug("Could not run `claude --version`: %s", e)
+            return None
+        if proc.returncode != 0:
+            logger.debug(
+                "`claude --version` exited %s: %s",
+                proc.returncode,
+                (proc.stderr or "").strip()[:200],
+            )
+            return None
+        version = parse_claude_version(proc.stdout)
+        if not version:
+            logger.warning(
+                "Unrecognized `claude --version` output: %r", (proc.stdout or "")[:200]
+            )
+            return None
+        _claude_cli_version = version
+        logger.debug("Claude Code CLI version: %s", version)
+        return version
+
+
+async def claude_cli_version_async() -> str | None:
+    """Async wrapper — offloads the one-time probe so the event loop never
+    blocks on the subprocess. Cache hits return without touching a thread."""
+    if _claude_cli_version_probed:
+        return _claude_cli_version
+    try:
+        return await asyncio.to_thread(claude_cli_version)
+    except Exception as e:  # never let version detection break registration
+        logger.debug("Claude Code version detection failed: %s", e)
+        return None
 
 
 # -- JWT token exchange -------------------------------------------------------
@@ -642,15 +734,21 @@ class Bridge:
         """Register this agent with the hub using the WS JWT."""
         if not self._ws_jwt:
             await self.obtain_jwt()
-        await self.send_rpc(
-            "agent.register",
-            {
-                "agent_name": self.ctx.name,
-                "auth_token": self._ws_jwt,
-                "visibility": "private",
-            },
-            msg_id=self._next_id(),
-        )
+        # framework/framework_version describe the runtime we sit on top of
+        # (the Claude Code CLI); adapter_version is this package. See the
+        # "Runtime identity" block near the top for why both exist.
+        params = {
+            "agent_name": self.ctx.name,
+            "auth_token": self._ws_jwt,
+            "visibility": "private",
+            "framework": FRAMEWORK,
+            "adapter_version": __version__,
+        }
+        framework_version = await claude_cli_version_async()
+        if framework_version:
+            # Omitted entirely when undetectable — never send an empty string.
+            params["framework_version"] = framework_version
+        await self.send_rpc("agent.register", params, msg_id=self._next_id())
 
     # -- Heartbeat -----------------------------------------------------------
 
@@ -1961,9 +2059,12 @@ def main():
     # Machine-wide concurrency cap across ALL agents (overridable). This is
     # the bounded-parallelism limit a single per-agent process can't enforce.
     machine_cap = max(1, int(os.getenv("MAX_CONCURRENT_MACHINE", "8")))
+    # Warms the one-time CLI version cache before any agent registers.
     logger.info(
-        "claude-code-agent harness v%s — %d agent(s): %s (mode=%s, machine cap=%d)",
-        __version__, len(roster), ", ".join(c.name for c in roster),
+        "claude-code-agent harness v%s on Claude Code CLI %s — %d agent(s): %s "
+        "(mode=%s, machine cap=%d)",
+        __version__, claude_cli_version() or "unknown",
+        len(roster), ", ".join(c.name for c in roster),
         EXECUTION_MODE, machine_cap,
     )
 
