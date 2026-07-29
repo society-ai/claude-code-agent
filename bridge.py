@@ -177,17 +177,18 @@ async def claude_cli_version_async() -> str | None:
 
 # -- JWT token exchange -------------------------------------------------------
 
-async def exchange_api_key_for_jwt(api_key: str) -> str:
+async def exchange_api_key_for_jwt(api_key: str, api_url: str = AGENT_ROUTER_API_URL) -> str:
     """Exchange a Society AI API key (sai_...) for a short-lived WS JWT.
 
     POST /auth/agent-token with {"api_key": "<key>"}
-    Returns JWT valid for ~15 min.
+    Returns JWT valid for ~15 min. `api_url` is the backend the key was
+    minted for — per-agent in a harness, never assumed from process env.
 
     Raises:
         AuthError on 401/403 (caller should not retry — bad credentials).
         httpx.HTTPError on transient failures (caller may retry with backoff).
     """
-    url = f"{AGENT_ROUTER_API_URL}/auth/agent-token"
+    url = f"{api_url}/auth/agent-token"
     ssl_ctx = ssl.create_default_context(cafile=certifi.where())
     async with httpx.AsyncClient(timeout=JWT_EXCHANGE_TIMEOUT, verify=ssl_ctx) as client:
         resp = await client.post(url, json={"api_key": api_key})
@@ -673,8 +674,13 @@ class Bridge:
             # disables it; spawn mode never mirrors.
             if MIRROR_SESSIONS:
                 from transcript_shipper import TranscriptShipper
+                # ctx.api_url, NOT the module-level default: the shipper must
+                # hit the SAME backend this agent's token was minted for. In a
+                # harness the process env has no AGENT_ROUTER_API_URL, and the
+                # module default (prod) would ship a local agent's transcripts
+                # to the wrong environment.
                 self._shipper = TranscriptShipper(
-                    AGENT_ROUTER_API_URL,
+                    self.ctx.api_url,
                     self.ctx.token,
                     state_dir=self.ctx.state_dir,
                     level=MIRROR_LEVEL,
@@ -697,7 +703,9 @@ class Bridge:
             from config import ENABLE_AGENT_LIFECYCLE
             sandbox_env = {
                 "SOCIETY_AI_AUTH_TOKEN": self.ctx.token,
-                "AGENT_ROUTER_API_URL": AGENT_ROUTER_API_URL,
+                # Per-agent URL: the sandboxed session must hit the same
+                # backend its token was minted for (matches session_env()).
+                "AGENT_ROUTER_API_URL": self.ctx.api_url,
                 "AGENT_NAME": self.ctx.name,
                 "COMPANY_ID": self.ctx.company_id,
             }
@@ -743,7 +751,7 @@ class Bridge:
         so we don't need a proactive refresh loop. If the connection drops,
         the next reconnect attempt fetches a fresh JWT.
         """
-        self._ws_jwt = await exchange_api_key_for_jwt(self.ctx.token)
+        self._ws_jwt = await exchange_api_key_for_jwt(self.ctx.token, self.ctx.api_url)
 
     async def register(self):
         """Register this agent with the hub using the WS JWT."""
@@ -1311,7 +1319,7 @@ class Bridge:
                 "User-Agent": f"claude-code-agent/{__version__}",
             }
             resp = await _get_http_client().post(
-                f"{AGENT_ROUTER_API_URL}/api/v1/feed",
+                f"{self.ctx.api_url}/api/v1/feed",
                 json={"message": message},
                 headers=headers,
             )
@@ -1797,7 +1805,7 @@ class Bridge:
             "pid": os.getpid(),
             "ws_connected": ws_connected,
             "registered": bool(self.registered),
-            "api_url": AGENT_ROUTER_API_URL,
+            "api_url": self.ctx.api_url,
             "config": {
                 "session_mode": self._session_mode,
                 "mirror": MIRROR_SESSIONS,
@@ -1961,7 +1969,7 @@ class Bridge:
                     asyncio.ensure_future(self._mirror_retry_loop())
                 from policy import fetch_platform_policy, apply_platform, apply_local_env
                 fetched = await fetch_platform_policy(
-                    AGENT_ROUTER_API_URL, self.ctx.token, self.ctx.name
+                    self.ctx.api_url, self.ctx.token, self.ctx.name
                 )
                 if fetched:
                     pol = self._session_mgr.policy(self.ctx.name)
@@ -1976,7 +1984,7 @@ class Bridge:
         reconnect_delay = 1
 
         while self.running:
-            url = ws_url()
+            url = ws_url(self.ctx.api_url)
             logger.info("Connecting to %s", url)
 
             # Get fresh JWT before each connection attempt

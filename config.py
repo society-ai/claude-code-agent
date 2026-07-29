@@ -11,7 +11,7 @@ import os
 import re
 import sys
 
-__version__ = "0.12.0"
+__version__ = "0.13.0"
 
 # -- Required / core ---------------------------------------------------------
 
@@ -55,9 +55,14 @@ STATUS_VERBOSITY: str = os.getenv("STATUS_VERBOSITY", "normal").strip().lower()
 # Code sessions (one per work item, tmux + channel) instead of spawning
 # `claude -p` per message. This bills to the interactive pool (not the SDK
 # credit pool, June 15 2026), gives native multi-turn continuity, and is the
-# foundation for the supervisor architecture. Opt-in while it matures; the
-# spawn path remains the fallback. Requires standard (non-sandbox) mode.
-SESSION_MODE: bool = os.getenv("SESSION_MODE", "false").strip().lower() in (
+# foundation for the supervisor architecture. Default ON (matching the status
+# panel's machine defaults) — session mode is what makes transcripts mirror
+# to the platform; the spawn path never mirrors, so a fresh install that
+# silently fell back to spawn would run invisible sessions. If session-mode
+# startup fails (missing tmux/channel deps) the bridge still falls back to
+# the spawn path at runtime. SESSION_MODE=false opts out explicitly.
+# Requires standard (non-sandbox) mode.
+SESSION_MODE: bool = os.getenv("SESSION_MODE", "true").strip().lower() in (
     "1", "true", "yes", "on",
 )
 
@@ -181,9 +186,11 @@ API_HEADERS = {
 }
 
 
-def ws_url() -> str:
-    """Derive WebSocket URL from API URL."""
-    url = AGENT_ROUTER_API_URL
+def ws_url(api_url: str = "") -> str:
+    """Derive WebSocket URL from an API URL (default: the process-wide
+    AGENT_ROUTER_API_URL). Harness callers pass each agent's own api_url so
+    every agent connects to the backend its token was minted for."""
+    url = (api_url or AGENT_ROUTER_API_URL).rstrip("/")
     if url.startswith("https://"):
         return "wss://" + url[len("https://"):] + "/ws/agents"
     return "ws://" + url[len("http://"):] + "/ws/agents"
