@@ -38,6 +38,12 @@ logger = logging.getLogger("session_manager")
 REPO_DIR = pathlib.Path(__file__).resolve().parent
 CHANNEL_SERVER = str(REPO_DIR / "channel" / "server.mjs")
 
+# How long to hold out for the channel banner before accepting a bare input
+# prompt as "ready". Channel load takes ~1-3s on a warm machine; this leaves
+# room for a slow MCP handshake without stalling a session whose channel is
+# genuinely absent.
+PROMPT_FALLBACK_S = 12.0
+
 # Tools an autonomous agent session needs without per-call prompts. We use a
 # broad pre-seeded allow-list rather than the bypassPermissions flag (which
 # carries a one-time interactive "accept" prompt). The machine owner scopes
@@ -318,7 +324,8 @@ class SessionManager:
         dev-channel confirm, and MCP-server consent. Returns True once the
         session shows its ready prompt, False on timeout/exit.
         """
-        deadline = time.time() + timeout_s
+        started = time.time()
+        deadline = started + timeout_s
         last_sig = ""
         stable_ready = 0
         while time.time() < deadline:
@@ -345,11 +352,18 @@ class SessionManager:
                 await asyncio.sleep(1.0)
                 continue
 
-            # Ready heuristic: the channel registration notice or the input
-            # prompt with no pending menu. Require two consecutive stable reads.
-            ready_now = (
-                "messages from server:society-ai-channel" in low
-                or ("❯" in pane and "enter to confirm" not in low)
+            # Ready heuristic. The channel banner is the only signal that
+            # says anything about the channel actually being loaded, so it
+            # is the one we want. The bare input prompt is NOT equivalent:
+            # the TUI draws it while MCP servers are still connecting, and
+            # treating it as ready is how a dispatch ends up pushed into a
+            # session that cannot receive it yet. Keep it only as a late
+            # fallback so a session whose channel never loads still starts
+            # (the bridge's delivery ack is what makes that safe).
+            banner = "messages from server:society-ai-channel" in low
+            prompt_only = "❯" in pane and "enter to confirm" not in low
+            ready_now = banner or (
+                prompt_only and time.time() - started > PROMPT_FALLBACK_S
             )
             sig = pane[-200:]
             if ready_now and sig == last_sig:

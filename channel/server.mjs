@@ -21,7 +21,16 @@
 //
 //   server -> hub (from the session's reply tool):
 //     {"type":"reply","session_key":"...","event_id":"...","text":"..."}
-//     {"type":"register","session_key":"..."}        (on connect)
+//     {"type":"register","session_key":"..."}        (after the MCP handshake)
+//
+// REGISTRATION TIMING IS LOAD-BEARING. The hub takes `register` as its cue
+// that the session can receive channel notifications, so we must not send it
+// until the client is actually listening. Registering when the process boots
+// (which is what we used to do) opens a ~1.5s window where the bridge pushes
+// an event, the notification hits stdio with no handler on the other side,
+// and the message is discarded with no error anywhere. We therefore register
+// from `oninitialized` plus a short settle delay; the bridge's delivery-ack
+// retry covers whatever residue is left.
 //
 // If the hub socket is absent or unset, the server still loads as a valid
 // (inert) channel so the session starts cleanly — it just never receives or
@@ -38,12 +47,28 @@ import {
 const SOCK = process.env.SOCIETY_AI_CHANNEL_SOCK || ''
 const SESSION_KEY = process.env.SOCIETY_AI_SESSION_KEY || ''
 const RECONNECT_MS = 2000
+// The client wires up its channel-notification handler shortly *after* it
+// sends `notifications/initialized` (observed at 110-250ms). Waiting this out
+// before we register keeps the bridge from pushing into that gap.
+const SETTLE_MS = Number(process.env.SOCIETY_AI_CHANNEL_SETTLE_MS || 750)
+
+// Diagnostics go to stderr, which Claude Code captures per session under
+// ~/Library/Caches/claude-cli-nodejs/<project>/mcp-logs-society-ai-channel/.
+// A silently dropped notification is the one failure this server can have,
+// so it must never be swallowed.
+function log(...args) {
+  try {
+    process.stderr.write(`[society-ai-channel] ${args.join(' ')}\n`)
+  } catch {
+    /* stderr gone; nothing useful left to do */
+  }
+}
 
 // Named distinctly from the `society-ai` tool MCP server (mcp_server.py),
 // which is registered separately at user scope. No collision: the tools are
 // mcp__society-ai__* (platform actions) vs mcp__society-ai-channel__reply.
 const mcp = new Server(
-  { name: 'society-ai-channel', version: '0.7.0' },
+  { name: 'society-ai-channel', version: '0.8.0' },
   {
     capabilities: {
       experimental: { 'claude/channel': {} },
@@ -114,12 +139,17 @@ async function onHubLine(line) {
     const meta = { event_id: '', ...(msg.meta || {}) }
     // Only identifier-safe meta keys survive as channel tag attributes;
     // the bridge is responsible for sending clean keys.
-    await mcp
-      .notification({
+    try {
+      await mcp.notification({
         method: 'notifications/claude/channel',
         params: { content: msg.content, meta },
       })
-      .catch(() => {})
+    } catch (err) {
+      // The bridge cannot see this, so say it where the session's MCP log
+      // will keep it. Delivery is confirmed bridge-side by watching the
+      // transcript, and a failure here means that check will retry.
+      log(`notification failed for event_id=${meta.event_id}:`, err?.message || err)
+    }
   }
 }
 
@@ -161,5 +191,23 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   throw new Error(`unknown tool: ${req.params.name}`)
 })
 
+// Register with the hub only once the client has completed the MCP handshake
+// and had a moment to attach its channel handler. Registering earlier tells
+// the bridge we can receive events while we still cannot, and the event it
+// pushes in that window is lost silently. See the header note.
+let hubStarted = false
+function startHub(why) {
+  if (hubStarted) return
+  hubStarted = true
+  log(`registering with hub (${why})`)
+  connectHub()
+}
+
+mcp.oninitialized = () => setTimeout(() => startHub('client initialized'), SETTLE_MS)
+
+// Safety net: a client that never sends notifications/initialized would
+// otherwise leave this session permanently undeliverable. Fall back to the
+// old boot-time behaviour rather than hanging, and say so in the log.
+setTimeout(() => startHub('handshake timeout; registering unconfirmed'), 15000)
+
 await mcp.connect(new StdioServerTransport())
-connectHub()

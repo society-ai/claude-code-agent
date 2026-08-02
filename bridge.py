@@ -31,6 +31,7 @@ import ssl
 import subprocess
 import sys
 import threading
+import time
 import uuid
 
 import certifi
@@ -80,6 +81,18 @@ TOOL_CONCURRENCY_RETRIES = 5  # retries when Claude API returns 400 for tool con
 TOOL_CONCURRENCY_BASE_DELAY = 3  # seconds between retries
 JWT_EXCHANGE_TIMEOUT = 15
 HTTP_FETCH_TIMEOUT = 30
+# How much of a session transcript to scan when confirming channel delivery.
+# The event we are looking for was pushed seconds ago, so it is always in the
+# tail; a resumed session's full transcript can be megabytes.
+_ACK_TAIL_BYTES = 256 * 1024
+# Registration rejections that retrying can never clear. Anything else (a
+# stale connection during a restart, a registry lookup that failed closed) is
+# transient and worth backing off into. Matched case-insensitively on the
+# hub's error string.
+TERMINAL_REGISTRATION_ERRORS = (
+    "owned by another user",
+    "routing id mismatch",
+)
 
 # UUID pattern for input validation
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
@@ -605,6 +618,9 @@ class Bridge:
         self.ctx = ctx or AgentContext.from_env()
         self.ws = None
         self.registered = False
+        # Whether the current (or most recent) connection ever got past
+        # registration. Drives the reconnect backoff reset; see run().
+        self._conn_registered = False
         self.running = True
         self._active_tasks: set[str] = set()
         # Self-update (agent.update RPC). _inflight_dispatches counts
@@ -845,16 +861,40 @@ class Bridge:
             if isinstance(result, dict) and "registered" in result:
                 if result["registered"]:
                     self.registered = True
+                    # Registration, not the socket handshake, is what makes
+                    # this connection usable. The reconnect backoff resets
+                    # here so that a hub which accepts the socket and then
+                    # rejects us cannot hold the delay at its floor forever.
+                    self._conn_registered = True
                     logger.info("Registered as %s", result.get("agent_id", self.ctx.name))
                 else:
-                    # Reject (commonly "already connected" during a restart or
-                    # harness cutover, while the hub still holds this agent's
-                    # prior connection): drop and let the reconnect loop retry.
+                    reason = str(result.get("error") or "")
+                    if any(t in reason.lower() for t in TERMINAL_REGISTRATION_ERRORS):
+                        # Nothing about this clears on its own. Retrying is a
+                        # hot loop against the hub that can never succeed, so
+                        # stop and leave the reason where the owner sees it.
+                        logger.error(
+                            "Registration refused permanently (%s). This will not "
+                            "resolve by retrying; the agent's owner or routing id "
+                            "has to be corrected on the platform. Stopping.",
+                            reason,
+                        )
+                        self.running = False
+                        try:
+                            if self.ws:
+                                await self.ws.close(code=1000, reason="registration refused")
+                        except Exception:
+                            pass
+                        return
+                    # Transient reject (commonly "already connected" during a
+                    # restart or harness cutover, while the hub still holds
+                    # this agent's prior connection): drop and let the
+                    # reconnect loop retry, now with real backoff behind it.
                     # The stale connection clears on the hub's heartbeat
                     # timeout, after which re-registration succeeds.
                     logger.error(
                         "Registration failed (%s) — reconnecting to retry",
-                        result.get("error"),
+                        reason,
                     )
                     await asyncio.sleep(5)
                     try:
@@ -1844,6 +1884,93 @@ class Bridge:
         if isinstance(fut, asyncio.Future) and not fut.done():
             fut.set_result(text)
 
+    async def _deliver_to_session(
+        self,
+        channel_key: str,
+        session_id: str,
+        cwd: str,
+        content: str,
+        meta: dict,
+        *,
+        attempts: int = 3,
+        ack_timeout_s: float = 15.0,
+    ) -> bool:
+        """Push a channel event and confirm the session actually took it.
+
+        A push that lands before the client has attached its channel handler
+        is discarded silently: the write to the hub socket succeeds, the
+        notification reaches the session's stdio, and nothing happens. The
+        only trustworthy acknowledgement is the session's own transcript,
+        where Claude Code records the injected event (a queue-operation
+        entry, then the user turn) tagged with our event_id.
+
+        Delivery is therefore at-least-once: push, watch the transcript, and
+        re-push if the event never shows up. A retry can in principle double
+        up if the first push lands in the moment between the last check and
+        the re-push; we re-check immediately before each retry to keep that
+        window as small as it can be. Returns True once acknowledged.
+        """
+        from transcript_shipper import transcript_path
+
+        hub = self._channel_hub
+        event_id = str(meta.get("event_id") or "")
+        # The transcript stores the channel tag inside a JSON string, so the
+        # attribute quotes arrive escaped. Match both forms rather than
+        # depending on how the entry happens to be serialized.
+        needles = (
+            [f'event_id="{event_id}"', f'event_id=\\"{event_id}\\"']
+            if event_id
+            else []
+        )
+        path = transcript_path(cwd, session_id)
+
+        def acked() -> bool:
+            # No event_id means nothing to correlate on; treat the push as
+            # fire-and-forget rather than retrying blind.
+            if not needles:
+                return True
+            # Only the tail can hold an event we pushed seconds ago, and a
+            # resumed session's transcript can be megabytes. Read the last
+            # chunk rather than the whole file, once per second.
+            try:
+                with open(path, "rb") as fh:
+                    fh.seek(0, os.SEEK_END)
+                    fh.seek(max(0, fh.tell() - _ACK_TAIL_BYTES), os.SEEK_SET)
+                    tail = fh.read()
+            except FileNotFoundError:
+                return False
+            except OSError as e:
+                logger.warning("Could not read transcript %s: %s", path, e)
+                return False
+            text = tail.decode("utf-8", "replace")
+            return any(n in text for n in needles)
+
+        for attempt in range(1, attempts + 1):
+            if attempt > 1 and acked():
+                return True
+            pushed = await hub.push_event(channel_key, content, meta)
+            if not pushed:
+                logger.warning(
+                    "Channel push %d/%d for %s returned not-connected",
+                    attempt, attempts, channel_key,
+                )
+            deadline = time.time() + ack_timeout_s
+            while time.time() < deadline:
+                await asyncio.sleep(1.0)
+                if acked():
+                    if attempt > 1:
+                        logger.info(
+                            "Channel event %s acknowledged on attempt %d",
+                            event_id, attempt,
+                        )
+                    return True
+            logger.warning(
+                "Channel event %s not acknowledged by %s within %.0fs "
+                "(attempt %d/%d)",
+                event_id, channel_key, ack_timeout_s, attempt, attempts,
+            )
+        return False
+
     async def _execute_via_session(
         self,
         task_id: str,
@@ -1921,8 +2048,30 @@ class Bridge:
         fut: asyncio.Future = loop.create_future()
         self._pending_session_tasks[event_id := task_id] = fut
         try:
-            await hub.push_event(channel_key, content, {"event_id": task_id, "kind": kind})
+            # Two distinct failures, two distinct timeouts. Delivery either
+            # lands in seconds or it never will, and reporting it as "the
+            # agent did not reply" points the reader at the model when the
+            # message never reached it.
+            delivered = await self._deliver_to_session(
+                channel_key,
+                rec.session_id,
+                mgr.policy(self.ctx.name).work_dir,
+                content,
+                {"event_id": task_id, "kind": kind},
+            )
             mgr.touch(channel_key)
+            if not delivered:
+                logger.error(
+                    "Delivery failed for task %s into session %s (%s)",
+                    task_id, rec.session_id[:8], channel_key,
+                )
+                await self._send_task_complete(
+                    task_id,
+                    "The session started but never picked up the message. "
+                    "Nothing was lost on your side; sending it again should work.",
+                    exit_code=1,
+                )
+                return
             try:
                 text = await asyncio.wait_for(fut, timeout=timeout_s)
             except asyncio.TimeoutError:
@@ -2012,7 +2161,12 @@ class Bridge:
                 async with websockets.connect(url, ping_interval=None, ssl=ssl_ctx) as ws:
                     self.ws = ws
                     self.registered = False
-                    reconnect_delay = 1  # reset on successful connect
+                    # NOT reset here. A socket that connects and is then
+                    # refused registration would otherwise pin the delay at
+                    # 1s and retry forever at a fixed interval, which is
+                    # exactly what MAX_RECONNECT_DELAY exists to prevent.
+                    # handle_message sets this once the hub accepts us.
+                    self._conn_registered = False
 
                     # Start heartbeat
                     heartbeat = asyncio.create_task(self.heartbeat_loop())
@@ -2040,6 +2194,11 @@ class Bridge:
                 logger.error("WS handshake failed: %s", e)
             except Exception as e:
                 logger.error("Connection error: %s", e)
+
+            # A connection that got as far as registering was a real one, so
+            # the next failure starts its backoff from scratch.
+            if self._conn_registered:
+                reconnect_delay = 1
 
             if self.running:
                 logger.info("Reconnecting in %ds...", reconnect_delay)
