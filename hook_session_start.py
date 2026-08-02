@@ -32,6 +32,7 @@ and the session starts normally.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from typing import Any
 
@@ -43,6 +44,19 @@ from hook_common import (
 
 HTTP_TIMEOUT_S = 3
 MAX_LISTED = 10
+
+
+def _is_dispatched_session() -> bool:
+    """True in a session the bridge launched to service a platform dispatch.
+
+    Set explicitly by SessionManager rather than inferred from the presence
+    of AGENT_NAME or a bridge socket: the machine owner's own terminal
+    sessions inherit those too, and guessing wrong here either strips the
+    banner from a session that needs it or leaks it into the web app.
+    """
+    return os.getenv("SOCIETY_AI_DISPATCHED", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
 
 
 def _truncate(s: str, n: int) -> str:
@@ -306,18 +320,25 @@ def main() -> int:
     # Some surfaces (the desktop app) don't render the systemMessage banner,
     # so the model is the only way the user learns the binding. A blockquote
     # reads as a banner rather than as the agent talking; first reply only.
-    quote = "\n".join(
-        _banner(acting_name, acting_display, acting_url,
-                acting_tasks, acting_inbox, others, md=True)
-    )
-    context_lines.append(
-        "  Begin your FIRST reply of this session with exactly this "
-        "blockquote, verbatim, then a blank line, then your normal answer:\n"
-        + quote
-        + "\n  Do not repeat it in later replies unless the binding changes "
-        "(after a successful switch_agent, show the bound version of the "
-        "blockquote once with the identities updated)."
-    )
+    #
+    # Never in a dispatched session. There the first reply IS the response
+    # the platform sends back, so the banner would ride along into the web
+    # app, where it is noise: it names machine-local agents and offers to
+    # "switch" between them, neither of which means anything to a web reader
+    # who already knows which agent they opened.
+    if not _is_dispatched_session():
+        quote = "\n".join(
+            _banner(acting_name, acting_display, acting_url,
+                    acting_tasks, acting_inbox, others, md=True)
+        )
+        context_lines.append(
+            "  Begin your FIRST reply of this session with exactly this "
+            "blockquote, verbatim, then a blank line, then your normal answer:\n"
+            + quote
+            + "\n  Do not repeat it in later replies unless the binding changes "
+            "(after a successful switch_agent, show the bound version of the "
+            "blockquote once with the identities updated)."
+        )
 
     banner_lines = _banner(
         acting_name, acting_display, acting_url,

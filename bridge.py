@@ -60,7 +60,7 @@ from config import (
     ws_url,
 )
 from streaming import StreamMapper
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Optional
 
 logging.basicConfig(
     level=logging.INFO,
@@ -671,7 +671,7 @@ class Bridge:
             from policy import default_policy, apply_local_env
             # Channel hub socket lives beside this agent's IPC socket.
             hub_sock = os.path.join(self.ctx.state_dir, "channels.sock")
-            self._channel_hub = ChannelHub(hub_sock, self._on_channel_reply)
+            self._channel_hub = ChannelHub(hub_sock)
             self._session_mgr = SessionManager(hub_sock)
             # Register this agent's policy (defaults + local env override now;
             # platform-fetched config is overlaid in run() once connected).
@@ -681,8 +681,11 @@ class Bridge:
             apply_local_env(pol, self.ctx.name)
             pol.session_env = self.ctx.session_env()
             self._session_mgr.set_policy(pol)
-            # event_id -> A2A task_id awaiting the session's reply.
+            # event_id -> future awaiting the session's response.
             self._pending_session_tasks: dict[str, str] = {}
+            # claude session_id -> {task_id, cwd} for a dispatch whose turn
+            # has not ended yet. The Stop hook is what closes these out.
+            self._session_awaiting: dict[str, dict] = {}
             logger.info("SESSION_MODE enabled: work runs in persistent sessions")
 
             # Transcript mirroring (recorded workspace). Ships per-turn JSONL
@@ -1820,12 +1823,19 @@ class Bridge:
         ignores everything else (the owner's personal sessions are never
         mirrored)."""
         session_id = str(params.get("session_id") or "")
-        if not session_id or self._shipper is None:
+        if not session_id:
             return {"shipped": False}
-        if not self._shipper.is_registered(session_id):
-            return {"shipped": False}
-        ok = await self._shipper.ship(session_id)
-        return {"shipped": ok}
+
+        ok = False
+        if self._shipper is not None and self._shipper.is_registered(session_id):
+            ok = await self._shipper.ship(session_id)
+
+        # The Stop hook is also how a dispatch learns its turn is over. Ship
+        # first so the platform has the transcript before the task completes,
+        # then hand the turn's text back to whoever is waiting on it. This
+        # runs even when mirroring is off, since it is the response path.
+        closed = await self._close_turn_from_transcript(session_id)
+        return {"shipped": ok, "turn_closed": closed}
 
     async def ipc_status(self, params: dict) -> dict:
         """Live in-process state for the local status panel (localhost only,
@@ -1876,13 +1886,113 @@ class Bridge:
             logger.warning("reap of %s failed: %s", key, e)
             return {"error": True, "message": str(e)}
 
-    async def _on_channel_reply(self, session_key: str, event_id: str, text: str) -> None:
-        """Called by the ChannelHub when a session replies to a pushed event.
-        Resolves the pending future for that event so the dispatching call can
-        send task.complete. Centralizing completion there avoids double-sends."""
-        fut = getattr(self, "_pending_session_tasks", {}).get(event_id)
-        if isinstance(fut, asyncio.Future) and not fut.done():
+    @staticmethod
+    def _turn_reply_text(cwd: str, session_id: str, event_id: str) -> Optional[str]:
+        """The prose a session wrote in response to one channel event.
+
+        This is the response, full stop. There is no reply tool: asking the
+        model to call one made delivery depend on it choosing to, which it
+        often does not for plain chat, and left the desktop and web views
+        showing different conversations. The transcript is the same record
+        both surfaces are built from, so reading it is what keeps them
+        consistent.
+
+        Bounded on both ends: everything after our channel event, stopping
+        at the next one, because a later dispatch is a different turn and
+        folding it in would attribute the wrong text to this task. Sidechain
+        (subagent) entries are skipped; only what the main session actually
+        said counts. Assistant turns arrive as one transcript entry per
+        content block, so text blocks are joined in order.
+
+        Returns None when our event is not in the transcript at all, which
+        is NOT the same as the agent saying nothing: a warm session can end
+        an earlier turn while ours is still in flight, and treating that as
+        an empty answer would complete the task against the wrong turn. ""
+        means the event is there and the agent wrote no prose.
+        """
+        from transcript_shipper import transcript_path
+
+        needles = (f'event_id="{event_id}"', f'event_id=\\"{event_id}\\"')
+        try:
+            with open(transcript_path(cwd, session_id), encoding="utf-8",
+                      errors="replace") as fh:
+                lines = fh.read().splitlines()
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            logger.warning("Could not read transcript for %s: %s", session_id[:8], e)
+            return None
+
+        start = -1
+        for i, raw in enumerate(lines):
+            if any(n in raw for n in needles):
+                start = i
+        if start < 0:
+            return None
+
+        out: list[str] = []
+        for raw in lines[start + 1:]:
+            try:
+                d = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(d, dict) or d.get("isSidechain"):
+                continue
+            msg = d.get("message")
+            kind = d.get("type")
+            if kind == "user" and isinstance(msg, dict):
+                content = msg.get("content")
+                if isinstance(content, str) and "<channel source=" in content:
+                    break  # the next dispatch; this turn is done
+                continue
+            if kind != "assistant" or not isinstance(msg, dict):
+                continue
+            for c in msg.get("content", []):
+                if isinstance(c, dict) and c.get("type") == "text":
+                    text = (c.get("text") or "").strip()
+                    # Streaming can re-emit a block; never repeat it.
+                    if text and (not out or out[-1] != text):
+                        out.append(text)
+        return "\n\n".join(out).strip()
+
+    async def _close_turn_from_transcript(self, session_id: str) -> bool:
+        """A turn ended in this session. If a dispatch is waiting on it,
+        resolve it with what the session said. Returns True if one closed."""
+        pending = self._session_awaiting.get(session_id)
+        if not pending:
+            return False
+        task_id = pending["task_id"]
+        fut = self._pending_session_tasks.get(task_id)
+        if not isinstance(fut, asyncio.Future) or fut.done():
+            return False
+
+        # The hook can beat the transcript's last flush by a hair; a couple
+        # of short retries costs nothing and avoids completing a task with
+        # an empty body that the session did in fact write.
+        text: Optional[str] = None
+        for _ in range(3):
+            text = self._turn_reply_text(pending["cwd"], session_id, task_id)
+            if text:
+                break
+            await asyncio.sleep(0.4)
+
+        if text is None:
+            # A turn ended, but not ours — our event is not in the transcript
+            # yet. Leave the watch in place for the Stop that does belong to
+            # us rather than completing the task with someone else's silence.
+            logger.info(
+                "Turn ended in session %s before task %s landed; still waiting",
+                session_id[:8], task_id,
+            )
+            return False
+
+        if not fut.done():
             fut.set_result(text)
+        logger.info(
+            "Turn closed for task %s from session %s (%d chars)",
+            task_id, session_id[:8], len(text),
+        )
+        return True
 
     async def _deliver_to_session(
         self,
@@ -2047,6 +2157,11 @@ class Bridge:
         loop = asyncio.get_event_loop()
         fut: asyncio.Future = loop.create_future()
         self._pending_session_tasks[event_id := task_id] = fut
+        # The session's Stop hook resolves this by reading the transcript;
+        # registered before delivery so a fast turn cannot end before we are
+        # listening for it.
+        work_dir = mgr.policy(self.ctx.name).work_dir
+        self._session_awaiting[rec.session_id] = {"task_id": task_id, "cwd": work_dir}
         try:
             # Two distinct failures, two distinct timeouts. Delivery either
             # lands in seconds or it never will, and reporting it as "the
@@ -2055,7 +2170,7 @@ class Bridge:
             delivered = await self._deliver_to_session(
                 channel_key,
                 rec.session_id,
-                mgr.policy(self.ctx.name).work_dir,
+                work_dir,
                 content,
                 {"event_id": task_id, "kind": kind},
             )
@@ -2075,13 +2190,29 @@ class Bridge:
             try:
                 text = await asyncio.wait_for(fut, timeout=timeout_s)
             except asyncio.TimeoutError:
-                await self._send_task_complete(
-                    task_id, "The agent did not reply within the time limit.", exit_code=1
-                )
-                return
+                # The turn never ended: still working past the limit, or the
+                # Stop hook never fired. Fall back to whatever the session
+                # has written so far rather than discarding a real answer.
+                text = self._turn_reply_text(work_dir, rec.session_id, task_id)
+                if text:
+                    logger.warning(
+                        "Task %s timed out; returning %d chars written so far",
+                        task_id, len(text),
+                    )
+                else:
+                    await self._send_task_complete(
+                        task_id, "The agent did not finish within the time limit.",
+                        exit_code=1,
+                    )
+                    return
             await self._send_task_complete(task_id, text or "(no reply)", exit_code=0)
         finally:
             self._pending_session_tasks.pop(task_id, None)
+            # Only clear the turn watch if it is still ours: a follow-up
+            # dispatch into the same session registers its own, and popping
+            # blindly would strand it with nothing listening for its turn.
+            if self._session_awaiting.get(rec.session_id, {}).get("task_id") == task_id:
+                self._session_awaiting.pop(rec.session_id, None)
             # Ship the turn's transcript delta in the background — never
             # blocks task completion, and failures only log.
             if self._shipper is not None:

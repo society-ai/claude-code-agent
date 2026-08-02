@@ -51,7 +51,6 @@ PROMPT_FALLBACK_S = 12.0
 DEFAULT_ALLOW = [
     "Bash", "Read", "Edit", "Write", "Glob", "Grep", "LS",
     "WebFetch", "WebSearch", "TodoWrite", "NotebookEdit", "Task",
-    "mcp__society-ai-channel__reply",
     "mcp__society-ai",  # the platform tool server (prefix match)
 ]
 
@@ -262,8 +261,14 @@ class SessionManager:
         # (and its society-ai MCP) act as THIS agent — essential when many
         # agents share one harness process.
         cwd = pol.work_dir
+        # Marks the session as platform-driven. Hooks use it to drop output
+        # meant for a human at this terminal: whatever the session writes is
+        # now the response the platform sends back, so local-only furniture
+        # (the identity banner) would end up in the web app.
+        session_env = dict(pol.session_env or {})
+        session_env["SOCIETY_AI_DISPATCHED"] = "1"
         env_prefix = "".join(
-            f"{k}={_shq(str(v))} " for k, v in (pol.session_env or {}).items() if v
+            f"{k}={_shq(str(v))} " for k, v in session_env.items() if v
         )
         shell_cmd = f"cd {_shq(cwd)} && {env_prefix}exec " + " ".join(_shq(c) for c in cmd)
         await self._tmux_kill(rec.tmux_name)  # idempotent

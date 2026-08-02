@@ -6,13 +6,13 @@ opens a persistent line-delimited JSON connection to this hub over a Unix
 socket and registers its session key. From then on:
 
   hub -> server:  {"type":"event","content":..,"meta":{..}}   (push into session)
-  server -> hub:  {"type":"reply","session_key":..,"event_id":..,"text":..}
-  server -> hub:  {"type":"register","session_key":..}         (on connect)
+  server -> hub:  {"type":"register","session_key":..}         (after handshake)
 
 The hub keeps a session_key -> writer map so the bridge can push an event
-into a specific session, and invokes an on_reply callback when a session
-replies. It is pure transport: it knows nothing about tasks, chats, or the
-platform — the bridge wires those in.
+into a specific session. Delivery is one-way: a session's answer comes back
+off its transcript when the turn ends, not over this socket, so there is no
+reply frame to handle. It is pure transport: it knows nothing about tasks,
+chats, or the platform — the bridge wires those in.
 
 Distinct from bridge_ipc.py (request/response JSON-RPC for MCP->bridge
 calls); this is long-lived bidirectional streaming for channels.
@@ -24,20 +24,16 @@ import asyncio
 import json
 import logging
 import os
-from typing import Awaitable, Callable, Optional
+from typing import Optional
 
 logger = logging.getLogger("channel_hub")
 
 MAX_LINE_BYTES = 8 * 1024 * 1024  # channel events can carry rich payloads
 
-# on_reply(session_key, event_id, text)
-ReplyCallback = Callable[[str, str, str], Awaitable[None]]
-
 
 class ChannelHub:
-    def __init__(self, sock_path: str, on_reply: ReplyCallback):
+    def __init__(self, sock_path: str):
         self._path = sock_path
-        self._on_reply = on_reply
         self._server: Optional[asyncio.AbstractServer] = None
         # session_key -> StreamWriter of the connected channel server
         self._conns: dict[str, asyncio.StreamWriter] = {}
@@ -147,15 +143,6 @@ class ChannelHub:
                         self._conns[key] = writer
                         registered_key = key
                         logger.info("Channel registered: session_key=%s", key)
-                elif mtype == "reply":
-                    key = msg.get("session_key") or registered_key or ""
-                    event_id = str(msg.get("event_id") or "")
-                    text = str(msg.get("text") or "")
-                    if key:
-                        try:
-                            await self._on_reply(key, event_id, text)
-                        except Exception:
-                            logger.exception("on_reply handler raised")
         except (asyncio.CancelledError, ConnectionError):
             pass
         except Exception:

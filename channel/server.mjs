@@ -19,9 +19,14 @@
 //   hub -> server (pushed into the session):
 //     {"type":"event","content":"...","meta":{...}}
 //
-//   server -> hub (from the session's reply tool):
-//     {"type":"reply","session_key":"...","event_id":"...","text":"..."}
+//   server -> hub:
 //     {"type":"register","session_key":"..."}        (after the MCP handshake)
+//
+// There is deliberately no reply tool. Responses are read off the session
+// transcript by the bridge when the turn ends, so the platform and the local
+// session show the same conversation. Making the response a tool call meant
+// it only arrived when the model chose to call it, which for plain chat it
+// frequently did not, and the two surfaces drifted apart.
 //
 // REGISTRATION TIMING IS LOAD-BEARING. The hub takes `register` as its cue
 // that the session can receive channel notifications, so we must not send it
@@ -39,10 +44,7 @@
 import net from 'node:net'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
-import {
-  ListToolsRequestSchema,
-  CallToolRequestSchema,
-} from '@modelcontextprotocol/sdk/types.js'
+import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 
 const SOCK = process.env.SOCIETY_AI_CHANNEL_SOCK || ''
 const SESSION_KEY = process.env.SOCIETY_AI_SESSION_KEY || ''
@@ -65,10 +67,10 @@ function log(...args) {
 }
 
 // Named distinctly from the `society-ai` tool MCP server (mcp_server.py),
-// which is registered separately at user scope. No collision: the tools are
-// mcp__society-ai__* (platform actions) vs mcp__society-ai-channel__reply.
+// which is registered separately at user scope. No collision: that one
+// carries the mcp__society-ai__* platform actions; this one carries none.
 const mcp = new Server(
-  { name: 'society-ai-channel', version: '0.8.0' },
+  { name: 'society-ai-channel', version: '0.9.0' },
   {
     capabilities: {
       experimental: { 'claude/channel': {} },
@@ -78,9 +80,12 @@ const mcp = new Server(
       'Messages from Society AI (your platform) arrive as ' +
       '<channel source="society-ai-channel" event_id="..." kind="...">. Each is a ' +
       'task assignment, chat message, review request, or supervisor note. ' +
-      'Act on it, then call the society-ai reply tool with the event_id from ' +
-      'the tag and a short text summarizing your response or result. Replies ' +
-      'route back to the platform and to whoever is watching.',
+      'Act on it and answer in this session as you normally would. Your ' +
+      'answer is sent back to the platform automatically when your turn ' +
+      'ends, so whoever is watching from the web app reads exactly what you ' +
+      'write here. There is no reply tool to call and nothing to send by ' +
+      'hand; just make sure the answer is in what you say, not only in the ' +
+      'tools you ran.',
   },
 )
 
@@ -153,43 +158,11 @@ async function onHubLine(line) {
   }
 }
 
-// --- reply tool: the session's voice back to the platform -------------------
-
-mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    {
-      name: 'reply',
-      description:
-        'Send a response back to Society AI for a channel event. Pass the ' +
-        'event_id from the <channel> tag you are responding to.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          event_id: {
-            type: 'string',
-            description: 'The event_id attribute from the channel tag',
-          },
-          text: { type: 'string', description: 'Your response or result summary' },
-        },
-        required: ['event_id', 'text'],
-      },
-    },
-  ],
-}))
-
-mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
-  if (req.params.name === 'reply') {
-    const { event_id, text } = req.params.arguments || {}
-    send({
-      type: 'reply',
-      session_key: SESSION_KEY,
-      event_id: String(event_id || ''),
-      text: String(text || ''),
-    })
-    return { content: [{ type: 'text', text: 'sent' }] }
-  }
-  throw new Error(`unknown tool: ${req.params.name}`)
-})
+// This server exposes no tools. It is inbound-only: events come in, and the
+// session's answer goes back via its transcript, not via a call the model has
+// to remember to make. The capability stays declared so the client's tool
+// listing succeeds.
+mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }))
 
 // Register with the hub only once the client has completed the MCP handshake
 // and had a moment to attach its channel handler. Registering earlier tells
