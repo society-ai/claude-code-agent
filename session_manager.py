@@ -287,6 +287,12 @@ class SessionManager:
         rec.has_run_once = True
         ready = await self._clear_startup_prompts(rec.tmux_name)
         rec.state = "ready" if ready else "failed"
+        if not ready:
+            # A boot that outlasted even the generous gate may still finish
+            # later; left alone it would sit as an orphan holding this
+            # session's key (and a Remote Control row). Kill it — the next
+            # dispatch relaunches with --resume and loses nothing.
+            await self._tmux_kill(rec.tmux_name)
         rec.last_active = time.time()
         logger.info("Session %s for %s (%s) state=%s resume=%s",
                     rec.session_id[:8], rec.work_item_key, rec.persona, rec.state, resume)
@@ -322,12 +328,22 @@ class SessionManager:
                     list_keys=("enabledMcpjsonServers",),
                     nested_list_keys={("permissions", "allow")})
 
-    async def _clear_startup_prompts(self, tmux_name: str, timeout_s: float = 25.0) -> bool:
+    async def _clear_startup_prompts(self, tmux_name: str, timeout_s: float = 120.0) -> bool:
         """Drive past the known first-run prompts until the input box is ready.
 
         Handles: workspace-trust, bypassPermissions accept (once per machine),
         dev-channel confirm, and MCP-server consent. Returns True once the
         session shows its ready prompt, False on timeout/exit.
+
+        The budget is sized for the CLI's WORST boot, not its usual one. A
+        healthy boot is ~3s, but the first boots after the CLI reinstalls
+        itself run tens of seconds to minutes rebuilding caches — and during
+        that window a startup prompt can be VISIBLE while the input loop is
+        not yet processing keys, so the answers this loop sends are simply
+        dropped until the process wakes up. Re-sending every pass is what
+        eventually lands one. A 25s budget failed exactly this way after the
+        2026-08-02 self-reinstall: prompt on screen, keys ignored, gate
+        expired, dispatch dead.
         """
         started = time.time()
         deadline = started + timeout_s
