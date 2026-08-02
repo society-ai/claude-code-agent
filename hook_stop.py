@@ -69,9 +69,11 @@ def _bridge_sockets() -> list[str]:
     return seen
 
 
-def _notify_mirrors(hook_input: dict[str, Any]) -> None:
+def _notify_mirrors(hook_input: dict[str, Any], event: str = "stop") -> None:
     """Fire-and-forget mirror_notify to every live bridge. Each bridge
-    decides for itself whether the session is one it owns."""
+    decides for itself whether the session is one it owns. `event` says
+    which hook fired: 'stop' (turn ended — ship and close the turn) or
+    'prompt' (the user just typed — ship soon, the turn is still open)."""
     session_id = hook_input.get("session_id")
     if not session_id:
         return
@@ -82,6 +84,7 @@ def _notify_mirrors(hook_input: dict[str, Any]) -> None:
             "session_id": str(session_id),
             "transcript_path": hook_input.get("transcript_path"),
             "cwd": hook_input.get("cwd"),
+            "event": event,
         },
     }) + "\n").encode("utf-8")
     for sock_path in _bridge_sockets():

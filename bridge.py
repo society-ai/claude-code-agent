@@ -1826,6 +1826,28 @@ class Bridge:
         if not session_id:
             return {"shipped": False}
 
+        # 'prompt' = UserPromptSubmit: the owner just typed into this session.
+        # Ship soon so the message reaches the platform (and the web app
+        # watching the chat) NOW, not at turn end — but in the background,
+        # because this hook blocks the turn from starting until it returns,
+        # and on a delay, because the prompt entry is flushed to the
+        # transcript as the turn spins up, not synchronously with the hook.
+        # Two staggered ships cover a slow flush; each is incremental and a
+        # no-op when there is nothing new. The turn is NOT closed here — it
+        # has only just begun.
+        if str(params.get("event") or "stop") == "prompt":
+            if self._shipper is not None and self._shipper.is_registered(session_id):
+                async def _ship_soon() -> None:
+                    for delay in (1.0, 3.0):
+                        await asyncio.sleep(delay)
+                        try:
+                            await self._shipper.ship(session_id)
+                        except Exception:
+                            logger.exception("prompt ship failed for %s", session_id[:8])
+                asyncio.ensure_future(_ship_soon())
+                return {"shipped": True, "deferred": True}
+            return {"shipped": False}
+
         ok = False
         if self._shipper is not None and self._shipper.is_registered(session_id):
             ok = await self._shipper.ship(session_id)

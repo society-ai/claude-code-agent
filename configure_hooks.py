@@ -27,6 +27,7 @@ SETTINGS_PATH = os.path.join(
 # also writing a migration that prunes the old filename from settings.
 SESSION_START_SCRIPT = "hook_session_start.py"
 STOP_SCRIPT = "hook_stop.py"
+PROMPT_SCRIPT = "hook_user_prompt.py"
 STATUS_LINE_SCRIPT = "hook_status_line.py"
 
 # Per-hook timeout in seconds. SessionStart hits the platform with two
@@ -119,6 +120,7 @@ def main() -> None:
     venv_py = os.path.join(repo_dir, "venv", "bin", "python")
     session_script = os.path.join(repo_dir, SESSION_START_SCRIPT)
     stop_script = os.path.join(repo_dir, STOP_SCRIPT)
+    prompt_script = os.path.join(repo_dir, PROMPT_SCRIPT)
     status_script = os.path.join(repo_dir, STATUS_LINE_SCRIPT)
 
     if not os.path.isfile(venv_py):
@@ -128,7 +130,7 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(2)
-    for script in (session_script, stop_script, status_script):
+    for script in (session_script, stop_script, prompt_script, status_script):
         if not os.path.isfile(script):
             print(
                 f"  Error: hook script missing at {script}. Reinstall claude-code-agent.",
@@ -138,6 +140,7 @@ def main() -> None:
 
     session_cmd = f"{venv_py} {session_script}"
     stop_cmd = f"{venv_py} {stop_script}"
+    prompt_cmd = f"{venv_py} {prompt_script}"
     status_cmd = f"{venv_py} {status_script}"
 
     data = _read_settings()
@@ -154,12 +157,16 @@ def main() -> None:
 
     _upsert_event(hooks, "SessionStart", session_cmd, SESSION_START_SCRIPT)
     _upsert_event(hooks, "Stop", stop_cmd, STOP_SCRIPT)
+    # UserPromptSubmit mirrors a locally-typed message immediately instead of
+    # at turn end. It blocks the turn from starting, so the hook itself only
+    # fires one short-timeout IPC and returns; the bridge ships async.
+    _upsert_event(hooks, "UserPromptSubmit", prompt_cmd, PROMPT_SCRIPT)
     _upsert_status_line(data, status_cmd)
     data["hooks"] = hooks
 
     _write_settings(data)
     print(
-        "  Registered SessionStart + Stop hooks and statusLine in "
+        "  Registered SessionStart + Stop + UserPromptSubmit hooks and statusLine in "
         "~/.claude/settings.json"
     )
 
