@@ -1851,6 +1851,23 @@ class Bridge:
         ok = False
         if self._shipper is not None and self._shipper.is_registered(session_id):
             ok = await self._shipper.ship(session_id)
+            # The Stop hook can beat the transcript's LAST flush: the final
+            # assistant text block is written by the CLI asynchronously, and
+            # a single ship taken at hook time reads everything except the
+            # answer itself — observed live (ledger ending on activity
+            # entries, response stranded on disk, web app showing a question
+            # with no reply). Nothing else ships a locally-typed turn until
+            # idle-reap 15 minutes later, so chase the flush with a couple
+            # of trailing ships. Each is incremental and a no-op when the
+            # first read already got everything.
+            async def _ship_tail() -> None:
+                for delay in (2.0, 6.0):
+                    await asyncio.sleep(delay)
+                    try:
+                        await self._shipper.ship(session_id)
+                    except Exception:
+                        logger.exception("tail ship failed for %s", session_id[:8])
+            asyncio.ensure_future(_ship_tail())
 
         # The Stop hook is also how a dispatch learns its turn is over. Ship
         # first so the platform has the transcript before the task completes,
