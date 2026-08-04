@@ -1826,6 +1826,13 @@ class Bridge:
         if not session_id:
             return {"shipped": False}
 
+        # Hook traffic IS session activity. Locally-typed turns never pass
+        # through a dispatch, and before this the idle reaper counted them
+        # as silence — it once killed a session fifteen seconds after the
+        # owner sent a message in it.
+        if self._session_mgr is not None:
+            self._session_mgr.touch_by_session_id(session_id)
+
         # 'prompt' = UserPromptSubmit: the owner just typed into this session.
         # Ship soon so the message reaches the platform (and the web app
         # watching the chat) NOW, not at turn end — but in the background,

@@ -413,6 +413,36 @@ class SessionManager:
             logger.info("Concurrency cap for %s: reaping %s", persona, r.work_item_key)
             await self.reap(r.work_item_key)
 
+    def touch_by_session_id(self, session_id: str) -> None:
+        """Refresh the idle clock for whichever work item this Claude session
+        belongs to. Called from the hook-notification path: locally-typed
+        turns never pass through a platform dispatch, and before this the
+        reaper counted them as idle time — it once killed a session fifteen
+        seconds after the owner sent a message in it."""
+        for rec in self._sessions.values():
+            if rec.session_id == session_id:
+                rec.last_active = time.time()
+                return
+
+    def _transcript_recently_active(self, rec: SessionRecord, window_s: float) -> bool:
+        """Is the session's transcript still being written to? The idle clock
+        only sees dispatches and hook notifications; a single turn longer
+        than the idle window has neither, and reaping it kills work in
+        flight. The transcript file grows for the whole turn, so its mtime
+        is the honest liveness signal of last resort."""
+        try:
+            from transcript_shipper import transcript_path
+
+            mtime = os.path.getmtime(
+                transcript_path(self.policy(rec.persona).work_dir, rec.session_id)
+            )
+        except (OSError, Exception):
+            return False
+        if time.time() - mtime < window_s:
+            rec.last_active = max(rec.last_active, mtime)
+            return True
+        return False
+
     async def _reaper_loop(self) -> None:
         while True:
             try:
@@ -424,7 +454,9 @@ class SessionManager:
                     pol = self.policy(rec.persona)
                     if pol.keep_alive:
                         continue
-                    if now - rec.last_active > pol.idle_reap_minutes * 60:
+                    if now - rec.last_active > pol.idle_reap_minutes * 60 and \
+                            not self._transcript_recently_active(
+                                rec, pol.idle_reap_minutes * 60):
                         logger.info("Idle-reaping %s (idle %.0fm)",
                                     rec.work_item_key, (now - rec.last_active) / 60)
                         await self.reap(rec.work_item_key)
