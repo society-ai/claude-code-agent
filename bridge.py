@@ -1842,13 +1842,19 @@ class Bridge:
         # Two staggered ships cover a slow flush; each is incremental and a
         # no-op when there is nothing new. The turn is NOT closed here — it
         # has only just begun.
+        # Every hook-triggered ship declares status='active'. A reaped session
+        # flips its mirror to 'ended', and nothing used to flip it back when
+        # the owner resumed the session from the desktop — the platform (and
+        # the web app's poll pacing) permanently believed the conversation
+        # was over. Hook traffic is proof of life; say so. Idempotent when
+        # the row is already active, and reap still lands 'ended' afterwards.
         if str(params.get("event") or "stop") == "prompt":
             if self._shipper is not None and self._shipper.is_registered(session_id):
                 async def _ship_soon() -> None:
                     for delay in (1.0, 3.0):
                         await asyncio.sleep(delay)
                         try:
-                            await self._shipper.ship(session_id)
+                            await self._shipper.ship(session_id, status="active")
                         except Exception:
                             logger.exception("prompt ship failed for %s", session_id[:8])
                 asyncio.ensure_future(_ship_soon())
@@ -1857,7 +1863,7 @@ class Bridge:
 
         ok = False
         if self._shipper is not None and self._shipper.is_registered(session_id):
-            ok = await self._shipper.ship(session_id)
+            ok = await self._shipper.ship(session_id, status="active")
             # The Stop hook can beat the transcript's LAST flush: the final
             # assistant text block is written by the CLI asynchronously, and
             # a single ship taken at hook time reads everything except the
@@ -1871,7 +1877,7 @@ class Bridge:
                 for delay in (2.0, 6.0):
                     await asyncio.sleep(delay)
                     try:
-                        await self._shipper.ship(session_id)
+                        await self._shipper.ship(session_id, status="active")
                     except Exception:
                         logger.exception("tail ship failed for %s", session_id[:8])
             asyncio.ensure_future(_ship_tail())
