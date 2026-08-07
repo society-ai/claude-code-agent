@@ -11,7 +11,7 @@ import os
 import re
 import sys
 
-__version__ = "0.14.5"
+__version__ = "0.15.0"
 
 # -- Required / core ---------------------------------------------------------
 

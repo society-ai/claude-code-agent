@@ -81,6 +81,12 @@ TOOL_CONCURRENCY_RETRIES = 5  # retries when Claude API returns 400 for tool con
 TOOL_CONCURRENCY_BASE_DELAY = 3  # seconds between retries
 JWT_EXCHANGE_TIMEOUT = 15
 HTTP_FETCH_TIMEOUT = 30
+# Composed-dispatch block kinds that are session-scoped standing context:
+# they hold across turns, so a warm session already carries them in its
+# transcript and re-sending them every dispatch is pure token waste.
+# Everything else (notably 'process') is per-event and always rendered.
+# Unknown kinds render every time — a new kind must never go silently missing.
+STANDING_BLOCK_KINDS = frozenset({"identity", "scope", "activity"})
 # How much of a session transcript to scan when confirming channel delivery.
 # The event we are looking for was pushed seconds ago, so it is always in the
 # tail; a resumed session's full transcript can be megabytes.
@@ -1149,6 +1155,7 @@ class Bridge:
                             or task_id
                         )
                         protocol_text = ""
+                        standing_text = ""
                         if frame is not None:
                             # v0.10: everything derives from frame FIELDS —
                             # no text sniffing. Session kind comes from the
@@ -1171,7 +1178,9 @@ class Bridge:
                                 kind = "chat"
                             else:
                                 kind = "trigger"
-                            content = self._render_composed_prompt(metadata, frame, work_text)
+                            standing_text, content = self._render_composed_prompt(
+                                metadata, frame, work_text
+                            )
                             protocol_text = self._protocol_text(metadata)
                             title = self._derive_session_title(work_text)
                         else:
@@ -1198,7 +1207,7 @@ class Bridge:
                                 kind = "chat"
                         await self._execute_via_session(
                             task_id, str(work_item_key), title, content, kind=kind,
-                            protocol_text=protocol_text,
+                            protocol_text=protocol_text, standing_text=standing_text,
                         )
                     elif agent_task_id and company_id:
                         # AgentOrg trigger flow — full context + Claude Code spawn
@@ -1420,16 +1429,25 @@ class Bridge:
         return ""
 
     @staticmethod
-    def _render_composed_prompt(metadata: dict, frame: dict, work_text: str) -> str:
+    def _render_composed_prompt(
+        metadata: dict, frame: dict, work_text: str
+    ) -> tuple[str, str]:
         """Render a composed dispatch into the session prompt, per the
         assembly contract of the instruction-hierarchy spec:
 
             blocks (labeled sections) -> frame line -> body -> [Next steps]
 
+        Returns (standing_text, event_text). Standing blocks (identity,
+        scope, activity) hold across turns, so _execute_via_session renders
+        them only on a fresh launch, exactly like the protocol; a resumed
+        session already carries them in its transcript. The event text is
+        rendered on every dispatch.
+
         The protocol is NOT included here — it is prepended only on fresh
         launches (see _execute_via_session). Every field is shape-checked;
         a malformed section is dropped, never fatal.
         """
+        standing: list[str] = []
         parts: list[str] = []
         for block in metadata.get("blocks") or []:
             if not isinstance(block, dict):
@@ -1439,9 +1457,13 @@ class Bridge:
                 continue
             label = block.get("label")
             if isinstance(label, str) and label.strip():
-                parts.append(f"[{label.strip()}]\n{text.strip()}")
+                section = f"[{label.strip()}]\n{text.strip()}"
             else:
-                parts.append(text.strip())
+                section = text.strip()
+            if block.get("kind") in STANDING_BLOCK_KINDS:
+                standing.append(section)
+            else:
+                parts.append(section)
         rendered_frame = frame.get("rendered")
         if isinstance(rendered_frame, str) and rendered_frame.strip():
             parts.append(rendered_frame.strip())
@@ -1450,7 +1472,7 @@ class Bridge:
         next_steps = metadata.get("next_steps")
         if isinstance(next_steps, str) and next_steps.strip():
             parts.append("[Next steps]\n" + next_steps.strip())
-        return "\n\n".join(parts)
+        return "\n\n".join(standing), "\n\n".join(parts)
 
     @staticmethod
     def _format_instructions_block(
@@ -2142,6 +2164,7 @@ class Bridge:
         kind: str,
         timeout_s: float = 600.0,
         protocol_text: str = "",
+        standing_text: str = "",
     ) -> None:
         """Dispatch a work item into a persistent session and wait for its
         reply, then complete the A2A task. The event_id we send IS the A2A
@@ -2163,11 +2186,16 @@ class Bridge:
             )
             return
 
-        # L1 platform protocol: session-scoped standing text. A fresh
-        # launch has no context — lead with the protocol; resumes and warm
-        # sessions already carry it in their transcript.
-        if protocol_text and getattr(rec, "fresh_launch", False):
-            content = protocol_text + "\n\n" + content
+        # Session-scoped standing context: the L1 platform protocol and the
+        # standing blocks (identity, scope, activity). A fresh launch has no
+        # context — lead with them; resumes and warm sessions already carry
+        # them in their transcript, so re-sending is pure token waste.
+        # Instruction edits therefore land on the next new session, not
+        # mid-conversation, which is the intended behaviour.
+        if getattr(rec, "fresh_launch", False):
+            preamble = "\n\n".join(p for p in (protocol_text, standing_text) if p)
+            if preamble:
+                content = preamble + "\n\n" + content
 
         # Register the session for transcript mirroring, linked to the work
         # item that caused it. 'task' = a real platform task (agent_task_id);
