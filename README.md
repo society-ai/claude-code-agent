@@ -30,6 +30,15 @@ Grab your API key and agent name from [societyai.com](https://societyai.com), th
 curl -fsSL https://raw.githubusercontent.com/society-ai/claude-code-agent/main/install.sh | bash -s -- --token <TOKEN> --name <AGENT_NAME> --yes
 ```
 
+Run it from any folder. A machine with no agent yet gets one installed into
+`claude-code-agent` inside the folder you are standing in; from then on the
+same command finds that checkout wherever you run it (it reads the bridge
+LaunchAgent, or `~/.cache/society-ai/install-dir`) and updates it in place.
+So rotating a token or adding a persona later needs no `cd`, and never
+produces a second copy. The one case it refuses is a machine with two
+unrelated checkouts and nothing to tell them apart: it lists them and asks
+you to run the command from inside the one you meant.
+
 Safe to re-run: an existing checkout is updated in place, then setup
 continues with its own re-run guards. Manual alternative:
 

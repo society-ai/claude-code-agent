@@ -184,7 +184,8 @@ if [ -z "$PERSONA" ] && [ -f ".env" ] && ! grep -qE '^AGENT_NAME=' .env; then
     echo "does not recognize. Nothing was changed." >&2
     echo "" >&2
     echo "To add another agent on this machine, run again with --persona <name>." >&2
-    echo "Or run the setup command from a fresh folder to start a new install." >&2
+    echo "To start over instead, move this .env aside and re-run the setup" >&2
+    echo "command from this folder." >&2
     exit 1
 fi
 
@@ -424,8 +425,9 @@ if [ -n "$PERSONA" ]; then
         echo "  - Sessions it spawns authenticate as '$PERSONA' (env expansion in"
         echo "    the shared MCP registration; interactive terminal sessions still"
         echo "    default to the primary persona)."
-        echo "  - Optional: edit $ENV_FILE to set WORK_DIR / EXTRA_DIRS for this"
-        echo "    persona's file scope, then: ./service.sh restart $PERSONA"
+        echo "  - File scope: pick the folders it may use with ./status.sh, or"
+        echo "    set WORK_DIR / EXTRA_DIRS by hand in $ENV_FILE and then run"
+        echo "    ./service.sh restart $PERSONA"
     }
 
     if [ "$ASSUME_YES" = 1 ] && [ "$(uname)" = "Darwin" ]; then
@@ -455,6 +457,14 @@ if [ -n "$PERSONA" ]; then
             echo "  '$PERSONA' as connected in a few seconds."
             echo ""
             print_persona_summary
+            echo ""
+            echo "  One more thing: for now '$PERSONA' can only see its own"
+            echo "  folder. To let it work on your projects, run"
+            echo ""
+            echo "      cd $REPO_DIR && ./status.sh"
+            echo ""
+            echo "  and pick the folders it may use. Only add folders you are"
+            echo "  happy for it to read and change."
             echo ""
             echo "  Logs live in:        $BRIDGE_OUT_LOG"
             echo "  To stop this agent:  ./service.sh stop $PERSONA   (run from this folder)"
@@ -842,6 +852,14 @@ if [ "$ASSUME_YES" = 1 ]; then
             echo ""
             echo "  Go back to your browser: the Agent Factory page will show"
             echo "  your agent as connected in a few seconds."
+            echo ""
+            echo "  One more thing: for now the agent can only see its own"
+            echo "  folder. To let it work on your projects, run"
+            echo ""
+            echo "      cd $REPO_DIR && ./status.sh"
+            echo ""
+            echo "  and pick the folders it may use. Only add folders you are"
+            echo "  happy for it to read and change."
             echo ""
             echo "  Logs live in:        ~/.cache/society-ai/bridge.log"
             echo "  To stop the agent:   ./service.sh stop   (run from this folder)"
