@@ -27,6 +27,7 @@ import logging
 import os
 import re
 import signal
+import socket
 import ssl
 import subprocess
 import sys
@@ -616,6 +617,12 @@ class AgentContext:
 
 
 class Bridge:
+    # How often, while waiting on a turn, to check whether Claude Code wrote
+    # an error into the transcript instead of an answer. Small enough that a
+    # dead turn is reported in seconds rather than at the task timeout, large
+    # enough to be free next to the file read it costs.
+    API_ERROR_POLL_S = 3.0
+
     def __init__(self, ctx: "AgentContext | None" = None, scheduler: "asyncio.Semaphore | None" = None):
         # ctx carries this runner's agent identity + local file access.
         # Default to the process env so single-agent / existing callers work
@@ -2029,6 +2036,97 @@ class Bridge:
                         out.append(text)
         return "\n\n".join(out).strip()
 
+    @staticmethod
+    def _turn_api_error(cwd: str, session_id: str, event_id: str) -> Optional[str]:
+        """The error Claude Code itself reported for this turn, if any.
+
+        Claude Code writes its own failures into the transcript as an
+        assistant entry flagged isApiErrorMessage — an expired login, a
+        rate limit, a refused key. No Stop hook follows one, so a turn that
+        ends this way is indistinguishable from a slow one: the dispatch sat
+        until the full task timeout and the person in chat saw silence.
+        Scanning for the flag turns that into an immediate, explainable
+        failure.
+
+        Same bounded window as _turn_reply_text: after our channel event,
+        stopping at the next one, main session only.
+        """
+        from transcript_shipper import transcript_path
+
+        needles = (f'event_id="{event_id}"', f'event_id=\\"{event_id}\\"')
+        try:
+            with open(transcript_path(cwd, session_id), encoding="utf-8",
+                      errors="replace") as fh:
+                lines = fh.read().splitlines()
+        except (FileNotFoundError, OSError):
+            return None
+
+        start = -1
+        for i, raw in enumerate(lines):
+            if any(n in raw for n in needles):
+                start = i
+        if start < 0:
+            return None
+
+        for raw in lines[start + 1:]:
+            try:
+                d = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(d, dict) or d.get("isSidechain"):
+                continue
+            msg = d.get("message")
+            if d.get("type") == "user" and isinstance(msg, dict):
+                content = msg.get("content")
+                if isinstance(content, str) and "<channel source=" in content:
+                    break  # the next dispatch; this turn is done
+                continue
+            if not d.get("isApiErrorMessage") or not isinstance(msg, dict):
+                continue
+            for c in msg.get("content", []):
+                if isinstance(c, dict) and c.get("type") == "text":
+                    text = (c.get("text") or "").strip()
+                    if text:
+                        return text
+        return None
+
+    @staticmethod
+    def _explain_api_error(reported: str) -> str:
+        """Turn Claude Code's own error into something the person reading
+        chat can act on.
+
+        They are usually not at the machine and have no reason to suspect
+        it: from the platform side an expired local login looks exactly like
+        a broken agent. Name the host, say what to type, and quote the
+        original so the cause is never guessed at.
+        """
+        host = socket.gethostname().split(".")[0]
+        low = reported.lower()
+        auth = any(
+            hint in low
+            for hint in ("login", "authenticate", "authentication",
+                         "oauth", "unauthorized", "api key", "credit balance")
+        )
+        if auth:
+            return (
+                f"I could not answer: the Claude Code sign-in on **{host}**, the "
+                f"computer running this agent, is no longer valid, so your message "
+                f"never reached the model.\n\n"
+                f"To fix it, on that computer open Terminal and run:\n\n"
+                f"    claude\n\n"
+                f"then type `/login` and sign in. Nothing else needs changing. "
+                f"Send your message again once you have.\n\n"
+                f"Claude Code reported: {reported}"
+            )
+        return (
+            f"I could not answer: Claude Code on **{host}**, the computer running "
+            f"this agent, reported an error before it could reply.\n\n"
+            f"Claude Code reported: {reported}\n\n"
+            f"The agent is still connected, so retrying is worthwhile. If it keeps "
+            f"happening, check the log on that computer:\n\n"
+            f"    ./service.sh logs"
+        )
+
     async def _close_turn_from_transcript(self, session_id: str) -> bool:
         """A turn ended in this session. If a dispatch is waiting on it,
         resolve it with what the session said. Returns True if one closed."""
@@ -2267,9 +2365,40 @@ class Bridge:
                     exit_code=1,
                 )
                 return
-            try:
-                text = await asyncio.wait_for(fut, timeout=timeout_s)
-            except asyncio.TimeoutError:
+            # Wait for the turn, but keep an eye on the transcript while we
+            # do. Claude Code reports its own failures (expired login, rate
+            # limit) as an entry no Stop hook follows, so waiting on the
+            # future alone burns the entire timeout and answers with silence.
+            # Shielded so a poll timeout never cancels the real future.
+            deadline = loop.time() + timeout_s
+            reported: Optional[str] = None
+            text = None
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                try:
+                    text = await asyncio.wait_for(
+                        asyncio.shield(fut),
+                        timeout=min(self.API_ERROR_POLL_S, remaining),
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    reported = self._turn_api_error(work_dir, rec.session_id, task_id)
+                    if reported:
+                        break
+
+            if reported and text is None:
+                logger.error(
+                    "Task %s: Claude Code reported an error instead of replying: %s",
+                    task_id, reported,
+                )
+                await self._send_task_complete(
+                    task_id, self._explain_api_error(reported), exit_code=1,
+                )
+                return
+
+            if text is None:
                 # The turn never ended: still working past the limit, or the
                 # Stop hook never fired. Fall back to whatever the session
                 # has written so far rather than discarding a real answer.

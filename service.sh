@@ -97,8 +97,45 @@ is_loaded() {
     # bootstrapped to gui/<uid> need `launchctl print`. Try the new way
     # first, fall back to the old way so the script works on both modern
     # and legacy macOS.
-    launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || \
-        launchctl list 2>/dev/null | grep -q "$LABEL"
+    #
+    # The fallback matches the label column EXACTLY. A substring match here
+    # reported the primary agent as loaded whenever any persona was running,
+    # because "io.societyai.claude-code-bridge" is a prefix of
+    # "io.societyai.claude-code-bridge.<persona>". That made `status` lie and
+    # made install try to bootout a service that was never there.
+    launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 && return 0
+    launchctl list 2>/dev/null \
+        | awk -v label="$LABEL" '$3 == label { found = 1 } END { exit !found }'
+}
+
+# Wait for a booted-out job to actually leave the domain. launchd tears a
+# service down asynchronously, and bootstrapping the replacement while the
+# old one is still dying fails with EBUSY/EIO.
+wait_unloaded() {
+    local i
+    for i in $(seq 1 40); do
+        is_loaded || return 0
+        sleep 0.25
+    done
+    return 1
+}
+
+# Bootstrap with retries, then the legacy fallback. Returns non-zero only
+# when the service is genuinely not running afterwards, so callers can
+# report a real failure instead of exiting silently under `set -e`.
+bootstrap_service() {
+    local i
+    for i in 1 2 3 4 5; do
+        if launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null; then
+            return 0
+        fi
+        # bootstrap can fail because the job is already up (a previous
+        # attempt won the race), which is success as far as we care.
+        is_loaded && return 0
+        sleep 0.5
+    done
+    launchctl load -w "$PLIST_PATH" 2>/dev/null || true
+    is_loaded
 }
 
 cmd_install() {
@@ -129,11 +166,18 @@ with open(sys.argv[1], "rb") as f:
     fi
 
     # If the agent is already loaded (e.g. re-running install after editing
-    # the env file), unload it first. bootstrap will fail otherwise.
+    # the env file), unload it first. bootstrap will fail otherwise. Then
+    # WAIT for it to go: bootstrapping into a domain that still holds the
+    # dying job is what used to leave a re-run with no agent running at all.
     if is_loaded; then
         echo "  Existing LaunchAgent found, unloading first..."
         launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || \
             launchctl unload "$PLIST_PATH" 2>/dev/null || true
+        if ! wait_unloaded; then
+            echo "  Warning: the previous agent service is still shutting down." >&2
+            echo "  Continuing anyway; if the new one does not come up, run" >&2
+            echo "      ./service.sh restart ${PERSONA}" >&2
+        fi
     fi
 
     # Substitute placeholders. Use Python rather than sed because $REPO_DIR
@@ -154,12 +198,20 @@ PYEOF
 
     chmod 0644 "$PLIST_PATH"
 
-    # Prefer the modern bootstrap/kickstart pair; fall back to load -w on
-    # macOS versions where bootstrap isn't available.
-    if launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null; then
+    # Prefer the modern bootstrap/kickstart pair, retrying past the teardown
+    # race; bootstrap_service falls back to load -w on macOS versions without
+    # bootstrap. A failure here is reported, never swallowed: an install that
+    # leaves no agent running is the whole bug this guards against.
+    if bootstrap_service; then
         launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>/dev/null || true
     else
-        launchctl load -w "$PLIST_PATH"
+        echo "" >&2
+        echo "Error: the agent service could not be started." >&2
+        echo "  plist:  $PLIST_PATH" >&2
+        echo "  logs:   $LOG_DIR/bridge.err.log" >&2
+        echo "" >&2
+        echo "Try once more with:  ./service.sh start ${PERSONA}" >&2
+        exit 1
     fi
 
     echo ""
@@ -253,8 +305,10 @@ cmd_start() {
         exit 1
     fi
     echo "  Connecting (loading) $LABEL..."
-    launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null || \
-        launchctl load "$PLIST_PATH" 2>/dev/null || true
+    if ! bootstrap_service; then
+        echo "  Could not start it. Logs: $LOG_DIR/bridge.err.log" >&2
+        exit 1
+    fi
     sleep 1
     cmd_status
 }
