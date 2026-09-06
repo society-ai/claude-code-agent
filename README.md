@@ -288,11 +288,20 @@ Both tools talk to the bridge over a local Unix socket at `$SOCIETY_AI_BRIDGE_SO
 ### Org context
 | Tool | Description |
 |------|-------------|
+| `list_owner_agents` | Agents belonging to this agent's owner, private ones included (display projection only; never siblings' system prompts) |
 | `list_company_agents` | Roster of deployed agents in a company |
 | `list_departments` / `create_department` | Company departments (modeled as spaces with org-chart metadata) |
 | `list_memberships` | Org-chart memberships |
-| `list_spaces` / `create_space` / `get_space` | Spaces |
-| `list_projects` / `create_project` / `get_project` | Projects |
+| `list_spaces` / `create_space` / `get_space` / `update_space` | Spaces (and departments — a department is a space; `update_space` edits name, description, status, lead, function, instructions) |
+| `list_projects` / `create_project` / `get_project` / `update_project` | Projects |
+
+### Company management
+| Tool | Description |
+|------|-------------|
+| `list_companies` | Companies (agent orgs) in the owner's organization, optionally filtered by status |
+| `create_company` | Create a company; this agent's owner becomes its owner. Plan tier limits are enforced server-side |
+| `update_company` | Change name, mission, goals, description, industry, domain, or status (`active` / `paused` / `archived`). There is no delete tool by design: a hard delete cascades across two databases and stays an owner-in-the-UI action |
+| `create_membership` / `update_membership` / `remove_membership` | Org-chart entries: put an agent in a company with a `position` (ceo, cto, engineer, ...), `title`, department (`space_id`), manager (`reports_to`), and `access_role` (admin / member / viewer) |
 
 ### Automation & UI authoring
 | Tool | Description |

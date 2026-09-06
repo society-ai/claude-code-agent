@@ -22,8 +22,14 @@ Tool surface (see README for full descriptions):
     list_kb_submissions, resolve_kb_submission   [curator writes need knowledge:curate]
 
   Phase 4 — org context:
-    list_company_agents, list_departments, create_department, list_memberships,
-    list_spaces, create_space, get_space, list_projects, create_project, get_project
+    list_owner_agents, list_company_agents, list_departments, create_department, list_memberships,
+    list_spaces, create_space, get_space, update_space,
+    list_projects, create_project, get_project, update_project
+
+  Phase 4b — company management (agent orgs):
+    list_companies, create_company, update_company,
+    create_membership, update_membership, remove_membership
+    (no delete_company by design — archive via update_company(status="archived"))
 
   Phase 5 — automation and UI authoring:
     create_schedule, list_schedules, create_workflow, list_workflows, start_workflow,
@@ -93,6 +99,13 @@ _VALID_PLATFORMS = {"cloud_run", "gce"}
 _VALID_AGENT_TYPES = {"openclaw", "zeroclaw"}
 _VALID_ACCESS_ROLES = {"admin", "member", "viewer"}
 _VALID_VISIBILITIES = {"private", "shared", "public"}
+# Company lifecycle states an agent may set. The DB also knows draft /
+# bootstrapping / deploying, but those belong to the creation flow, not to
+# an agent editing a live company.
+_VALID_COMPANY_STATUSES = {"active", "paused", "archived"}
+_VALID_MEMBERSHIP_STATUSES = {"active", "paused", "removed"}
+# Company identifier prefix: task ids become <PREFIX>-1, <PREFIX>-2, ...
+_IDENTIFIER_PREFIX_RE = re.compile(r"^[A-Z][A-Z0-9]{1,9}$")
 
 
 def _error(message: str, status: int | None = None, body: str | None = None) -> dict[str, Any]:
@@ -1504,6 +1517,78 @@ async def add_edge(
 # ==============================================================================
 
 
+def _project_owner_agent(raw: dict[str, Any], me: Optional[str]) -> dict[str, Any]:
+    """Display-safe projection of a /api/v1/factory/agents record.
+
+    An allow-list, not a deny-list: the upstream record carries each agent's
+    full system prompt (`config.instructions`) and role brief (`role_md`),
+    and a sibling agent has no business reading either. New upstream fields
+    stay hidden until someone adds them here deliberately.
+    """
+    config = raw.get("config")
+    if not isinstance(config, dict):
+        config = {}
+    name = raw.get("agent_name")
+    skills = [
+        s.get("id") for s in (config.get("skills") or [])
+        if isinstance(s, dict) and s.get("id")
+    ]
+    return {
+        "agent_name": name,
+        "display_name": config.get("display_name") or name,
+        "description": config.get("description"),
+        "role_summary": raw.get("role_summary"),
+        "agent_type": raw.get("agent_type"),
+        "visibility": raw.get("visibility"),
+        "is_deployed": raw.get("is_deployed"),
+        "is_active": raw.get("is_active"),
+        "deployment_status": raw.get("deployment_status"),
+        # Configured skills only. An empty list does NOT mean unreachable —
+        # the factory derives a default skill at card-build time that never
+        # lands in config.skills (agent_factory self_hosted.py builds "chat",
+        # the other types build "general").
+        "skills": skills,
+        "is_self": bool(name and me and name == me),
+    }
+
+
+@mcp.tool()
+async def list_owner_agents(include_inactive: bool = False) -> str:
+    """List the agents belonging to this agent's owner, private ones included.
+
+    Owner scope, which nothing else on this surface covers: `search_agents`
+    only sees agents published to the public network, and `list_company_agents`
+    needs a company_id and returns nothing for an owner with no company. This
+    is the tool that answers "what other agents does my owner have?".
+
+    Returns a display projection only — never the siblings' system prompts.
+    Each entry carries the agent's configured skill ids for `delegate_task`;
+    an empty `skills` list means the agent exposes only its factory-derived
+    default skill, not that it is unreachable.
+
+    Args:
+        include_inactive: Also return agents whose is_active is false.
+            Defaults to false (deleted/suspended agents are noise).
+    """
+    data = await api.get("/api/v1/factory/agents")
+    if isinstance(data, dict) and data.get("error"):
+        return _result(data)
+    if not isinstance(data, list):
+        return _result(_error(
+            "unexpected response from GET /api/v1/factory/agents (expected a list)",
+            body=str(data),
+        ))
+
+    me = _ident().name
+    agents = [
+        _project_owner_agent(raw, me)
+        for raw in data
+        if isinstance(raw, dict)
+        and (include_inactive or raw.get("is_active") is not False)
+    ]
+    return _result({"agents": agents, "total": len(agents)})
+
+
 @mcp.tool()
 async def list_company_agents(company_id: Optional[str] = None) -> str:
     """List all deployed agents in a company with status and model info."""
@@ -1658,6 +1743,308 @@ async def get_project(project_id: str, company_id: Optional[str] = None) -> str:
     except ValueError as e:
         return _result(_error(str(e)))
     return _result(await api.get(f"/api/v1/companies/{cid}/projects/{project_id}"))
+
+
+@mcp.tool()
+async def update_space(
+    space_id: str,
+    company_id: Optional[str] = None,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+    status: Optional[str] = None,
+    lead_agent_id: Optional[str] = None,
+    dept_function: Optional[str] = None,
+    instructions: Optional[str] = None,
+) -> str:
+    """Update a space or department. Only the fields you pass change.
+
+    A department is a space with org-chart metadata, so this is also the
+    tool for renaming a department, changing its lead, or editing the
+    standing instructions its tasks inherit.
+
+    Args:
+        space_id: Space (department) UUID.
+        company_id: Company UUID.
+        name, description, status: Basic fields.
+        lead_agent_id: Lead agent UUID.
+        dept_function: Function tag (e.g. "engineering").
+        instructions: Standing instructions for work in this space.
+    """
+    try:
+        cid = _resolve_company_id(company_id)
+        _validate_uuid(space_id, "space_id")
+        if lead_agent_id:
+            _validate_uuid(lead_agent_id, "lead_agent_id")
+    except ValueError as e:
+        return _result(_error(str(e)))
+    body: dict[str, Any] = {}
+    for key, val in (
+        ("name", name), ("description", description), ("status", status),
+        ("lead_agent_id", lead_agent_id), ("dept_function", dept_function),
+        ("instructions", instructions),
+    ):
+        if val is not None:
+            body[key] = val
+    if not body:
+        return _result(_error("nothing to update: pass at least one field"))
+    return _result(await api.patch(f"/api/v1/companies/{cid}/spaces/{space_id}", body))
+
+
+@mcp.tool()
+async def update_project(
+    project_id: str,
+    company_id: Optional[str] = None,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+    status: Optional[str] = None,
+    lead_agent_id: Optional[str] = None,
+    target_date: Optional[str] = None,
+    instructions: Optional[str] = None,
+) -> str:
+    """Update a project. Only the fields you pass change.
+
+    Args:
+        project_id: Project UUID.
+        company_id: Company UUID.
+        name, description, status: Basic fields.
+        lead_agent_id: Lead agent UUID.
+        target_date: ISO-8601 date or datetime.
+        instructions: Standing instructions for work in this project.
+    """
+    try:
+        cid = _resolve_company_id(company_id)
+        _validate_uuid(project_id, "project_id")
+        if lead_agent_id:
+            _validate_uuid(lead_agent_id, "lead_agent_id")
+    except ValueError as e:
+        return _result(_error(str(e)))
+    body: dict[str, Any] = {}
+    for key, val in (
+        ("name", name), ("description", description), ("status", status),
+        ("lead_agent_id", lead_agent_id), ("target_date", target_date),
+        ("instructions", instructions),
+    ):
+        if val is not None:
+            body[key] = val
+    if not body:
+        return _result(_error("nothing to update: pass at least one field"))
+    return _result(await api.patch(f"/api/v1/companies/{cid}/projects/{project_id}", body))
+
+
+# ==============================================================================
+# PHASE 4b — company management (agent orgs)
+# ==============================================================================
+# Authorization is entirely server-side: the agent's token resolves to its
+# owner's user and org, plan tier limits apply on create, and ai-chatbot's
+# permission checks apply to every write. There is deliberately no
+# delete_company tool: a hard delete cascades across two databases and is an
+# owner-in-the-UI action. Archive with update_company(status="archived").
+
+
+@mcp.tool()
+async def list_companies(status: Optional[str] = None) -> str:
+    """List the companies (agent orgs) in this agent's owner's organization.
+
+    Args:
+        status: Optional filter, e.g. "active", "paused", "archived".
+    """
+    params: dict[str, Any] = {}
+    if status:
+        params["status"] = status
+    return _result(await api.get("/api/v1/companies", params=params))
+
+
+@mcp.tool()
+async def create_company(
+    name: str,
+    identifier_prefix: Optional[str] = None,
+    mission: Optional[str] = None,
+    goals: Optional[list[str]] = None,
+    description: Optional[str] = None,
+    industry: Optional[str] = None,
+    domain: Optional[str] = None,
+) -> str:
+    """Create a company (agent org). This agent's owner becomes its owner.
+
+    After creating, build the org with create_department, create_project,
+    create_membership (put agents in it with positions), and create_task.
+
+    Args:
+        name: Company name (required).
+        identifier_prefix: 2-10 chars, an uppercase letter then uppercase
+            letters or digits (e.g. "CIV"). Task ids become CIV-1, CIV-2, ...
+        mission: One-paragraph mission statement.
+        goals: List of goal strings.
+        description, industry, domain: Optional profile fields.
+    """
+    if not name or not name.strip():
+        return _result(_error("name is required"))
+    if identifier_prefix is not None and not _IDENTIFIER_PREFIX_RE.match(identifier_prefix):
+        return _result(_error(
+            "identifier_prefix must be 2-10 chars: an uppercase letter followed by "
+            f"uppercase letters or digits (e.g. 'CIV'), got {identifier_prefix!r}"
+        ))
+    body: dict[str, Any] = {"name": name.strip()}
+    for key, val in (
+        ("identifier_prefix", identifier_prefix), ("mission", mission), ("goals", goals),
+        ("description", description), ("industry", industry), ("domain", domain),
+    ):
+        if val is not None:
+            body[key] = val
+    return _result(await api.post("/api/v1/companies", body))
+
+
+@mcp.tool()
+async def update_company(
+    company_id: Optional[str] = None,
+    name: Optional[str] = None,
+    mission: Optional[str] = None,
+    goals: Optional[list[str]] = None,
+    description: Optional[str] = None,
+    industry: Optional[str] = None,
+    domain: Optional[str] = None,
+    status: Optional[str] = None,
+) -> str:
+    """Update a company's profile or lifecycle status. Only passed fields change.
+
+    Status: "active" | "paused" | "archived". Archiving is the supported way
+    to retire a company from an agent; there is no delete tool by design.
+
+    Args:
+        company_id: Company UUID.
+        name, mission, goals, description, industry, domain: Profile fields.
+        status: New lifecycle status.
+    """
+    err = _enum_check(status, _VALID_COMPANY_STATUSES, "status")
+    if err:
+        return _result(err)
+    try:
+        cid = _resolve_company_id(company_id)
+    except ValueError as e:
+        return _result(_error(str(e)))
+    body: dict[str, Any] = {}
+    for key, val in (
+        ("name", name), ("mission", mission), ("goals", goals), ("description", description),
+        ("industry", industry), ("domain", domain), ("status", status),
+    ):
+        if val is not None:
+            body[key] = val
+    if not body:
+        return _result(_error("nothing to update: pass at least one field"))
+    return _result(await api.patch(f"/api/v1/companies/{cid}", body))
+
+
+@mcp.tool()
+async def create_membership(
+    agent_name: str,
+    company_id: Optional[str] = None,
+    position: Optional[str] = None,
+    title: Optional[str] = None,
+    space_id: Optional[str] = None,
+    reports_to: Optional[str] = None,
+    access_role: Optional[str] = None,
+) -> str:
+    """Put an agent in a company's org chart.
+
+    Args:
+        agent_name: Canonical agent name (must already exist).
+        company_id: Company UUID.
+        position: Org-chart position, e.g. "ceo", "cto", "department_head",
+            "team_lead", "engineer", "individual_contributor" (max 50 chars).
+        title: Human title, e.g. "Head of Platform".
+        space_id: Department (space) UUID the agent belongs to.
+        reports_to: Manager's agent name.
+        access_role: "admin" | "member" | "viewer" (access control, separate from position).
+    """
+    try:
+        cid = _resolve_company_id(company_id)
+        _validate_agent_name(agent_name)
+        if space_id:
+            _validate_uuid(space_id, "space_id")
+        if reports_to:
+            _validate_agent_name(reports_to, "reports_to")
+    except ValueError as e:
+        return _result(_error(str(e)))
+    err = _enum_check(access_role, _VALID_ACCESS_ROLES, "access_role")
+    if err:
+        return _result(err)
+    if position is not None and len(position) > 50:
+        return _result(_error("position must be 50 characters or fewer"))
+    body: dict[str, Any] = {"agent_name": agent_name}
+    for key, val in (
+        ("position", position), ("title", title), ("space_id", space_id),
+        ("reports_to", reports_to), ("access_role", access_role),
+    ):
+        if val is not None:
+            body[key] = val
+    return _result(await api.post(f"/api/v1/companies/{cid}/memberships", body))
+
+
+@mcp.tool()
+async def update_membership(
+    membership_id: str,
+    company_id: Optional[str] = None,
+    position: Optional[str] = None,
+    title: Optional[str] = None,
+    space_id: Optional[str] = None,
+    reports_to: Optional[str] = None,
+    status: Optional[str] = None,
+    access_role: Optional[str] = None,
+) -> str:
+    """Change an org-chart entry: position, title, department, manager, status, or access role.
+
+    Args:
+        membership_id: Org-chart entry UUID (from list_memberships).
+        company_id: Company UUID.
+        position, title, space_id, reports_to, access_role: As in create_membership.
+        status: "active" | "paused" | "removed".
+    """
+    try:
+        cid = _resolve_company_id(company_id)
+        _validate_uuid(membership_id, "membership_id")
+        if space_id:
+            _validate_uuid(space_id, "space_id")
+        if reports_to:
+            _validate_agent_name(reports_to, "reports_to")
+    except ValueError as e:
+        return _result(_error(str(e)))
+    for err in (
+        _enum_check(status, _VALID_MEMBERSHIP_STATUSES, "status"),
+        _enum_check(access_role, _VALID_ACCESS_ROLES, "access_role"),
+    ):
+        if err:
+            return _result(err)
+    if position is not None and len(position) > 50:
+        return _result(_error("position must be 50 characters or fewer"))
+    body: dict[str, Any] = {}
+    for key, val in (
+        ("position", position), ("title", title), ("space_id", space_id),
+        ("reports_to", reports_to), ("status", status), ("access_role", access_role),
+    ):
+        if val is not None:
+            body[key] = val
+    if not body:
+        return _result(_error("nothing to update: pass at least one field"))
+    return _result(await api.patch(f"/api/v1/companies/{cid}/memberships/{membership_id}", body))
+
+
+@mcp.tool()
+async def remove_membership(membership_id: str, company_id: Optional[str] = None) -> str:
+    """Remove an agent's org-chart entry from a company.
+
+    Removes both the org-chart row and the access membership. The agent
+    itself is untouched; use update_agent(action="delete") to delete an agent.
+
+    Args:
+        membership_id: Org-chart entry UUID (from list_memberships).
+        company_id: Company UUID.
+    """
+    try:
+        cid = _resolve_company_id(company_id)
+        _validate_uuid(membership_id, "membership_id")
+    except ValueError as e:
+        return _result(_error(str(e)))
+    return _result(await api.delete(f"/api/v1/companies/{cid}/memberships/{membership_id}"))
 
 
 # ==============================================================================
