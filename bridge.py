@@ -202,7 +202,7 @@ async def exchange_api_key_for_jwt(api_key: str, api_url: str = AGENT_ROUTER_API
 
     POST /auth/agent-token with {"api_key": "<key>"}
     Returns JWT valid for ~15 min. `api_url` is the backend the key was
-    minted for — per-agent in a harness, never assumed from process env.
+    minted for — the agent's own, never assumed from the module default.
 
     Raises:
         AuthError on 401/403 (caller should not retry — bad credentials).
@@ -361,8 +361,7 @@ async def stream_claude_code(
     work_dir: str | None = None,
     extra_dirs: list[str] | None = None,
 ) -> tuple[int, str, str | None, bool]:
-    # Per-agent dirs when called from a harness runner; fall back to the
-    # process globals for the single-agent / legacy case.
+    # The calling bridge's dirs; fall back to the process globals.
     work_dir = work_dir or WORK_DIR
     if extra_dirs is None:
         extra_dirs = EXTRA_DIRS
@@ -572,10 +571,9 @@ async def run_claude_code(
 class AgentContext:
     """Everything that makes a bridge runner act AS one specific agent.
 
-    Single-agent: built from the process env (`from_env`). Harness: each
-    agent on the machine gets its own, built from its `.env` file. This is
-    the unit that decouples 'which agent' (token + identity + local file
-    access) from the shared execution machinery.
+    Built from the process env (`from_env`), which the launcher sourced from
+    the agent's `.env` file. This is the unit that decouples 'which agent'
+    (token + identity + local file access) from the execution machinery.
     """
     name: str
     token: str
@@ -588,8 +586,7 @@ class AgentContext:
 
     @classmethod
     def from_env(cls) -> "AgentContext":
-        """The single agent defined by the process environment (the default
-        persona / back-compat path)."""
+        """The agent defined by the process environment."""
         return cls(
             name=AGENT_NAME,
             token=SOCIETY_AI_AUTH_TOKEN,
@@ -603,7 +600,7 @@ class AgentContext:
 
     def session_env(self) -> dict:
         """Env injected into each spawned `claude` so its society-ai MCP acts
-        as this agent (not the process default). Used by the harness."""
+        as this agent, not whatever the user's own shell env says."""
         return {
             "SOCIETY_AI_AUTH_TOKEN": self.token,
             "AGENT_NAME": self.name,
@@ -623,11 +620,10 @@ class Bridge:
     # enough to be free next to the file read it costs.
     API_ERROR_POLL_S = 3.0
 
-    def __init__(self, ctx: "AgentContext | None" = None, scheduler: "asyncio.Semaphore | None" = None):
+    def __init__(self, ctx: "AgentContext | None" = None):
         # ctx carries this runner's agent identity + local file access.
-        # Default to the process env so single-agent / existing callers work
-        # unchanged. `scheduler` is the SHARED machine-wide concurrency gate
-        # when running under a harness; standalone gets its own.
+        # Defaults to the process env, which the launcher sourced from the
+        # agent's .env file.
         self.ctx = ctx or AgentContext.from_env()
         self.ws = None
         self.registered = False
@@ -645,9 +641,7 @@ class Bridge:
         # flight; the last dispatch to finish starts it.
         self._inflight_dispatches = 0
         self._pending_update: dict | None = None
-        # Shared scheduler = machine-wide concurrency cap across ALL agents in
-        # a harness. Standalone falls back to a private per-agent cap.
-        self._semaphore = scheduler or asyncio.Semaphore(MAX_CONCURRENT_TASKS)
+        self._semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
         self._msg_counter = 0
         self._ws_jwt: str | None = None
         # Per-task chat conversation history. Each entry is a list of
@@ -688,8 +682,8 @@ class Bridge:
             self._session_mgr = SessionManager(hub_sock)
             # Register this agent's policy (defaults + local env override now;
             # platform-fetched config is overlaid in run() once connected).
-            # session_env makes every spawned claude act as THIS agent — the
-            # critical bit when many agents share one harness process.
+            # session_env makes every spawned claude act as THIS agent, even
+            # when the user's own shell env names another one.
             pol = default_policy(self.ctx.name, self.ctx.work_dir, list(self.ctx.extra_dirs))
             apply_local_env(pol, self.ctx.name)
             pol.session_env = self.ctx.session_env()
@@ -707,10 +701,7 @@ class Bridge:
             if MIRROR_SESSIONS:
                 from transcript_shipper import TranscriptShipper
                 # ctx.api_url, NOT the module-level default: the shipper must
-                # hit the SAME backend this agent's token was minted for. In a
-                # harness the process env has no AGENT_ROUTER_API_URL, and the
-                # module default (prod) would ship a local agent's transcripts
-                # to the wrong environment.
+                # hit the SAME backend this agent's token was minted for.
                 self._shipper = TranscriptShipper(
                     self.ctx.api_url,
                     self.ctx.token,
@@ -903,8 +894,8 @@ class Bridge:
                             pass
                         return
                     # Transient reject (commonly "already connected" during a
-                    # restart or harness cutover, while the hub still holds
-                    # this agent's prior connection): drop and let the
+                    # restart, while the hub still holds this agent's prior
+                    # connection): drop and let the
                     # reconnect loop retry, now with real backoff behind it.
                     # The stale connection clears on the hub's heartbeat
                     # timeout, after which re-registration succeeds.
@@ -1314,7 +1305,7 @@ class Bridge:
         same way the launchers map personas to env files: the primary sources
         .env, a persona sources .env.<name>. We reverse that mapping by
         finding the env file whose AGENT_NAME is ours (mirrors the
-        discover_roster filters for backups/special files)."""
+        backup/special-file filters setup.sh relies on)."""
         repo_dir = os.path.dirname(os.path.abspath(__file__))
         primary = _read_env_file(os.path.join(repo_dir, ".env"))
         if (primary.get("AGENT_NAME") or "").strip() == self.ctx.name:
@@ -1371,7 +1362,7 @@ class Bridge:
 
             # Same endpoint + auth the MCP post_feed tool uses
             # (POST /api/v1/feed with the agent's own token) — but sent with
-            # this bridge's ctx.token, so each harness agent reports as itself.
+            # this bridge's ctx.token, so the agent reports as itself.
             headers = {
                 "Authorization": f"Bearer {self.ctx.token}",
                 "Content-Type": "application/json",
@@ -2315,6 +2306,12 @@ class Bridge:
                 work_item_id=work_item_key,
             )
 
+        if rec.state != "ready":
+            await self._send_task_complete(
+                task_id, rec.failure or "Could not start a Claude Code session.", exit_code=1
+            )
+            return
+
         # An aliased dispatch (e.g. a reply typed in the session's platform
         # chat) resolves to the canonical work item — the channel registered
         # under that key, so all hub operations use it.
@@ -2327,6 +2324,10 @@ class Bridge:
                 break
             await asyncio.sleep(0.25)
         if not hub.is_connected(channel_key):
+            logger.error(
+                "Channel for %s (session %s) did not connect to %s within 10s",
+                channel_key, rec.session_id[:8], hub.path,
+            )
             await self._send_task_complete(
                 task_id, "Session started but its channel did not connect in time.", exit_code=1
             )
@@ -2557,7 +2558,7 @@ class Bridge:
         logger.info("Shutting down...")
 
 
-# -- Roster + Harness ---------------------------------------------------------
+# -- Env files ----------------------------------------------------------------
 
 def _read_env_file(path: str) -> dict:
     """Minimal KEY=value parser for a persona .env file."""
@@ -2580,52 +2581,7 @@ def _read_env_file(path: str) -> dict:
     return out
 
 
-def _context_from_env_file(repo_dir: str, env_file: str, persona_arg: str) -> "AgentContext | None":
-    env = _read_env_file(os.path.join(repo_dir, env_file))
-    name = (env.get("AGENT_NAME") or "").strip()
-    token = (env.get("SOCIETY_AI_AUTH_TOKEN") or "").strip()
-    if not name or not token:
-        return None
-    cache = os.path.join(os.path.expanduser("~"), ".cache", "society-ai")
-    socket = env.get("SOCIETY_AI_BRIDGE_SOCKET") or (
-        os.path.join(cache, "bridge.sock") if not persona_arg
-        else os.path.join(cache, persona_arg, "bridge.sock")
-    )
-    extra = [d.strip() for d in (env.get("EXTRA_DIRS") or "").split(",") if d.strip()]
-    return AgentContext(
-        name=name, token=token,
-        work_dir=env.get("WORK_DIR") or os.getcwd(),
-        extra_dirs=extra, company_id=env.get("COMPANY_ID", ""),
-        api_url=(env.get("AGENT_ROUTER_API_URL") or AGENT_ROUTER_API_URL).rstrip("/"),
-        socket=socket, state_dir=os.path.dirname(socket) or ".",
-    )
-
-
-def discover_roster() -> "list[AgentContext]":
-    """Build the machine's agent roster from .env / .env.<persona> files —
-    the same files the per-persona installs and the status panel use."""
-    repo = os.path.dirname(os.path.abspath(__file__))
-    roster: list[AgentContext] = []
-    for entry in sorted(os.listdir(repo)):
-        if entry == ".env":
-            persona_arg = ""
-        elif entry.startswith(".env.") and entry not in (".env.example", ".env.defaults"):
-            persona_arg = entry[len(".env."):]
-            if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,62}", persona_arg):
-                continue
-            # setup.sh keeps timestamped backups (.env.bak-<epoch>,
-            # .env.<persona>.bak-<epoch>) before overwriting a config. Running
-            # them would connect a duplicate of a live agent under its old
-            # credentials, so they are never part of the roster.
-            if re.search(r"\.?bak-\d+$", persona_arg):
-                continue
-        else:
-            continue
-        ctx = _context_from_env_file(repo, entry, persona_arg)
-        if ctx:
-            roster.append(ctx)
-    return roster
-
+# -- Shutdown -----------------------------------------------------------------
 
 async def _teardown_bridge(bridge: "Bridge") -> None:
     """Per-agent graceful teardown: park ended flips, stop session infra so
@@ -2659,123 +2615,68 @@ async def _teardown_bridge(bridge: "Bridge") -> None:
             logger.warning("shipper close (%s): %s", bridge.ctx.name, e)
 
 
-class Harness:
-    """Runs every agent on this machine in one supervised process. Each agent
-    gets its own hub connection + IPC socket (identity plane); all share ONE
-    scheduler — the machine-wide concurrency cap (execution plane). A failure
-    in one agent's connection is isolated and doesn't tear down the others."""
-
-    def __init__(self, roster: "list[AgentContext]", machine_cap: int):
-        self.roster = roster
-        self.machine_cap = machine_cap
-        self.bridges: list[Bridge] = []
-        self.ipc_servers: list = []
-        self._scheduler = None
-
-    async def run(self) -> None:
-        self._scheduler = asyncio.Semaphore(self.machine_cap)
-        for ctx in self.roster:
-            b = Bridge(ctx, scheduler=self._scheduler)
-            self.bridges.append(b)
-            ipc = bridge_ipc.IPCServer(
-                handlers={
-                    "search_agents": b.ipc_search_agents,
-                    "delegate_task": b.ipc_delegate_task,
-                    "mirror_notify": b.ipc_mirror_notify,
-                    "status": b.ipc_status,
-                    "reap_session": b.ipc_reap_session,
-                },
-                path=ctx.socket,
-            )
-            try:
-                await ipc.start()
-            except Exception as e:
-                logger.error("IPC server for %s failed to start: %s", ctx.name, e)
-            self.ipc_servers.append(ipc)
-            logger.info("Harness: agent %s online (socket=%s)", ctx.name, ctx.socket)
-        await asyncio.gather(*(b.run() for b in self.bridges), return_exceptions=True)
-
-    def stop(self) -> None:
-        for b in self.bridges:
-            b.stop()
-
-    async def shutdown(self) -> None:
-        for ipc in self.ipc_servers:
-            try:
-                await ipc.stop()
-            except Exception as e:
-                logger.warning("IPC server stop: %s", e)
-        for b in self.bridges:
-            await _teardown_bridge(b)
-        try:
-            await _close_http_client()
-        except Exception as e:
-            logger.warning("HTTP client cleanup: %s", e)
-
-
 # -- Entry point --------------------------------------------------------------
 
 def main():
-    roster = discover_roster()
-
-    # Single-agent mode. bridge_launcher.sh sources one agent's env file
-    # (which always carries AGENT_NAME) before exec'ing us, so a per-agent
-    # LaunchAgent must run ONLY that agent. Without this every per-agent
-    # service would start the whole roster, so each agent got connected once
-    # per installed service; the hub accepts the first and rejects the rest
-    # with "already connected", and the losers reconnect forever. That churn
-    # makes the agent undeliverable: tasks never reach a stable connection.
-    # harness_launcher.sh deliberately sources only .env.defaults (no
-    # AGENT_NAME), so the machine-wide harness still runs the full roster.
-    only = (os.getenv("AGENT_NAME") or "").strip()
-    if only:
-        roster = [c for c in roster if c.name == only]
-        if not roster:
-            print(
-                f"Error: AGENT_NAME={only} is set, but no .env file in this "
-                "folder defines that agent. Check the env file this service "
-                "sources, or run ./setup.sh again.",
-                file=sys.stderr,
-            )
-            sys.exit(2)
-
-    if not roster:
+    # One process per agent. bridge_launcher.sh sources exactly one agent's
+    # env file (.env or .env.<persona>) before exec'ing us, so the process
+    # env IS the agent.
+    ctx = AgentContext.from_env()
+    if not ctx.name or not ctx.token:
         print(
-            "Error: no agents found. Set SOCIETY_AI_AUTH_TOKEN + AGENT_NAME in "
-            ".env (or add personas with ./setup.sh --persona <name>).",
+            "Error: AGENT_NAME and SOCIETY_AI_AUTH_TOKEN must be set. Start the "
+            "bridge with ./bridge_launcher.sh [persona], or run ./setup.sh.",
             file=sys.stderr,
         )
         sys.exit(2)
 
-    # Machine-wide concurrency cap across ALL agents (overridable). This is
-    # the bounded-parallelism limit a single per-agent process can't enforce.
-    machine_cap = max(1, int(os.getenv("MAX_CONCURRENT_MACHINE", "8")))
-    # Warms the one-time CLI version cache before any agent registers.
+    cli_version = claude_cli_version()
     logger.info(
-        "claude-code-agent harness v%s on Claude Code CLI %s — %d agent(s): %s "
-        "(mode=%s, machine cap=%d)",
-        __version__, claude_cli_version() or "unknown",
-        len(roster), ", ".join(c.name for c in roster),
-        EXECUTION_MODE, machine_cap,
+        "claude-code-agent bridge v%s on Claude Code CLI %s — agent %s (mode=%s)",
+        __version__, cli_version or "unknown", ctx.name, EXECUTION_MODE,
     )
+    if cli_version is None:
+        logger.error(
+            "`claude --version` does not run on this PATH (%s); sessions will "
+            "fail to start until Claude Code is reinstalled",
+            os.environ.get("PATH", ""),
+        )
 
-    harness = Harness(roster, machine_cap)
+    bridge = Bridge(ctx)
+    ipc = bridge_ipc.IPCServer(
+        handlers={
+            "search_agents": bridge.ipc_search_agents,
+            "delegate_task": bridge.ipc_delegate_task,
+            "mirror_notify": bridge.ipc_mirror_notify,
+            "status": bridge.ipc_status,
+            "reap_session": bridge.ipc_reap_session,
+        },
+        path=ctx.socket,
+    )
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
+    # Owning the agent's sockets is what makes this process the agent on
+    # this machine. If another live process already owns them, starting
+    # anyway would split the agent between two processes, so stop here.
+    try:
+        loop.run_until_complete(ipc.start())
+    except bridge_ipc.SocketInUseError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
     def _request_shutdown():
         logger.info("Shutdown requested")
-        harness.stop()
-        # Close each agent's WS so its run loop unblocks and returns —
-        # otherwise the process ignores SIGTERM (the read loop stays parked
-        # on `async for raw in ws`). launchd stops/restarts via SIGTERM, so
-        # this is what lets a clean teardown (parked status flips) happen.
-        for b in harness.bridges:
-            if b.ws is not None:
-                asyncio.ensure_future(b.ws.close())
+        bridge.stop()
+        # Close the WS so the run loop unblocks and returns — otherwise the
+        # process ignores SIGTERM (the read loop stays parked on
+        # `async for raw in ws`). launchd stops/restarts via SIGTERM, so this
+        # is what lets a clean teardown (parked status flips) happen.
+        if bridge.ws is not None:
+            asyncio.ensure_future(bridge.ws.close())
 
     # Prefer loop-native signal handling (runs inside the loop, can schedule
-    # the WS closes); fall back to plain signals where unavailable.
+    # the WS close); fall back to plain signals where unavailable.
     for _sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(_sig, _request_shutdown)
@@ -2783,20 +2684,25 @@ def main():
             signal.signal(_sig, lambda *_: _request_shutdown())
 
     try:
-        loop.run_until_complete(harness.run())
+        loop.run_until_complete(bridge.run())
     except KeyboardInterrupt:
-        harness.stop()
+        bridge.stop()
     finally:
-        if any(b._active_tasks for b in harness.bridges):
+        if bridge._active_tasks:
             logger.info("Waiting for in-flight tasks...")
             try:
                 loop.run_until_complete(asyncio.sleep(2))
             except Exception:
                 pass
         try:
-            loop.run_until_complete(harness.shutdown())
+            loop.run_until_complete(ipc.stop())
         except Exception as e:
-            logger.warning("Harness shutdown error: %s", e)
+            logger.warning("IPC server stop: %s", e)
+        try:
+            loop.run_until_complete(_teardown_bridge(bridge))
+            loop.run_until_complete(_close_http_client())
+        except Exception as e:
+            logger.warning("Shutdown error: %s", e)
         try:
             loop.close()
         except Exception:

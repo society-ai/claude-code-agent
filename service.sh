@@ -138,9 +138,26 @@ bootstrap_service() {
     is_loaded
 }
 
+# The all-agents-in-one-process "harness" service is retired. A machine
+# that still has its LaunchAgent runs it next to the per-agent bridges, and
+# the two fight over each agent's sockets and hub registration: sessions
+# connect to one process while platform messages arrive at the other.
+remove_retired_harness() {
+    local label="io.societyai.claude-code-harness"
+    local plist="$HOME/Library/LaunchAgents/$label.plist"
+    if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+        launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+    fi
+    if [ -f "$plist" ]; then
+        rm -f "$plist"
+        echo "  Removed the retired harness service ($label); each agent now runs as its own service."
+    fi
+}
+
 cmd_install() {
     require_macos
     require_setup
+    remove_retired_harness
 
     if [ ! -f "$PLIST_TEMPLATE" ]; then
         echo "Error: plist template not found at $PLIST_TEMPLATE" >&2

@@ -188,8 +188,8 @@ API_HEADERS = {
 
 def ws_url(api_url: str = "") -> str:
     """Derive WebSocket URL from an API URL (default: the process-wide
-    AGENT_ROUTER_API_URL). Harness callers pass each agent's own api_url so
-    every agent connects to the backend its token was minted for."""
+    AGENT_ROUTER_API_URL). Callers pass the agent's own api_url so it
+    connects to the backend its token was minted for."""
     url = (api_url or AGENT_ROUTER_API_URL).rstrip("/")
     if url.startswith("https://"):
         return "wss://" + url[len("https://"):] + "/ws/agents"

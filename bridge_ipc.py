@@ -53,6 +53,57 @@ def socket_path() -> str:
 HandlerMap = dict[str, Callable[[dict], Awaitable[Any]]]
 
 
+class SocketInUseError(RuntimeError):
+    """Another live process is already listening on the socket path."""
+
+
+def claim_socket_path(path: str) -> None:
+    """Make `path` free to bind: create its 0700 directory and remove a
+    stale socket file left by a process that is gone.
+
+    A socket file that still ACCEPTS connections belongs to a live process,
+    so it is never removed: unlinking it would leave that process listening
+    on an orphaned inode while every new client connects to us instead, and
+    one agent would end up split across two processes (sessions connect to
+    one, platform messages arrive at the other). Raises SocketInUseError.
+    """
+    import socket as _socket
+    import stat as _stat
+
+    sock_dir = os.path.dirname(path)
+    if sock_dir:
+        os.makedirs(sock_dir, exist_ok=True)
+        try:
+            os.chmod(sock_dir, 0o700)
+        except OSError:
+            pass
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return
+    if not _stat.S_ISSOCK(st.st_mode):
+        raise RuntimeError(f"{path} exists and is not a socket; refusing to unlink")
+
+    probe = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    probe.settimeout(1.0)
+    try:
+        probe.connect(path)
+    except OSError:
+        pass  # nobody listening: stale file from a process that exited
+    else:
+        raise SocketInUseError(
+            f"another process is already listening on {path}. Is a second "
+            "Society AI bridge (or the old harness service) running for this "
+            "agent? Stop it first; `launchctl list | grep societyai` lists them."
+        )
+    finally:
+        probe.close()
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
 # -- Server side (bridge) -----------------------------------------------------
 
 
@@ -69,30 +120,9 @@ class IPCServer:
         return self._path
 
     async def start(self) -> None:
-        """Start listening. Cleans up any stale socket file from a prior run."""
-        sock_dir = os.path.dirname(self._path)
-        if sock_dir:
-            os.makedirs(sock_dir, exist_ok=True)
-            try:
-                os.chmod(sock_dir, 0o700)
-            except OSError:
-                pass
-
-        # Remove a stale socket file from a previous bridge invocation.
-        if os.path.exists(self._path):
-            try:
-                # Sanity-check that what we're about to unlink is actually
-                # a socket — don't blow away a regular file by accident.
-                st = os.stat(self._path)
-                import stat as _stat
-                if _stat.S_ISSOCK(st.st_mode):
-                    os.unlink(self._path)
-                else:
-                    raise RuntimeError(
-                        f"IPC path {self._path} exists and is not a socket; refusing to unlink"
-                    )
-            except FileNotFoundError:
-                pass
+        """Start listening. Cleans up a stale socket file from a prior run;
+        raises SocketInUseError if a live process still owns the path."""
+        claim_socket_path(self._path)
 
         self._server = await asyncio.start_unix_server(self._handle_client, path=self._path)
         try:

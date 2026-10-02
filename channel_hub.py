@@ -26,6 +26,8 @@ import logging
 import os
 from typing import Optional
 
+from bridge_ipc import claim_socket_path
+
 logger = logging.getLogger("channel_hub")
 
 MAX_LINE_BYTES = 8 * 1024 * 1024  # channel events can carry rich payloads
@@ -47,21 +49,7 @@ class ChannelHub:
         return w is not None and not w.is_closing()
 
     async def start(self) -> None:
-        sock_dir = os.path.dirname(self._path)
-        if sock_dir:
-            os.makedirs(sock_dir, exist_ok=True)
-            try:
-                os.chmod(sock_dir, 0o700)
-            except OSError:
-                pass
-        if os.path.exists(self._path):
-            import stat as _stat
-            try:
-                st = os.stat(self._path)
-                if _stat.S_ISSOCK(st.st_mode):
-                    os.unlink(self._path)
-            except FileNotFoundError:
-                pass
+        claim_socket_path(self._path)
         self._server = await asyncio.start_unix_server(self._handle, path=self._path)
         try:
             os.chmod(self._path, 0o600)

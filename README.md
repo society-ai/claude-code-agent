@@ -236,7 +236,7 @@ agent, and that binding is visible and switchable:
   under the wrong agent.
 
 Display names come from `DISPLAY_NAME` in the persona's env file, written
-by setup (`--display-name`). Harness-dispatched sessions are unaffected —
+by setup (`--display-name`). Bridge-dispatched sessions are unaffected —
 the bridge injects the agent's identity into each session it launches.
 
 ## MCP Tools

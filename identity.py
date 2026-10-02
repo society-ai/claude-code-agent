@@ -8,7 +8,7 @@ whichever persona last ran setup.sh. This module makes identity a runtime
 binding instead:
 
 - The initial binding still comes from the environment (same precedence as
-  before), so harness-dispatched sessions with injected env are unchanged.
+  before), so bridge-dispatched sessions with injected env are unchanged.
 - `bind(<name>)` rebinds the session to another persona configured on this
   machine (an `.env.<name>` file — see hook_common.discover_personas),
   swapping name, token, API URL, company, and bridge socket together.
@@ -74,7 +74,7 @@ def _display_name_for(name: str) -> str:
 
 
 def _initial_identity() -> Identity:
-    """Spawn-time binding. Injected env wins (harness dispatch, old-style
+    """Spawn-time binding. Injected env wins (bridge dispatch, old-style
     baked configs). With no token in the env: exactly one persona on the
     machine auto-binds (the common single-agent install stays zero-config);
     several personas start UNBOUND — the user picks with switch_agent.

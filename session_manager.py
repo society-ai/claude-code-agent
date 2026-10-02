@@ -68,10 +68,9 @@ class PersonaPolicy:
     max_concurrent: int = 3
     permission_mode: str = "default"   # 'default' | 'acceptEdits' | 'bypassPermissions'
     # Per-agent environment injected into each spawned `claude` session so it
-    # acts as THIS agent (token, name, IPC socket). Critical when many agents
-    # share one process (the harness): the session's society-ai MCP reads
-    # these from its environment, so they must be the agent's, not the
-    # process-wide defaults. Empty in the single-agent case (inherits env).
+    # acts as THIS agent (token, name, IPC socket): the session's society-ai
+    # MCP reads these from its environment, so they must be the agent's, not
+    # whatever the user-scope MCP config falls back to.
     session_env: dict = field(default_factory=dict)
 
 
@@ -89,6 +88,9 @@ class SessionRecord:
     fresh_launch: bool = False         # last ensure_session() created a brand-new
                                        # Claude session (no prior context) — the
                                        # bridge sends the platform protocol then
+    failure: str = ""                  # why the last launch did not reach ready,
+                                       # in words the person who sent the message
+                                       # can act on
 
 
 class SessionManager:
@@ -258,8 +260,8 @@ class SessionManager:
 
         # Launch detached in tmux, cwd = persona work dir. Per-agent env is
         # injected as inline assignments on the exec so the spawned claude
-        # (and its society-ai MCP) act as THIS agent — essential when many
-        # agents share one harness process.
+        # (and its society-ai MCP) act as THIS agent, not whichever persona
+        # the user-scope MCP config falls back to.
         cwd = pol.work_dir
         # Marks the session as platform-driven. Hooks use it to drop output
         # meant for a human at this terminal: whatever the session writes is
@@ -287,7 +289,11 @@ class SessionManager:
         rec.has_run_once = True
         ready = await self._clear_startup_prompts(rec.tmux_name)
         rec.state = "ready" if ready else "failed"
+        rec.failure = ""
         if not ready:
+            rec.failure = await self._explain_failed_launch(rec, pol)
+            logger.error("Session %s for %s did not start: %s",
+                         rec.session_id[:8], rec.work_item_key, rec.failure)
             # A boot that outlasted even the generous gate may still finish
             # later; left alone it would sit as an orphan holding this
             # session's key (and a Remote Control row). Kill it — the next
@@ -296,6 +302,57 @@ class SessionManager:
         rec.last_active = time.time()
         logger.info("Session %s for %s (%s) state=%s resume=%s",
                     rec.session_id[:8], rec.work_item_key, rec.persona, rec.state, resume)
+
+    async def _explain_failed_launch(self, rec: SessionRecord, pol: PersonaPolicy) -> str:
+        """Say why a launch never reached the ready prompt. The pane is gone
+        by the time a fast exit is noticed, taking its error with it, so the
+        CLI is re-run on its own to recover the reason. A broken install
+        (half-finished update, binary not executable) is the common case,
+        and it fails the same way on every launch until someone fixes it."""
+        alive = await self._tmux_alive(rec.tmux_name)
+        if alive:
+            pane = (await self._tmux_capture(rec.tmux_name)) or ""
+            tail = [ln.strip() for ln in pane.splitlines() if ln.strip()][-5:]
+            logger.error("Pane of %s at startup timeout:\n%s", rec.tmux_name, "\n".join(tail))
+        problem = await self._claude_cli_problem(pol)
+        if problem:
+            return (
+                f"Claude Code is not working on this machine ({problem}). "
+                "Reinstall Claude Code, check that `claude --version` works "
+                "in a terminal, then send the message again."
+            )
+        if alive:
+            return ("Claude Code did not finish starting within 2 minutes. "
+                    "The bridge log has the last screen it showed.")
+        return ("Claude Code exited right after starting. Run `claude` in "
+                f"{pol.work_dir} to see the error.")
+
+    async def _claude_cli_problem(self, pol: PersonaPolicy) -> str:
+        """Run `claude --version` the way a session runs `claude`: same PATH,
+        same cwd. Returns what went wrong, or "" if the CLI runs."""
+        env = dict(os.environ)
+        env.update({k: str(v) for k, v in (pol.session_env or {}).items() if v})
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "claude", "--version", cwd=pol.work_dir, env=env,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            return "the `claude` command is not on the bridge's PATH"
+        except OSError as e:
+            return f"`claude` could not be run: {e.strerror or e}"
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=30)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return "`claude --version` did not answer within 30 seconds"
+        if proc.returncode == 0:
+            return ""
+        if proc.returncode < 0:
+            return f"`claude` was killed by signal {-proc.returncode}, usually a corrupt binary"
+        lines = [ln.strip() for ln in (err or out).decode("utf-8", "replace").splitlines() if ln.strip()]
+        detail = f": {lines[0]}" if lines else ""
+        return f"`claude --version` failed with exit code {proc.returncode}{detail}"
 
     def _write_workspace_config(self, rec: SessionRecord, pol: PersonaPolicy) -> None:
         """Write .mcp.json (channel server with this session's key) + project
