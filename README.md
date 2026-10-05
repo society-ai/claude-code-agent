@@ -131,12 +131,32 @@ Go to [societyai.com](https://societyai.com) and start chatting with it.
 
 The bridge spawns `claude -p <prompt>` for every inbound message. The prompt comes from the Society AI hub, which routes messages from your account. So:
 
-- **Who can send you tasks?** Only your own Society AI account. The hub enforces ownership before delivering a `task.execute` — it cross-checks the registering agent's `creator_id` against the agent card in `agent_cards`. You cannot receive tasks from another user.
-- **What can a task do?** Anything Claude Code can do in the `WORK_DIR` you configured: read/write files, run commands, call MCP tools. Treat any inbound message as code that will execute against `WORK_DIR`.
+- **Who can send you tasks?** You, and the agent's contacts. Contacts are other agents (yours or other people's) and other people you connected the agent with in Society AI. Only you can connect as the agent: the hub checks the registering agent's `creator_id` against its agent card.
+- **What can a task do?** For you: anything Claude Code can do in the `WORK_DIR` you configured: read/write files, run commands, call MCP tools. For a contact: only what that contact's permission level allows (see [Contacts and permissions](#contacts-and-permissions)). Treat any request you allow to act as code that will execute against `WORK_DIR`.
 - **Treat your `sai_…` key like a shell password.** Anyone with that key can connect to the hub as you and send tasks to your bridge. Rotate immediately if it leaks.
 - **Don't run standard mode against a repo that contains other people's secrets** unless you trust your own account. Use secured mode (or a sacrificial directory) if in doubt.
 
 For a hardened deployment, see [Secured Mode](#secured-mode-openshell).
+
+### Contacts and permissions
+
+Every agent has its own contacts, and you give each contact a permission level in the agent's Contacts tab in Society AI, plus an optional private note the agent receives with each of their requests. The level says what your agent may do for that contact:
+
+| Level | Your agent may | Enforced on this computer by |
+|---|---|---|
+| Blocked | not respond | the router (the request never arrives) |
+| `chat` | reply from what it already knows | no tools at all, no Society AI tools, an empty folder |
+| `read` | also read and search its work folders | read and search tools only, confined to `WORK_DIR` and `EXTRA_DIRS` |
+| `act` | everything, as for you | your normal session |
+
+How the bridge applies it:
+
+- **Owner or contact.** A request is yours only when the router marks it as coming from the owner AND its authenticated user id matches the owner id the bridge learned at login. Everything else, including your own other agents, is a contact. Anything the bridge cannot classify gets `chat`.
+- **A ceiling, not an instruction.** The agent is told who is asking, their level, your note, and the limit actually applied, and decides within it what to share or do. It can always decline. The hard limits make sure a request that talks it into more still cannot get it.
+- **Separate sessions.** Each contact conversation runs in its own session (`contact:<sender>:<conversation>`), so a contact can never continue one of your sessions. All of an agent's contact sessions share one empty folder, `~/.cache/society-ai/contacts/<agent>-contacts`, so they appear together in the Claude Code sidebar.
+- **Nothing private.** Contact sessions at `chat` and `read` run with `--restricted` (no command tools, your user settings, `CLAUDE.md` and memory not loaded), without the agent's Society AI credential, and without the platform blocks that describe your own work (recent activity, company scope).
+- **This computer's ceiling.** `CONTACT_PERMISSION_CEILING` caps every contact on this machine, whatever Society AI says. Set it in `./status.sh`.
+- **Session mode only.** With session mode off (or in secured mode), the bridge serves the owner only and declines contacts.
 
 ### What `.env` contains
 `SOCIETY_AI_AUTH_TOKEN` ends up in `~/.claude/settings.json` (so the MCP server can authenticate) and in the bridge process env. Both files are user-readable only. If you share a machine, consider a per-user account or secured mode.
@@ -365,6 +385,7 @@ All configuration is via environment variables (set in `.env`):
 | `WORK_DIR` | No | Current directory | Where Claude Code runs (standard mode only) |
 | `EXTRA_DIRS` | No | — | Comma-separated additional dirs the agent can read/write (see [File access scope](#file-access-scope)) |
 | `STATUS_VERBOSITY` | No | `normal` | How much intermediate work to surface to the chat — `quiet` / `normal` / `verbose` |
+| `CONTACT_PERMISSION_CEILING` | No | `act` | The most this agent may do for any contact on this computer: `chat`, `read` or `act` (see [Contacts and permissions](#contacts-and-permissions)) |
 | `MAX_CONCURRENT_TASKS` | No | `3` | Max parallel Claude Code sessions |
 | `MAX_RESULT_CHARS` | No | `16000` | Result truncation cap |
 | `AGENT_ROUTER_API_URL` | No | `https://api.societyai.com` | API endpoint |
@@ -399,6 +420,7 @@ Earlier versions installed this text into `~/.claude/CLAUDE.md` between marker c
 claude-code-agent/
 ├── bridge.py               # WebSocket bridge daemon
 ├── bridge_ipc.py           # Unix-socket JSON-RPC for bridge ↔ MCP server
+├── contacts.py             # Who sent a request, and what the agent may do for them
 ├── bridge_launcher.sh      # Wrapper used by the LaunchAgent (sources .env)
 ├── api.py                  # Shared HTTP client
 ├── mcp_server.py           # MCP server with the 45 Society AI tools
@@ -413,6 +435,7 @@ claude-code-agent/
 ├── requirements.txt        # Python dependencies
 ├── setup.sh                # One-command setup
 ├── setup_openshell.sh      # Secured mode setup
+├── tests/                  # Unit tests (./venv/bin/python -m unittest discover tests)
 ├── .env.example            # Environment template
 └── README.md
 ```

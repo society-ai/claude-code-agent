@@ -60,6 +60,16 @@ from config import (
     __version__,
     ws_url,
 )
+from contacts import (
+    Sender,
+    clamp,
+    classify_sender,
+    contact_work_item_key,
+    limit_line,
+    owner_id_from_jwt,
+    strip_private_blocks,
+)
+from dataclasses import replace
 from streaming import StreamMapper
 from typing import Any, Awaitable, Callable, Optional
 
@@ -644,6 +654,9 @@ class Bridge:
         self._semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
         self._msg_counter = 0
         self._ws_jwt: str | None = None
+        # The owner's user id, from the registration ack or our own WS JWT.
+        # Until it is known, nothing is treated as coming from the owner.
+        self._owner_user_id: str | None = None
         # Per-task chat conversation history. Each entry is a list of
         # {"user": str, "assistant": str} dicts. We maintain history ourselves
         # and inline it into the next prompt rather than using `claude --resume`,
@@ -775,6 +788,19 @@ class Bridge:
         the next reconnect attempt fetches a fresh JWT.
         """
         self._ws_jwt = await exchange_api_key_for_jwt(self.ctx.token, self.ctx.api_url)
+        if not self._owner_user_id:
+            self._owner_user_id = owner_id_from_jwt(self._ws_jwt)
+            if not self._owner_user_id:
+                logger.error(
+                    "Could not read the owner id from the login token; every "
+                    "request will be handled as a contact at 'chat'"
+                )
+
+    def _contact_ceiling(self) -> str:
+        """The machine owner's cap for every contact (chat | read | act)."""
+        if self._session_mgr is not None:
+            return self._session_mgr.policy(self.ctx.name).contact_permission_ceiling
+        return os.getenv("CONTACT_PERMISSION_CEILING", "act").strip() or "act"
 
     async def register(self):
         """Register this agent with the hub using the WS JWT."""
@@ -789,6 +815,9 @@ class Bridge:
             "visibility": "private",
             "framework": FRAMEWORK,
             "adapter_version": __version__,
+            # Lets the Contacts tab show "limited on this computer". The
+            # bridge enforces it whatever the platform stores.
+            "contact_permission_ceiling": self._contact_ceiling(),
         }
         framework_version = await claude_cli_version_async()
         if framework_version:
@@ -873,6 +902,9 @@ class Bridge:
                     # here so that a hub which accepts the socket and then
                     # rejects us cannot hold the delay at its floor forever.
                     self._conn_registered = True
+                    owner_id = result.get("owner_user_id")
+                    if isinstance(owner_id, str) and owner_id.strip():
+                        self._owner_user_id = owner_id.strip()
                     logger.info("Registered as %s", result.get("agent_id", self.ctx.name))
                 else:
                     reason = str(result.get("error") or "")
@@ -1107,11 +1139,19 @@ class Bridge:
         # is deleted when the router's dual-emit window closes.
         frame = metadata.get("frame") if isinstance(metadata.get("frame"), dict) else None
 
+        # Who sent this: the owner, or a contact with a permission level.
+        # A contact never sees the owner's private standing blocks, and its
+        # level is capped by this machine's ceiling.
+        sender = classify_sender(frame, metadata, self._owner_user_id)
+        if not sender.is_owner:
+            sender = replace(sender, permission=clamp(sender.permission, self._contact_ceiling()))
+            metadata = strip_private_blocks(metadata)
+
         # Send-as-supervisor (legacy path only): the platform relays a
         # supervisor-suggested message the owner approved. Composed
         # dispatches carry this in the frame (from=supervisor) instead.
         from_supervisor = metadata.get("from_supervisor")
-        if frame is None and isinstance(from_supervisor, str) and from_supervisor.strip():
+        if sender.is_owner and frame is None and isinstance(from_supervisor, str) and from_supervisor.strip():
             user_text = (
                 f"[Message from your supervisor ({from_supervisor.strip()}) — "
                 "relayed with your owner's approval. Treat it as direction "
@@ -1119,8 +1159,9 @@ class Bridge:
             )
 
         logger.info(
-            "Task received: %s (agent_task=%s, company=%s)",
+            "Task received: %s (agent_task=%s, company=%s, from=%s)",
             task_id, agent_task_id, company_id,
+            "owner" if sender.is_owner else f"{sender.label} [{sender.permission}]",
         )
         logger.info("Message: %s", user_text[:200])
 
@@ -1146,12 +1187,17 @@ class Bridge:
                         # v0.7: dispatch into a persistent per-work-item session.
                         # Stable key gives task rework continuity (resume same
                         # session); chat falls back to sessionId/chat/task_id.
-                        work_item_key = (
-                            agent_task_id
-                            or params.get("sessionId")
-                            or metadata.get("chat_id")
-                            or task_id
-                        )
+                        if sender.is_owner:
+                            work_item_key = (
+                                agent_task_id
+                                or params.get("sessionId")
+                                or metadata.get("chat_id")
+                                or task_id
+                            )
+                        else:
+                            work_item_key = contact_work_item_key(
+                                sender, frame, metadata, params, task_id
+                            )
                         protocol_text = ""
                         standing_text = ""
                         if frame is not None:
@@ -1181,6 +1227,12 @@ class Bridge:
                             )
                             protocol_text = self._protocol_text(metadata)
                             title = self._derive_session_title(work_text)
+                        elif not sender.is_owner:
+                            # A contact through a pre-composer router: just
+                            # the request, none of the owner's primers.
+                            content = user_text
+                            title = self._derive_session_title(user_text)
+                            kind = "task_assigned" if agent_task_id else "chat"
                         else:
                             # Legacy fallback (pre-composer router): sniff
                             # mode from text, prepend primers. Delete when
@@ -1203,9 +1255,32 @@ class Bridge:
                                 kind = "trigger"
                             else:
                                 kind = "chat"
+                        permission = None
+                        if not sender.is_owner:
+                            # The agent learns what it may actually do here,
+                            # on every request: the level can change between
+                            # messages, and the machine ceiling can make it
+                            # lower than what the platform says.
+                            content = limit_line(sender) + "\n\n" + content
+                            title = f"{sender.label}: {title}"
+                            permission = sender.permission
                         await self._execute_via_session(
                             task_id, str(work_item_key), title, content, kind=kind,
                             protocol_text=protocol_text, standing_text=standing_text,
+                            sender=sender, permission=permission,
+                        )
+                    elif not sender.is_owner:
+                        # The one-shot spawn path (session mode off, or the
+                        # secured sandbox) runs with full permissions and has
+                        # no way to limit them, so it serves the owner only.
+                        logger.warning(
+                            "Refusing request %s from contact %s: session mode is off",
+                            task_id, sender.label,
+                        )
+                        await self._send_task_complete(
+                            task_id,
+                            "This agent can't take requests from contacts right now.",
+                            exit_code=1,
                         )
                     elif agent_task_id and company_id:
                         # AgentOrg trigger flow — full context + Claude Code spawn
@@ -2254,10 +2329,15 @@ class Bridge:
         timeout_s: float = 600.0,
         protocol_text: str = "",
         standing_text: str = "",
+        sender: Sender | None = None,
+        permission: str | None = None,
     ) -> None:
         """Dispatch a work item into a persistent session and wait for its
         reply, then complete the A2A task. The event_id we send IS the A2A
-        task_id, so the reply correlates straight back."""
+        task_id, so the reply correlates straight back.
+
+        `permission` is None for the owner; for a contact it is the level
+        the session is launched (or relaunched) with."""
         mgr = self._session_mgr
         hub = self._channel_hub
         # Ensure (launch or resume) the work item's session. Trigger-kind
@@ -2267,6 +2347,8 @@ class Bridge:
             rec = await mgr.ensure_session(
                 work_item_key, self.ctx.name, title=title,
                 background=(kind == "trigger"),
+                permission=permission,
+                contact_label=sender.label if sender is not None and not sender.is_owner else "",
             )
         except Exception as e:
             logger.exception("Session launch failed for %s", work_item_key)
@@ -2300,10 +2382,14 @@ class Bridge:
                 wi_kind = "trigger"
             self._shipper.register(
                 rec.session_id,
-                cwd=mgr.policy(self.ctx.name).work_dir,
+                cwd=mgr.session_cwd(rec),
                 title=title,
                 work_item_kind=wi_kind,
                 work_item_id=work_item_key,
+                contact=(
+                    {"sender": sender.label, "permission": permission}
+                    if sender is not None and not sender.is_owner else None
+                ),
             )
 
         if rec.state != "ready":
@@ -2339,7 +2425,7 @@ class Bridge:
         # The session's Stop hook resolves this by reading the transcript;
         # registered before delivery so a fast turn cannot end before we are
         # listening for it.
-        work_dir = mgr.policy(self.ctx.name).work_dir
+        work_dir = mgr.session_cwd(rec)
         self._session_awaiting[rec.session_id] = {"task_id": task_id, "cwd": work_dir}
         try:
             # Two distinct failures, two distinct timeouts. Delivery either

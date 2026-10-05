@@ -29,14 +29,28 @@ import logging
 import os
 import pathlib
 import time
+import sys
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional
+
+from contacts import contacts_dir
 
 logger = logging.getLogger("session_manager")
 
 REPO_DIR = pathlib.Path(__file__).resolve().parent
 CHANNEL_SERVER = str(REPO_DIR / "channel" / "server.mjs")
+CHANNEL_SERVER_NAME = "society-ai-channel"
+
+# Env a contact session at chat/read must not inherit: the agent's platform
+# credential and identity. Those sessions get no Society AI tools, and nothing
+# in them should be able to act as the agent.
+CONTACT_STRIPPED_ENV = (
+    "SOCIETY_AI_AUTH_TOKEN", "AGENT_NAME", "COMPANY_ID", "SOCIETY_AI_BRIDGE_SOCKET",
+)
+
+# Built-in tools a contact session gets per level. `act` gets everything.
+CONTACT_TOOLS = {"chat": "", "read": "Read,Grep,Glob"}
 
 # How long to hold out for the channel banner before accepting a bare input
 # prompt as "ready". Channel load takes ~1-3s on a warm machine; this leaves
@@ -72,6 +86,9 @@ class PersonaPolicy:
     # MCP reads these from its environment, so they must be the agent's, not
     # whatever the user-scope MCP config falls back to.
     session_env: dict = field(default_factory=dict)
+    # Machine owner's cap on what this agent may do for ANY contact
+    # (chat | read | act). Local only: the platform can never raise it.
+    contact_permission_ceiling: str = "act"
 
 
 @dataclass
@@ -91,6 +108,10 @@ class SessionRecord:
     failure: str = ""                  # why the last launch did not reach ready,
                                        # in words the person who sent the message
                                        # can act on
+    permission: Optional[str] = None   # None = an owner session; otherwise the
+                                       # contact level it was launched with
+                                       # (chat | read | act)
+    contact_label: str = ""            # who the contact is, for titles and logs
 
 
 class SessionManager:
@@ -189,17 +210,28 @@ class SessionManager:
         *,
         title: str = "",
         background: bool = False,
+        permission: Optional[str] = None,
+        contact_label: str = "",
     ) -> SessionRecord:
         """Return a live session for the work item, launching or resuming as
-        needed. Concurrency-safe per work item."""
+        needed. Concurrency-safe per work item.
+
+        `permission` is None for the owner and the contact level otherwise.
+        A live session launched at a different level (the owner changed the
+        contact's permissions) is restarted with --resume, so the
+        conversation keeps its history under the new limits."""
         work_item_key = self.resolve(work_item_key)
         lock = self._launch_locks.setdefault(work_item_key, asyncio.Lock())
         async with lock:
             rec = self._sessions.get(work_item_key)
             if rec and rec.state == "ready" and await self._tmux_alive(rec.tmux_name):
-                rec.last_active = time.time()
-                rec.fresh_launch = False
-                return rec
+                if rec.permission == permission:
+                    rec.last_active = time.time()
+                    rec.fresh_launch = False
+                    return rec
+                logger.info("Permissions for %s changed (%s -> %s); relaunching",
+                            work_item_key[:40], rec.permission, permission)
+                await self._tmux_kill(rec.tmux_name)
 
             pol = self.policy(persona)
             await self._enforce_concurrency(persona)
@@ -216,6 +248,8 @@ class SessionManager:
                 self._sessions[work_item_key] = rec
             else:
                 rec.title = title or rec.title
+            rec.permission = permission
+            rec.contact_label = contact_label
 
             resume = rec.has_run_once
             rec.fresh_launch = not resume
@@ -237,42 +271,42 @@ class SessionManager:
     # -- launching ------------------------------------------------------------
 
     async def _launch(self, rec: SessionRecord, pol: PersonaPolicy, *, resume: bool) -> None:
-        self._write_workspace_config(rec, pol)
-
-        # Fresh launch sets the session id with --session-id; resume reopens
-        # it with --resume. The two flags are mutually exclusive — passing
-        # both with the same id makes the CLI exit immediately.
-        if resume:
-            cmd = ["claude", "--resume", rec.session_id]
+        if rec.permission is None:
+            cwd, cmd, env_set, env_unset = self._owner_command(rec, pol, resume)
         else:
-            cmd = ["claude", "--session-id", rec.session_id]
-        for d in pol.extra_dirs:
-            cmd += ["--add-dir", d]
-        if pol.permission_mode and pol.permission_mode != "default":
-            cmd += ["--permission-mode", pol.permission_mode]
-        # Background automation (wakes, schedules) never claims a Remote
-        # Control sidebar row — only user- and task-originated sessions do.
-        if pol.remote_control and not rec.background:
-            cmd += ["--remote-control", rec.title[:60]]
-        # Dev-flag loads our bare .mcp.json channel server during the research
-        # preview. A packaged plugin + --channels replaces this post-GA.
-        cmd += ["--dangerously-load-development-channels", "server:society-ai-channel"]
+            cwd, cmd, env_set, env_unset = self._contact_command(rec, pol, resume)
+        if rec.permission in CONTACT_TOOLS:
+            # Strict sessions load MCP servers only from --mcp-config, and the
+            # dev channel is found there.
+            cmd += ["--mcp-config", json.dumps(self._channel_mcp_config(rec))]
+        else:
+            # Without --strict-mcp-config the dev channel is only found among
+            # file-configured servers, so it lives in the folder's .mcp.json.
+            # That file is the same for every session in the folder: each
+            # launch passes its own key and hub socket in its environment
+            # (two sessions starting together used to overwrite each other's
+            # key in the file).
+            self._write_workspace_config(cwd)
+            env_set = {
+                **env_set,
+                "SOCIETY_AI_SESSION_KEY": rec.work_item_key,
+                "SOCIETY_AI_CHANNEL_SOCK": self._hub_sock,
+            }
+        # Dev-flag loads the channel server during the research preview. A
+        # packaged plugin + --channels replaces this post-GA.
+        cmd += ["--dangerously-load-development-channels", f"server:{CHANNEL_SERVER_NAME}"]
 
-        # Launch detached in tmux, cwd = persona work dir. Per-agent env is
-        # injected as inline assignments on the exec so the spawned claude
-        # (and its society-ai MCP) act as THIS agent, not whichever persona
-        # the user-scope MCP config falls back to.
-        cwd = pol.work_dir
-        # Marks the session as platform-driven. Hooks use it to drop output
-        # meant for a human at this terminal: whatever the session writes is
-        # now the response the platform sends back, so local-only furniture
-        # (the identity banner) would end up in the web app.
-        session_env = dict(pol.session_env or {})
-        session_env["SOCIETY_AI_DISPATCHED"] = "1"
-        env_prefix = "".join(
-            f"{k}={_shq(str(v))} " for k, v in session_env.items() if v
+        # Launch detached in tmux. Per-agent env is injected as inline
+        # assignments on the exec so the spawned claude (and its society-ai
+        # MCP) act as THIS agent, not whichever persona the user-scope MCP
+        # config falls back to. Contact sessions below act drop that env.
+        env_prefix = "".join(f"-u {k} " for k in env_unset)
+        env_prefix += "".join(f"{k}={_shq(str(v))} " for k, v in env_set.items() if v)
+        os.makedirs(cwd, exist_ok=True)
+        shell_cmd = (
+            f"cd {_shq(cwd)} && exec env {env_prefix}"
+            + " ".join(_shq(c) for c in cmd)
         )
-        shell_cmd = f"cd {_shq(cwd)} && {env_prefix}exec " + " ".join(_shq(c) for c in cmd)
         await self._tmux_kill(rec.tmux_name)  # idempotent
         proc = await asyncio.create_subprocess_exec(
             "tmux", "new-session", "-d", "-s", rec.tmux_name,
@@ -354,16 +388,97 @@ class SessionManager:
         detail = f": {lines[0]}" if lines else ""
         return f"`claude --version` failed with exit code {proc.returncode}{detail}"
 
-    def _write_workspace_config(self, rec: SessionRecord, pol: PersonaPolicy) -> None:
-        """Write .mcp.json (channel server with this session's key) + project
-        settings (enable the channel, pre-seed permission allow-rules) into
-        the persona's work dir."""
-        wd = pathlib.Path(pol.work_dir)
-        wd.mkdir(parents=True, exist_ok=True)
+    def session_cwd(self, rec: SessionRecord) -> str:
+        """The folder a session runs in, which is also where Claude Code
+        keeps its transcript."""
+        if rec.permission is None:
+            return self.policy(rec.persona).work_dir
+        return contacts_dir(rec.persona)
 
-        mcp = {
+    def _session_flags(self, rec: SessionRecord, pol: PersonaPolicy, resume: bool) -> list[str]:
+        # Fresh launch sets the session id with --session-id; resume reopens
+        # it with --resume. The two flags are mutually exclusive — passing
+        # both with the same id makes the CLI exit immediately.
+        cmd = ["claude", "--resume" if resume else "--session-id", rec.session_id]
+        # Background automation (wakes, schedules) never claims a Remote
+        # Control sidebar row — only user-, contact- and task-originated
+        # sessions do.
+        if pol.remote_control and not rec.background:
+            cmd += ["--remote-control", rec.title[:60]]
+        return cmd
+
+    def _owner_command(self, rec: SessionRecord, pol: PersonaPolicy, resume: bool):
+        cmd = self._session_flags(rec, pol, resume)
+        for d in pol.extra_dirs:
+            cmd += ["--add-dir", d]
+        if pol.permission_mode and pol.permission_mode != "default":
+            cmd += ["--permission-mode", pol.permission_mode]
+        # Marks the session as platform-driven. Hooks use it to drop output
+        # meant for a human at this terminal: whatever the session writes is
+        # now the response the platform sends back, so local-only furniture
+        # (the identity banner) would end up in the web app.
+        env = dict(pol.session_env or {})
+        env["SOCIETY_AI_DISPATCHED"] = "1"
+        return pol.work_dir, cmd, env, ()
+
+    def _contact_command(self, rec: SessionRecord, pol: PersonaPolicy, resume: bool):
+        """A session working on a contact's request. All of an agent's
+        contact sessions share one empty folder, so they group under a
+        single directory in the Claude Code sidebar.
+
+        chat / read: --restricted (no command-running tools, user/project
+        settings and memory ignored, file tools confined to the working
+        folders), an explicit built-in tool list, only the channel MCP server
+        (no Society AI tools), dontAsk so nothing can stall on a prompt, and
+        no agent credential in the environment. The bridge's reply path
+        hooks come in through --settings, because --restricted ignores the
+        user settings they normally live in.
+
+        act: the owner's toolset, working in the agent's folders."""
+        cmd = self._session_flags(rec, pol, resume)
+        work_dirs = [pol.work_dir, *pol.extra_dirs]
+        if rec.permission == "act":
+            for d in work_dirs:
+                cmd += ["--add-dir", d]
+            if pol.permission_mode and pol.permission_mode != "default":
+                cmd += ["--permission-mode", pol.permission_mode]
+            env = dict(pol.session_env or {})
+            env["SOCIETY_AI_DISPATCHED"] = "1"
+            return contacts_dir(pol.name), cmd, env, ()
+
+        cmd += [
+            "--restricted",
+            "--tools", CONTACT_TOOLS[rec.permission],
+            "--strict-mcp-config",
+            "--permission-mode", "dontAsk",
+            "--settings", json.dumps(self._reply_hook_settings()),
+        ]
+        if rec.permission == "read":
+            for d in work_dirs:
+                cmd += ["--add-dir", d]
+        return contacts_dir(pol.name), cmd, {"SOCIETY_AI_DISPATCHED": "1"}, CONTACT_STRIPPED_ENV
+
+    @staticmethod
+    def _reply_hook_settings() -> dict:
+        """Only the hooks the reply path needs: Stop (a turn ended: ship the
+        transcript and hand the reply back) and UserPromptSubmit (mirror the
+        prompt early). Mirror-only: the owner's task reminders and identity
+        banner never reach a contact session."""
+        py = _shq(sys.executable)
+
+        def hook(script: str, *args: str) -> list:
+            command = " ".join([py, _shq(str(REPO_DIR / script)), *args])
+            return [{"hooks": [{"type": "command", "command": command, "timeout": 5}]}]
+
+        return {"hooks": {
+            "Stop": hook("hook_stop.py", "--mirror-only"),
+            "UserPromptSubmit": hook("hook_user_prompt.py"),
+        }}
+
+    def _channel_mcp_config(self, rec: SessionRecord) -> dict:
+        return {
             "mcpServers": {
-                "society-ai-channel": {
+                CHANNEL_SERVER_NAME: {
                     "command": "node",
                     "args": [CHANNEL_SERVER],
                     "env": {
@@ -373,12 +488,31 @@ class SessionManager:
                 }
             }
         }
+
+    def _write_workspace_config(self, cwd: str) -> None:
+        """Register the channel server in the folder's .mcp.json (key and hub
+        socket expanded from each session's environment), enable it without
+        a prompt, and pre-seed permission allow-rules."""
+        wd = pathlib.Path(cwd)
+        wd.mkdir(parents=True, exist_ok=True)
+        mcp = {
+            "mcpServers": {
+                CHANNEL_SERVER_NAME: {
+                    "command": "node",
+                    "args": [CHANNEL_SERVER],
+                    "env": {
+                        "SOCIETY_AI_CHANNEL_SOCK": "${SOCIETY_AI_CHANNEL_SOCK}",
+                        "SOCIETY_AI_SESSION_KEY": "${SOCIETY_AI_SESSION_KEY}",
+                    },
+                }
+            }
+        }
         _merge_json(wd / ".mcp.json", mcp, list_keys=())
 
         claude_dir = wd / ".claude"
         claude_dir.mkdir(exist_ok=True)
         settings = {
-            "enabledMcpjsonServers": ["society-ai-channel"],
+            "enabledMcpjsonServers": [CHANNEL_SERVER_NAME],
             "permissions": {"allow": list(DEFAULT_ALLOW)},
         }
         _merge_json(claude_dir / "settings.local.json", settings,
@@ -418,7 +552,13 @@ class SessionManager:
                 await asyncio.sleep(1.0)
                 continue
             if "trust" in low and ("yes, i trust" in low or "do you trust" in low):
-                await self._tmux_send(tmux_name, "", enter=True)  # default = trust
+                # Normally the highlighted default is "trust"; in --restricted
+                # mode it is "No, exit". Move off it before confirming.
+                cursor = next((ln for ln in pane.splitlines() if "❯" in ln), "").lower()
+                if "no" in cursor and "trust" not in cursor:
+                    await self._tmux_send(tmux_name, "Down")
+                    await asyncio.sleep(0.3)
+                await self._tmux_send(tmux_name, "", enter=True)
                 await asyncio.sleep(1.0)
                 continue
             if "loading development channels" in low and "local development" in low:
@@ -491,7 +631,7 @@ class SessionManager:
             from transcript_shipper import transcript_path
 
             mtime = os.path.getmtime(
-                transcript_path(self.policy(rec.persona).work_dir, rec.session_id)
+                transcript_path(self.session_cwd(rec), rec.session_id)
             )
         except (OSError, Exception):
             return False
@@ -621,3 +761,4 @@ def _merge_json(path: pathlib.Path, additions: dict, *, list_keys=(), nested_lis
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(out, indent=2))
     os.replace(tmp, path)
+

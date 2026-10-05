@@ -128,6 +128,10 @@ def _fetch_in_progress(api_url: str, token: str, agent_name: str) -> list[dict[s
 
 def main() -> int:
     _notify_mirrors(_read_hook_input())
+    # Contact sessions run this hook with --mirror-only: the reply path needs
+    # the notify, but the owner's task reminders must not reach a contact.
+    if "--mirror-only" in sys.argv[1:]:
+        return 0
 
     personas = discover_personas()
     if not personas:

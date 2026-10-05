@@ -63,7 +63,9 @@ def transcript_path(cwd: str, session_id: str) -> pathlib.Path:
     """Path of a session's local transcript. Claude Code munges the cwd by
     replacing every non-alphanumeric character with '-'
     (/Users/x/.claude → -Users-x--claude)."""
-    munged = re.sub(r"[^A-Za-z0-9]", "-", os.path.abspath(cwd))
+    # Claude Code files transcripts under the PHYSICAL cwd (getcwd resolves
+    # symlinks: /tmp -> /private/tmp), so resolve before munging.
+    munged = re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(cwd))
     return _PROJECTS_DIR / munged / f"{session_id}.jsonl"
 
 
@@ -204,6 +206,7 @@ class TranscriptShipper:
         title: str = "",
         work_item_kind: Optional[str] = None,
         work_item_id: Optional[str] = None,
+        contact: Optional[dict] = None,
     ) -> None:
         """Mark a session as bridge-owned and shippable. Idempotent; metadata
         refreshes on every call (a resume can update the title)."""
@@ -217,6 +220,11 @@ class TranscriptShipper:
             rec["work_item_kind"] = work_item_kind
         if work_item_id:
             rec["work_item_id"] = str(work_item_id)[:255]
+        if contact:
+            # Who a contact session works for and at which level, so the
+            # Sessions list can label it.
+            rec["contact_sender"] = str(contact.get("sender") or "")[:255]
+            rec["contact_permission"] = str(contact.get("permission") or "")[:16]
         self._prune()
         self._save_state()
 
@@ -375,7 +383,7 @@ class TranscriptShipper:
             "cwd": meta.get("cwd"),
             "entries": entries,
         }
-        for k in ("title", "work_item_kind", "work_item_id"):
+        for k in ("title", "work_item_kind", "work_item_id", "contact_sender", "contact_permission"):
             if meta.get(k):
                 body[k] = meta[k]
         if status:
