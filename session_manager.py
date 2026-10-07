@@ -88,7 +88,7 @@ class PersonaPolicy:
     session_env: dict = field(default_factory=dict)
     # Machine owner's cap on what this agent may do for ANY contact
     # (chat | read | act). Local only: the platform can never raise it.
-    contact_permission_ceiling: str = "act"
+    contact_permission_limit: str = "act"
 
 
 @dataclass

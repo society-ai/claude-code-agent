@@ -50,7 +50,7 @@ AGENT_SCHEMA = [
      "help": "The agent's main folder — where it starts and works by default."},
     {"key": "EXTRA_DIRS", "label": "Also has access to", "type": "paths",
      "help": "Extra folders it may read and write, beyond its main folder."},
-    {"key": "CONTACT_PERMISSION_CEILING", "label": "Most it may do for contacts", "type": "enum",
+    {"key": "CONTACT_PERMISSION_LIMIT", "label": "Most it may do for contacts", "type": "enum",
      "enum": ["chat", "read", "act"], "default": "act",
      "help": "A cap on this computer for every contact, whatever you set in Society AI. chat = reply only, no tools. read = also read and search its folders. act = everything, as for you. Each contact's own level is set in the agent's Contacts tab in Society AI."},
     {"key": "COMPANY_ID", "label": "Default company", "type": "str", "advanced": True,

@@ -19,7 +19,7 @@ dispatch's `user_id` (pinned by the router from authentication) to match the
 owner id it learned at login before treating anything as the owner. Anything
 it cannot classify is a contact at `chat`.
 
-The level is a ceiling, not an instruction. The agent is told who the sender
+The level is an upper limit, not an instruction. The agent is told who the sender
 is and what it may do, and decides within that; the session's hard limits
 make sure a request that talks the agent into more still cannot get it.
 """
@@ -42,7 +42,7 @@ DEFAULT_PERMISSION = "chat"
 PRIVATE_BLOCK_KINDS = frozenset({"activity", "scope"})
 
 # What the agent is told about the hard limit actually applied on this
-# machine (the machine ceiling can make it lower than the platform's level).
+# machine (the machine limit can make it lower than the platform's level).
 LIMIT_TEXT = {
     "chat": (
         "In this conversation you cannot use any tools, files or commands. "
@@ -60,11 +60,11 @@ LIMIT_TEXT = {
 }
 
 
-def clamp(level: Optional[str], ceiling: Optional[str]) -> str:
-    """The lower of `level` and the machine `ceiling`. Unknown or missing
-    values fall back to chat (level) and act (ceiling: no extra cap)."""
+def clamp(level: Optional[str], limit: Optional[str]) -> str:
+    """The lower of `level` and the machine `limit`. Unknown or missing
+    values fall back to chat (level) and act (limit: no extra cap)."""
     lvl = level if level in PERMISSION_LEVELS else DEFAULT_PERMISSION
-    cap = ceiling if ceiling in PERMISSION_LEVELS else "act"
+    cap = limit if limit in PERMISSION_LEVELS else "act"
     return PERMISSION_LEVELS[min(PERMISSION_LEVELS.index(lvl), PERMISSION_LEVELS.index(cap))]
 
 

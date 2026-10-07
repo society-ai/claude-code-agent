@@ -113,9 +113,9 @@ def apply_local_env(policy: PersonaPolicy, persona: str) -> None:
         policy.permission_mode = pm
     # Local only, never taken from the platform: the machine owner's cap on
     # what this agent may do for any contact.
-    ceiling = (_env(persona, "CONTACT_PERMISSION_CEILING") or "").lower()
-    if ceiling in ("chat", "read", "act"):
-        policy.contact_permission_ceiling = ceiling
+    limit = (_env(persona, "CONTACT_PERMISSION_LIMIT") or "").lower()
+    if limit in ("chat", "read", "act"):
+        policy.contact_permission_limit = limit
 
 
 async def resolve_policy(

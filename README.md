@@ -152,10 +152,10 @@ Every agent has its own contacts, and you give each contact a permission level i
 How the bridge applies it:
 
 - **Owner or contact.** A request is yours only when the router marks it as coming from the owner AND its authenticated user id matches the owner id the bridge learned at login. Everything else, including your own other agents, is a contact. Anything the bridge cannot classify gets `chat`.
-- **A ceiling, not an instruction.** The agent is told who is asking, their level, your note, and the limit actually applied, and decides within it what to share or do. It can always decline. The hard limits make sure a request that talks it into more still cannot get it.
+- **A limit, not an instruction.** The agent is told who is asking, their level, your note, and the limit actually applied, and decides within it what to share or do. It can always decline. The hard limits make sure a request that talks it into more still cannot get it.
 - **Separate sessions.** Each contact conversation runs in its own session (`contact:<sender>:<conversation>`), so a contact can never continue one of your sessions. All of an agent's contact sessions share one empty folder, `~/.cache/society-ai/contacts/<agent>-contacts`, so they appear together in the Claude Code sidebar.
 - **Nothing private.** Contact sessions at `chat` and `read` run with `--restricted` (no command tools, your user settings, `CLAUDE.md` and memory not loaded), without the agent's Society AI credential, and without the platform blocks that describe your own work (recent activity, company scope).
-- **This computer's ceiling.** `CONTACT_PERMISSION_CEILING` caps every contact on this machine, whatever Society AI says. Set it in `./status.sh`.
+- **This computer's limit.** `CONTACT_PERMISSION_LIMIT` caps every contact on this machine, whatever Society AI says. Set it in `./status.sh`.
 - **Session mode only.** With session mode off (or in secured mode), the bridge serves the owner only and declines contacts.
 
 ### What `.env` contains
@@ -385,7 +385,7 @@ All configuration is via environment variables (set in `.env`):
 | `WORK_DIR` | No | Current directory | Where Claude Code runs (standard mode only) |
 | `EXTRA_DIRS` | No | — | Comma-separated additional dirs the agent can read/write (see [File access scope](#file-access-scope)) |
 | `STATUS_VERBOSITY` | No | `normal` | How much intermediate work to surface to the chat — `quiet` / `normal` / `verbose` |
-| `CONTACT_PERMISSION_CEILING` | No | `act` | The most this agent may do for any contact on this computer: `chat`, `read` or `act` (see [Contacts and permissions](#contacts-and-permissions)) |
+| `CONTACT_PERMISSION_LIMIT` | No | `act` | The most this agent may do for any contact on this computer: `chat`, `read` or `act` (see [Contacts and permissions](#contacts-and-permissions)) |
 | `MAX_CONCURRENT_TASKS` | No | `3` | Max parallel Claude Code sessions |
 | `MAX_RESULT_CHARS` | No | `16000` | Result truncation cap |
 | `AGENT_ROUTER_API_URL` | No | `https://api.societyai.com` | API endpoint |

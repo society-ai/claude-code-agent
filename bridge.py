@@ -82,6 +82,11 @@ logger = logging.getLogger("bridge")
 
 WORK_DIR = os.getenv("WORK_DIR", os.getcwd())
 HEARTBEAT_INTERVAL = 60  # seconds (hub timeout is 90s)
+# How long a fresh connection may wait for the hub to accept our
+# registration. Heartbeats only run once registered, so without this a
+# registration the hub never answers leaves the agent connected but
+# unreachable indefinitely (seen 2026-10-07: jenkins sat 7 hours like that).
+REGISTRATION_TIMEOUT_S = 30
 MAX_RECONNECT_DELAY = 60
 MAX_CONCURRENT_TASKS = max(1, int(os.getenv("MAX_CONCURRENT_TASKS", "3")))
 MAX_TRACKED_SESSIONS = 1000  # cap history/lock maps to prevent memory leak
@@ -796,11 +801,11 @@ class Bridge:
                     "request will be handled as a contact at 'chat'"
                 )
 
-    def _contact_ceiling(self) -> str:
+    def _contact_limit(self) -> str:
         """The machine owner's cap for every contact (chat | read | act)."""
         if self._session_mgr is not None:
-            return self._session_mgr.policy(self.ctx.name).contact_permission_ceiling
-        return os.getenv("CONTACT_PERMISSION_CEILING", "act").strip() or "act"
+            return self._session_mgr.policy(self.ctx.name).contact_permission_limit
+        return os.getenv("CONTACT_PERMISSION_LIMIT", "act").strip() or "act"
 
     async def register(self):
         """Register this agent with the hub using the WS JWT."""
@@ -817,13 +822,24 @@ class Bridge:
             "adapter_version": __version__,
             # Lets the Contacts tab show "limited on this computer". The
             # bridge enforces it whatever the platform stores.
-            "contact_permission_ceiling": self._contact_ceiling(),
+            "contact_permission_limit": self._contact_limit(),
         }
         framework_version = await claude_cli_version_async()
         if framework_version:
             # Omitted entirely when undetectable — never send an empty string.
             params["framework_version"] = framework_version
         await self.send_rpc("agent.register", params, msg_id=self._next_id())
+
+    async def _registration_watchdog(self, ws) -> None:
+        """Drop a connection the hub has not accepted within
+        REGISTRATION_TIMEOUT_S, so the reconnect loop tries again."""
+        await asyncio.sleep(REGISTRATION_TIMEOUT_S)
+        if not self._conn_registered and self.ws is ws:
+            logger.error(
+                "Hub did not answer registration within %ds; reconnecting",
+                REGISTRATION_TIMEOUT_S,
+            )
+            await ws.close()
 
     # -- Heartbeat -----------------------------------------------------------
 
@@ -1141,10 +1157,10 @@ class Bridge:
 
         # Who sent this: the owner, or a contact with a permission level.
         # A contact never sees the owner's private standing blocks, and its
-        # level is capped by this machine's ceiling.
+        # level is capped by this machine's limit.
         sender = classify_sender(frame, metadata, self._owner_user_id)
         if not sender.is_owner:
-            sender = replace(sender, permission=clamp(sender.permission, self._contact_ceiling()))
+            sender = replace(sender, permission=clamp(sender.permission, self._contact_limit()))
             metadata = strip_private_blocks(metadata)
 
         # Send-as-supervisor (legacy path only): the platform relays a
@@ -1259,7 +1275,7 @@ class Bridge:
                         if not sender.is_owner:
                             # The agent learns what it may actually do here,
                             # on every request: the level can change between
-                            # messages, and the machine ceiling can make it
+                            # messages, and the machine limit can make it
                             # lower than what the platform says.
                             content = limit_line(sender) + "\n\n" + content
                             title = f"{sender.label}: {title}"
@@ -2597,6 +2613,9 @@ class Bridge:
 
                     # Start heartbeat
                     heartbeat = asyncio.create_task(self.heartbeat_loop())
+                    registration_watchdog = asyncio.create_task(
+                        self._registration_watchdog(ws)
+                    )
 
                     try:
                         async for raw in ws:
@@ -2604,11 +2623,12 @@ class Bridge:
                     except ConnectionClosed as e:
                         logger.warning("Connection closed: %s", e)
                     finally:
-                        heartbeat.cancel()
-                        try:
-                            await heartbeat
-                        except (asyncio.CancelledError, Exception):
-                            pass
+                        for task in (heartbeat, registration_watchdog):
+                            task.cancel()
+                            try:
+                                await task
+                            except (asyncio.CancelledError, Exception):
+                                pass
                         self.ws = None
                         self.registered = False
                         # Anything waiting on a pending IPC reply must be
