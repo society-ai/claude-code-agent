@@ -63,7 +63,8 @@ def default_policy(persona: str, work_dir: str, extra_dirs: list[str]) -> Person
         remote_control=True,     # default-on: a visible workforce
         keep_alive=False,        # ephemeral task sessions by default
         idle_reap_minutes=15,
-        max_concurrent=3,
+        max_concurrent=10,       # open sessions kept per agent; idle ones close
+                                 # after idle_reap_minutes anyway
         permission_mode="bypassPermissions",  # self-hosted autonomous agent
     )
 
@@ -108,6 +109,7 @@ def apply_local_env(policy: PersonaPolicy, persona: str) -> None:
     policy.keep_alive = _as_bool(_env(persona, "KEEP_ALIVE"), policy.keep_alive)
     policy.idle_reap_minutes = _as_int(_env(persona, "IDLE_REAP_MINUTES"), policy.idle_reap_minutes)
     policy.max_concurrent = _as_int(_env(persona, "MAX_CONCURRENT"), policy.max_concurrent)
+    policy.display_name = _env(persona, "DISPLAY_NAME") or policy.display_name
     pm = _env(persona, "PERMISSION_MODE")
     if pm:
         policy.permission_mode = pm

@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import base64
 import json
-import os
 import re
 from dataclasses import dataclass
 from typing import Optional
@@ -90,14 +89,9 @@ def classify_sender(frame: Optional[dict], metadata: dict, owner_id: Optional[st
 
     Owner requires BOTH: the router says so (`frame.from.kind == "owner"`) and
     the dispatch's `user_id` equals the owner id from our login. A label
-    alone is never enough.
-
-    Routers that predate contact permissions send no `permission` and no
-    `conversation_id`. For those, a dispatch carrying the owner's `user_id`
-    is still the owner (that router has no other way to say so for the
-    owner's own agents, supervisor relays and task triggers); everyone else
-    is a contact at chat. The fallback switches itself off once the router
-    sends the new fields.
+    alone is never enough, and a matching user id alone is not either: the
+    owner's own agents and supervisor carry the owner's user id but are
+    contacts with their own permission level.
     """
     user_id = str(metadata.get("user_id") or "").strip()
     owner_match = bool(owner_id) and user_id == owner_id
@@ -107,10 +101,6 @@ def classify_sender(frame: Optional[dict], metadata: dict, owner_id: Optional[st
     kind = str(frm.get("kind") or "")
 
     if kind == "owner" and owner_match:
-        return OWNER
-
-    new_router = "permission" in frm or bool(isinstance(frame, dict) and frame.get("conversation_id"))
-    if not new_router and owner_match:
         return OWNER
 
     name = str(frm.get("name") or "").strip()
@@ -158,17 +148,6 @@ def strip_private_blocks(metadata: dict) -> dict:
 
 def limit_line(sender: Sender) -> str:
     return f"[Your limits for this request from {sender.label}]\n{LIMIT_TEXT[sender.permission]}"
-
-
-def contacts_dir(agent_name: str) -> str:
-    """The one working folder all of an agent's contact sessions share, so
-    they group under a single directory in the Claude Code sidebar. It stays
-    empty: chat and read sessions cannot write, and act sessions work in the
-    agent's own folders."""
-    return os.path.join(
-        os.path.expanduser("~"), ".cache", "society-ai", "contacts",
-        f"{_safe_key_part(agent_name)}-contacts",
-    )
 
 
 def owner_id_from_jwt(jwt: Optional[str]) -> Optional[str]:

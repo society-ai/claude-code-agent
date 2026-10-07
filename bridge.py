@@ -2032,6 +2032,25 @@ class Bridge:
             "sessions": sessions,
         }
 
+    async def ipc_reopen_session(self, params: dict) -> dict:
+        """Relaunch a closed session with its history (and its Remote Control
+        entry) without sending it anything. The panel's Reopen button."""
+        key = str(params.get("work_item_key") or "").strip()
+        if not key:
+            return {"error": True, "message": "work_item_key is required"}
+        if self._session_mgr is None:
+            return {"error": True, "message": "session mode is not enabled"}
+        if self._session_mgr.get(key) is None:
+            return {"error": True, "message": f"no session for {key}"}
+        try:
+            rec = await self._session_mgr.reopen(key)
+        except Exception as e:
+            logger.warning("reopen of %s failed: %s", key, e)
+            return {"error": True, "message": str(e)}
+        if rec.state != "ready":
+            return {"error": True, "message": rec.failure or "the session did not start"}
+        return {"reopened": True, "work_item_key": rec.work_item_key}
+
     async def ipc_reap_session(self, params: dict) -> dict:
         """Reap (kill + ship-ended) a single live session by work-item key.
         Lets the panel clear a stuck session without restarting the bridge."""
@@ -2756,6 +2775,7 @@ def main():
             "mirror_notify": bridge.ipc_mirror_notify,
             "status": bridge.ipc_status,
             "reap_session": bridge.ipc_reap_session,
+            "reopen_session": bridge.ipc_reopen_session,
         },
         path=ctx.socket,
     )

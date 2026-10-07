@@ -28,19 +28,33 @@ import json
 import logging
 import os
 import pathlib
-import time
+import re
+import subprocess
 import sys
+import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Optional
-
-from contacts import contacts_dir
 
 logger = logging.getLogger("session_manager")
 
 REPO_DIR = pathlib.Path(__file__).resolve().parent
 CHANNEL_SERVER = str(REPO_DIR / "channel" / "server.mjs")
 CHANNEL_SERVER_NAME = "society-ai-channel"
+
+# Every agent's sessions start in its own folder under ~/Society AI. Claude
+# Code's sidebar (desktop app, claude.ai/code) groups Remote Control sessions
+# by the git remote's repository name, so each agent folder is a git repo
+# whose placeholder remote is named after the agent: its sessions then show
+# under the agent's name instead of "Other". The remote is never pushed to
+# and does not need to exist.
+SOCIETY_AI_HOME = pathlib.Path.home() / "Society AI"
+AGENT_REMOTE_BASE = "https://societyai.com/agents/"
+AGENT_FOLDER_MARKER = ".society-ai-agent"
+
+# Closed sessions the bridge remembers (so a later message resumes them with
+# their history, and the panel can reopen them), newest first.
+MAX_REMEMBERED_SESSIONS = 500
 
 # Env a contact session at chat/read must not inherit: the agent's platform
 # credential and identity. Those sessions get no Society AI tools, and nothing
@@ -79,13 +93,15 @@ class PersonaPolicy:
     remote_control: bool = True
     keep_alive: bool = False           # supervisor / warm primaries
     idle_reap_minutes: int = 15
-    max_concurrent: int = 3
+    max_concurrent: int = 10
     permission_mode: str = "default"   # 'default' | 'acceptEdits' | 'bypassPermissions'
     # Per-agent environment injected into each spawned `claude` session so it
     # acts as THIS agent (token, name, IPC socket): the session's society-ai
     # MCP reads these from its environment, so they must be the agent's, not
     # whatever the user-scope MCP config falls back to.
     session_env: dict = field(default_factory=dict)
+    # Names the agent's folder and its sidebar group ("" = the agent name).
+    display_name: str = ""
     # Machine owner's cap on what this agent may do for ANY contact
     # (chat | read | act). Local only: the platform can never raise it.
     contact_permission_limit: str = "act"
@@ -112,6 +128,15 @@ class SessionRecord:
                                        # contact level it was launched with
                                        # (chat | read | act)
     contact_label: str = ""            # who the contact is, for titles and logs
+    cwd: str = ""                      # the folder it first launched in; a resume
+                                       # must use the same one (Claude Code files
+                                       # transcripts by folder)
+
+# Fields saved to disk; the rest is per-process runtime state.
+_REMEMBERED_FIELDS = (
+    "work_item_key", "persona", "session_id", "tmux_name", "title", "last_active",
+    "has_run_once", "background", "permission", "contact_label", "cwd",
+)
 
 
 class SessionManager:
@@ -120,6 +145,12 @@ class SessionManager:
         self._sessions: dict[str, SessionRecord] = {}
         self._aliases: dict[str, str] = {}  # alias key -> canonical work_item_key
         self._policies: dict[str, PersonaPolicy] = {}
+        self._agent_dirs: dict[str, pathlib.Path] = {}
+        # Which work item each Claude session belongs to, kept across bridge
+        # restarts: without it, a message after a restart opened a fresh
+        # session and lost the conversation's history.
+        self._registry_path = pathlib.Path(hub_sock_path).with_name("sessions.json")
+        self._load_registry()
         self._launch_locks: dict[str, asyncio.Lock] = {}
         self._reaper_task: Optional[asyncio.Task] = None
         # process-machine one-time flags
@@ -166,12 +197,13 @@ class SessionManager:
         Claude Code session instead of opening a new one."""
         if alias_key and alias_key != canonical_key:
             self._aliases[alias_key] = canonical_key
+            self._save_registry()
 
     def get(self, work_item_key: str) -> Optional[SessionRecord]:
         return self._sessions.get(self.resolve(work_item_key))
 
     def snapshot(self) -> list[dict]:
-        """Read-only view of live sessions for the local status panel.
+        """Read-only view of sessions for the local status panel.
 
         Returns one dict per tracked session (newest activity first). No
         transcript content — only the operational shape (what's running,
@@ -194,9 +226,15 @@ class SessionManager:
                 "tmux": rec.tmux_name,
                 "idle_seconds": int(now - rec.last_active),
                 "aliases": alias_by_canonical.get(rec.work_item_key, []),
+                "contact": rec.contact_label,
+                "permission": rec.permission,
             })
         rows.sort(key=lambda r: r["idle_seconds"])
-        return rows
+        # Every open session, plus the most recent closed ones (the registry
+        # remembers hundreds; the panel only needs enough to reopen).
+        open_rows = [r for r in rows if r["state"] in ("ready", "starting")]
+        closed_rows = [r for r in rows if r["state"] not in ("ready", "starting")]
+        return open_rows + closed_rows[:30]
 
     def touch(self, work_item_key: str) -> None:
         rec = self._sessions.get(self.resolve(work_item_key))
@@ -251,10 +289,67 @@ class SessionManager:
             rec.permission = permission
             rec.contact_label = contact_label
 
-            resume = rec.has_run_once
+            resume = rec.has_run_once and self._has_history(rec)
             rec.fresh_launch = not resume
-            await self._launch(rec, pol, resume=resume)
+            try:
+                await self._launch(rec, pol, resume=resume)
+            finally:
+                self._save_registry()
             return rec
+
+    def _has_history(self, rec: SessionRecord) -> bool:
+        """Whether Claude Code saved any conversation for this session. A
+        session closed before its first message has none, and --resume of
+        it exits at once; it starts fresh under the same id instead."""
+        from transcript_shipper import transcript_path
+        return transcript_path(self.session_cwd(rec), rec.session_id).exists()
+
+    async def reopen(self, work_item_key: str) -> SessionRecord:
+        """Bring a closed session back with its history, visible in the
+        sidebar, without sending it anything. The owner's explicit choice,
+        so even an automation session gets a Remote Control entry."""
+        rec = self.get(work_item_key)
+        if rec is None:
+            raise KeyError(work_item_key)
+        rec.background = False
+        return await self.ensure_session(
+            rec.work_item_key, rec.persona, title=rec.title,
+            permission=rec.permission, contact_label=rec.contact_label,
+        )
+
+    # -- remembered sessions --------------------------------------------------
+
+    def _load_registry(self) -> None:
+        try:
+            data = json.loads(self._registry_path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return
+        for row in data.get("sessions") or []:
+            try:
+                rec = SessionRecord(**{k: row[k] for k in _REMEMBERED_FIELDS if k in row})
+            except TypeError:
+                continue
+            rec.state = "closed"  # nothing survives a bridge restart
+            self._sessions[rec.work_item_key] = rec
+        aliases = data.get("aliases")
+        if isinstance(aliases, dict):
+            self._aliases.update({str(k): str(v) for k, v in aliases.items()})
+
+    def _save_registry(self) -> None:
+        recs = sorted(self._sessions.values(), key=lambda r: r.last_active, reverse=True)
+        recs = [r for r in recs if r.has_run_once][:MAX_REMEMBERED_SESSIONS]
+        keep = {r.work_item_key for r in recs}
+        payload = {
+            "sessions": [{k: asdict(r)[k] for k in _REMEMBERED_FIELDS} for r in recs],
+            "aliases": {a: c for a, c in self._aliases.items() if c in keep},
+        }
+        try:
+            self._registry_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._registry_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload, indent=1))
+            os.replace(tmp, self._registry_path)
+        except OSError as e:
+            logger.warning("Could not save the session registry: %s", e)
 
     async def reap(self, work_item_key: str) -> None:
         rec = self._sessions.get(self.resolve(work_item_key))
@@ -262,6 +357,7 @@ class SessionManager:
             return
         await self._tmux_kill(rec.tmux_name)
         rec.state = "reaped"
+        self._save_registry()
         if self.on_reap is not None:
             try:
                 await self.on_reap(rec)
@@ -275,6 +371,9 @@ class SessionManager:
             cwd, cmd, env_set, env_unset = self._owner_command(rec, pol, resume)
         else:
             cwd, cmd, env_set, env_unset = self._contact_command(rec, pol, resume)
+        if resume and rec.cwd:
+            cwd = rec.cwd  # Claude Code finds a session's history by its folder
+        rec.cwd = cwd
         if rec.permission in CONTACT_TOOLS:
             # Strict sessions load MCP servers only from --mcp-config, and the
             # dev channel is found there.
@@ -359,7 +458,7 @@ class SessionManager:
             return ("Claude Code did not finish starting within 2 minutes. "
                     "The bridge log has the last screen it showed.")
         return ("Claude Code exited right after starting. Run `claude` in "
-                f"{pol.work_dir} to see the error.")
+                f"{self.session_cwd(rec)} to see the error.")
 
     async def _claude_cli_problem(self, pol: PersonaPolicy) -> str:
         """Run `claude --version` the way a session runs `claude`: same PATH,
@@ -390,10 +489,35 @@ class SessionManager:
 
     def session_cwd(self, rec: SessionRecord) -> str:
         """The folder a session runs in, which is also where Claude Code
-        keeps its transcript."""
-        if rec.permission is None:
-            return self.policy(rec.persona).work_dir
-        return contacts_dir(rec.persona)
+        keeps its transcript. A session keeps the folder it first launched
+        in for life."""
+        if rec.cwd:
+            return rec.cwd
+        agent_dir = self.agent_dir(rec.persona)
+        return str(agent_dir if rec.permission is None else agent_dir / "contacts")
+
+    def agent_dir(self, persona: str) -> pathlib.Path:
+        """~/Society AI/<display name>: where the agent's sessions start, set
+        up so its sessions group under its name in the Claude Code sidebar.
+        Created on first use; a marker file records which agent owns it, so
+        two agents with the same display name never share a folder."""
+        cached = self._agent_dirs.get(persona)
+        if cached is not None:
+            return cached
+        pol = self.policy(persona)
+        name = re.sub(r'[\x00-\x1f/\\:*?"<>|]+', "-", pol.display_name or persona).strip(" .-") or persona
+        path = SOCIETY_AI_HOME / name
+        marker = path / AGENT_FOLDER_MARKER
+        if marker.exists() and marker.read_text().strip() != persona:
+            name = f"{name} ({persona})"
+            path = SOCIETY_AI_HOME / name
+            marker = path / AGENT_FOLDER_MARKER
+        (path / "contacts").mkdir(parents=True, exist_ok=True)
+        if not marker.exists():
+            marker.write_text(persona + "\n")
+        _ensure_group_remote(path, re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-") or persona)
+        self._agent_dirs[persona] = path
+        return path
 
     def _session_flags(self, rec: SessionRecord, pol: PersonaPolicy, resume: bool) -> list[str]:
         # Fresh launch sets the session id with --session-id; resume reopens
@@ -408,8 +532,11 @@ class SessionManager:
         return cmd
 
     def _owner_command(self, rec: SessionRecord, pol: PersonaPolicy, resume: bool):
+        """The owner's session starts in the agent's folder (so it groups
+        under the agent in the sidebar) with full access to its work
+        folders, whose CLAUDE.md instructions still load."""
         cmd = self._session_flags(rec, pol, resume)
-        for d in pol.extra_dirs:
+        for d in [pol.work_dir, *pol.extra_dirs]:
             cmd += ["--add-dir", d]
         if pol.permission_mode and pol.permission_mode != "default":
             cmd += ["--permission-mode", pol.permission_mode]
@@ -419,12 +546,15 @@ class SessionManager:
         # (the identity banner) would end up in the web app.
         env = dict(pol.session_env or {})
         env["SOCIETY_AI_DISPATCHED"] = "1"
-        return pol.work_dir, cmd, env, ()
+        env["CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD"] = "1"
+        return str(self.agent_dir(rec.persona)), cmd, env, ()
 
     def _contact_command(self, rec: SessionRecord, pol: PersonaPolicy, resume: bool):
         """A session working on a contact's request. All of an agent's
-        contact sessions share one empty folder, so they group under a
-        single directory in the Claude Code sidebar.
+        contact sessions share the empty contacts/ folder inside the agent's
+        folder: the same sidebar group as the owner's sessions, but file
+        access confined away from whatever the owner's sessions leave in the
+        agent's folder.
 
         chat / read: --restricted (no command-running tools, user/project
         settings and memory ignored, file tools confined to the working
@@ -444,7 +574,8 @@ class SessionManager:
                 cmd += ["--permission-mode", pol.permission_mode]
             env = dict(pol.session_env or {})
             env["SOCIETY_AI_DISPATCHED"] = "1"
-            return contacts_dir(pol.name), cmd, env, ()
+            env["CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD"] = "1"
+            return str(self.agent_dir(rec.persona) / "contacts"), cmd, env, ()
 
         cmd += [
             "--restricted",
@@ -456,7 +587,7 @@ class SessionManager:
         if rec.permission == "read":
             for d in work_dirs:
                 cmd += ["--add-dir", d]
-        return contacts_dir(pol.name), cmd, {"SOCIETY_AI_DISPATCHED": "1"}, CONTACT_STRIPPED_ENV
+        return str(self.agent_dir(rec.persona) / "contacts"), cmd, {"SOCIETY_AI_DISPATCHED": "1"}, CONTACT_STRIPPED_ENV
 
     @staticmethod
     def _reply_hook_settings() -> dict:
@@ -762,3 +893,20 @@ def _merge_json(path: pathlib.Path, additions: dict, *, list_keys=(), nested_lis
     tmp.write_text(json.dumps(out, indent=2))
     os.replace(tmp, path)
 
+
+
+def _ensure_group_remote(path: pathlib.Path, repo_name: str) -> None:
+    """Make `path` a git repo whose origin is named `repo_name`, unless it
+    already has an origin (never touch a remote someone else set)."""
+    try:
+        if not (path / ".git").exists():
+            subprocess.run(["git", "init", "-q"], cwd=path, check=True, timeout=10,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        has_origin = subprocess.run(["git", "remote", "get-url", "origin"], cwd=path,
+                                    timeout=10, capture_output=True).returncode == 0
+        if not has_origin:
+            subprocess.run(["git", "remote", "add", "origin", f"{AGENT_REMOTE_BASE}{repo_name}.git"],
+                           cwd=path, check=True, timeout=10,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.warning("Could not set up %s as a sidebar group (%s); its sessions show under Other", path, e)

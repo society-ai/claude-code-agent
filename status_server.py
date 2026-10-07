@@ -78,8 +78,8 @@ MACHINE_SCHEMA = [
      "help": "How much an agent narrates while it works — quiet shows just the result, verbose streams its thinking and every step."},
     {"key": "IDLE_REAP_MINUTES", "label": "End idle sessions after (min)", "type": "int", "default": 15,
      "help": "An inactive session is wrapped up and recorded after this many minutes, freeing resources."},
-    {"key": "MAX_CONCURRENT", "label": "Max sessions at once", "type": "int", "default": 3,
-     "help": "How many work sessions a single agent runs in parallel before new ones queue."},
+    {"key": "MAX_CONCURRENT", "label": "Max open sessions", "type": "int", "default": 10,
+     "help": "How many sessions an agent keeps open at once (each uses about 300 MB). When it's reached, the least recently used one is closed; it comes back with its history on its next message, or with Reopen below."},
     {"key": "PERMISSION_MODE", "label": "Permission mode", "type": "enum", "advanced": True,
      "enum": ["default", "acceptEdits", "bypassPermissions"], "default": "bypassPermissions"},
     {"key": "ENABLE_AGENT_LIFECYCLE", "label": "Allow deploy/delete tools", "type": "bool",
@@ -451,7 +451,7 @@ class Handler(BaseHTTPRequestHandler):
                     strip_env_keys(os.path.join(REPO_DIR, p["env_file"]), set(clean.keys()))
             return self._json(200, {"ok": True, "written": sorted(clean), "restart_required": bool(clean)})
 
-        m = re.fullmatch(r"/api/persona/([a-z0-9._-]+)/(config|start|stop|restart|reap)", parsed.path)
+        m = re.fullmatch(r"/api/persona/([a-z0-9._-]+)/(config|start|stop|restart|reap|reopen)", parsed.path)
         if not m:
             return self._json(404, {"error": "not found"})
         persona_id, action = m.group(1), m.group(2)
@@ -469,6 +469,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, run_service(action, p["persona_arg"]))
         if action == "reap":
             return self._json(200, ipc_call(p["socket"], "reap_session", {"work_item_key": str(body.get("work_item_key") or "")}))
+        if action == "reopen":
+            # Relaunching takes several seconds (the CLI boots and connects).
+            return self._json(200, ipc_call(p["socket"], "reopen_session",
+                                            {"work_item_key": str(body.get("work_item_key") or "")},
+                                            timeout=90.0))
         return self._json(404, {"error": "not found"})
 
 
@@ -602,6 +607,7 @@ function render(){
  const root=document.getElementById('root');root.innerHTML='';
  DATA.agents.forEach(a=>{
   const live=a.live||{}, sess=live.sessions||[];
+  const open_=sess.filter(s=>s.state==='ready'||s.state==='starting'), closed=sess.filter(s=>!(s.state==='ready'||s.state==='starting')).slice(0,20);
   // One folder list: WORK_DIR (the "main" folder) + EXTRA_DIRS, in order.
   const dirs=[a.config.WORK_DIR, ...(a.config.EXTRA_DIRS?a.config.EXTRA_DIRS.split(','):[])].map(s=>(s||'').trim()).filter(Boolean);
   const card=document.createElement('div');card.className='card';card.dataset.id=a.id;
@@ -609,7 +615,7 @@ function render(){
    <div class="ph">
      <div class="dot ${a.running?'on':'off'}"></div>
      <div><div class="nm">${esc(a.display)}</div>
-       <div class="meta">${a.running?('online · v'+esc(live.version||'?')+(live.ws_connected===false?' · connecting':'')):(a.installed?'offline':'not installed')}${a.running&&sess.length?' · '+sess.length+' session'+(sess.length>1?'s':''):''}</div></div>
+       <div class="meta">${a.running?('online · v'+esc(live.version||'?')+(live.ws_connected===false?' · connecting':'')):(a.installed?'offline':'not installed')}${a.running&&open_.length?' · '+open_.length+' open session'+(open_.length>1?'s':''):''}</div></div>
      <div class="right">
        ${a.running?`<button class="btn sm" onclick="act('${a.id}','restart')">Restart</button>`:''}
        <label class="tog" title="${a.running?'Online — click to take offline':'Offline — click to bring online'}">
@@ -624,7 +630,8 @@ function render(){
      <div class="err" data-err></div>
      <div class="savebar"><button class="btn p sm" data-save disabled onclick="saveDirs('${a.id}')">Save directories</button>
        <span class="muted" data-hint></span></div>
-     ${sess.length?`<details class="adv" style="margin-top:6px"><summary>${sess.length} live session${sess.length>1?'s':''}</summary><div class="sess">${sess.map(s=>`<div class="row"><div class="t">${esc(s.title||s.work_item_key)}<div class="k">${esc(s.kind)} · ${esc(s.state)} · idle ${s.idle_seconds}s</div></div><button class="btn sm" onclick="reap('${a.id}','${esc(s.work_item_key)}')">End</button></div>`).join('')}</div></details>`:''}
+     ${open_.length?`<details class="adv" style="margin-top:6px"><summary>${open_.length} open session${open_.length>1?'s':''}</summary><div class="sess">${open_.map(s=>`<div class="row"><div class="t">${esc(s.title||s.work_item_key)}<div class="k">${sessMeta(s)} · idle ${ago(s.idle_seconds)}</div></div><button class="btn sm" onclick="reap('${a.id}','${esc(s.work_item_key)}')">End</button></div>`).join('')}</div></details>`:''}
+     ${closed.length?`<details class="adv" style="margin-top:6px"><summary>${closed.length} recent closed session${closed.length>1?'s':''}</summary><div class="sess">${closed.map(s=>`<div class="row"><div class="t">${esc(s.title||s.work_item_key)}<div class="k">${sessMeta(s)} · last active ${ago(s.idle_seconds)} ago</div></div><button class="btn sm" onclick="reopen('${a.id}','${esc(s.work_item_key)}',this)">Reopen</button></div>`).join('')}</div></details>`:''}
      <details class="adv"><summary>Advanced (identity)</summary><div data-adv>${advFields(a)}</div></details>
    </div>`;
   root.appendChild(card);
@@ -650,6 +657,9 @@ async function saveAdv(id){const c=card(id);const u={};c.querySelectorAll('[data
 
 async function toggleAgent(id,on){try{const r=await api('/api/persona/'+id+'/'+(on?'start':'stop'),{});toast(on?'Connecting…':'Disconnecting…',!r.ok);setTimeout(load,1400);}catch(e){toast('Failed',true);load();}}
 async function act(id,verb){try{const r=await api('/api/persona/'+id+'/'+verb,{});toast(verb+(r.ok?' ok':' failed'),!r.ok);setTimeout(load,1400);}catch(e){toast(verb+' failed',true);}}
+function ago(sec){if(sec<90)return sec+'s';if(sec<5400)return Math.round(sec/60)+'m';if(sec<172800)return Math.round(sec/3600)+'h';return Math.round(sec/86400)+'d';}
+function sessMeta(s){return s.contact?('from '+esc(s.contact)+' · '+esc(s.permission||'chat')):(s.kind==='background'?'automation':'yours');}
+async function reopen(id,key,btn){btn.disabled=true;btn.textContent='Opening…';try{const r=await api('/api/persona/'+id+'/reopen',{work_item_key:key});toast(r.reopened?'Reopened: it is back in your Claude Code sidebar':(r.message||'Could not reopen'),!r.reopened);}catch(e){toast('Could not reopen',true);}setTimeout(load,800);}
 async function reap(id,key){if(!confirm('End session '+key+'? It will be stopped and recorded.'))return;try{const r=await api('/api/persona/'+id+'/reap',{work_item_key:key});toast(r.reaped?'Ended':'Failed',!r.reaped);setTimeout(load,1000);}catch(e){toast('Failed',true);}}
 
 /* machine settings drawer */
