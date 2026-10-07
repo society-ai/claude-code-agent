@@ -259,6 +259,17 @@ class AgentFolder(TempHome):
         mgr.agent_dir("agent-x1")
         self.assertEqual(self.git_origin(path), "https://societyai.com/agents/Society-AI-Johnny.git")
 
+    def test_folder_guide_names_the_work_folders(self):
+        mgr = self.manager()
+        mgr.set_policy(PersonaPolicy(name="agent-x1", display_name="Johnny",
+                                     work_dir="/Users/me/Coding/harvest", extra_dirs=["/Users/me/docs"]))
+        path = mgr.agent_dir("agent-x1")
+        guide = (path / "CLAUDE.md").read_text()
+        self.assertIn("This folder is not a project", guide)
+        self.assertIn("- `/Users/me/Coding/harvest`", guide)
+        self.assertIn("- `/Users/me/docs`", guide)
+        self.assertEqual((path / ".gitignore").read_text().splitlines()[-1], "*")
+
     def test_existing_origin_is_left_alone(self):
         import subprocess
         path = session_manager.SOCIETY_AI_HOME / "Mine"

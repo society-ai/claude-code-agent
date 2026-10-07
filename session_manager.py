@@ -517,6 +517,7 @@ class SessionManager:
         (path / "contacts").mkdir(parents=True, exist_ok=True)
         if not marker.exists():
             marker.write_text(persona + "\n")
+        _write_folder_guide(path, pol)
         slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-") or persona
         _ensure_group_remote(path, AGENT_GROUP_PREFIX + slug)
         self._agent_dirs[persona] = path
@@ -918,3 +919,38 @@ def _ensure_group_remote(path: pathlib.Path, repo_name: str) -> None:
                            timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError) as e:
         logger.warning("Could not set up %s as a sidebar group (%s); its sessions show under Other", path, e)
+
+
+AGENT_FOLDER_GUIDE = """\
+# This folder is not a project
+
+Your Society AI sessions start here so they group together in the Claude Code
+sidebar. It is a placeholder: the git repository and its `origin` remote only
+name that group. Nothing here is real work, and the remote does not exist.
+
+Do not create files, commit or push here.
+
+## Your work folders
+
+{folders}
+
+Do your work in those folders. You have full access to them, and their own
+CLAUDE.md instructions are loaded.
+
+(Written by the Society AI bridge on every start; edits here are overwritten.
+Change the folders with ./status.sh in the claude-code-agent folder.)
+"""
+
+
+def _write_folder_guide(path: pathlib.Path, pol: PersonaPolicy) -> None:
+    """Tell sessions what the agent folder is and where the real work is. A
+    session starting in an empty placeholder repo otherwise takes it for its
+    project and loses track of its work folders. The .gitignore keeps the
+    placeholder repo clean, so its git status says nothing misleading."""
+    folders = [d for d in [pol.work_dir, *pol.extra_dirs] if d]
+    listing = "\n".join(f"- `{d}`" for d in folders) or "- (none configured: ask your owner)"
+    try:
+        (path / "CLAUDE.md").write_text(AGENT_FOLDER_GUIDE.format(folders=listing))
+        (path / ".gitignore").write_text("# Society AI agent folder: nothing here is tracked.\n*\n")
+    except OSError as e:
+        logger.warning("Could not write the folder guide in %s: %s", path, e)

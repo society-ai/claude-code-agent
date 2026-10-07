@@ -273,9 +273,14 @@ def main() -> int:
         )
 
     # -- Other personas -------------------------------------------------------
+    # Listed for the machine owner's own sessions, where switching agents is
+    # a real option. A bridge-launched session works for one agent only;
+    # another agent's open work is noise there at best, and a leak to the
+    # agent (and anyone it talks to) at worst.
+    dispatched = _is_dispatched_session()
     others: list[dict[str, Any]] = []
     for p in personas:
-        if p["name"] == acting_name:
+        if p["name"] == acting_name or dispatched:
             continue
         fetched = _fetch(p["api_url"], p["token"], p["name"])
         tasks, inbox = fetched if fetched is not None else (None, None)
