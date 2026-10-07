@@ -44,12 +44,14 @@ CHANNEL_SERVER_NAME = "society-ai-channel"
 
 # Every agent's sessions start in its own folder under ~/Society AI. Claude
 # Code's sidebar (desktop app, claude.ai/code) groups Remote Control sessions
-# by the git remote's repository name, so each agent folder is a git repo
-# whose placeholder remote is named after the agent: its sessions then show
-# under the agent's name instead of "Other". The remote is never pushed to
-# and does not need to exist.
+# by the git remote's repository name (only the last path segment shows, so
+# "Society-AI/Jenkins" would read "Jenkins"), so each agent folder is a git
+# repo whose placeholder remote is named "Society-AI-<agent>": its sessions
+# then group under that instead of "Other". The remote is never pushed to and
+# does not need to exist.
 SOCIETY_AI_HOME = pathlib.Path.home() / "Society AI"
 AGENT_REMOTE_BASE = "https://societyai.com/agents/"
+AGENT_GROUP_PREFIX = "Society-AI-"
 AGENT_FOLDER_MARKER = ".society-ai-agent"
 
 # Closed sessions the bridge remembers (so a later message resumes them with
@@ -515,7 +517,8 @@ class SessionManager:
         (path / "contacts").mkdir(parents=True, exist_ok=True)
         if not marker.exists():
             marker.write_text(persona + "\n")
-        _ensure_group_remote(path, re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-") or persona)
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-") or persona
+        _ensure_group_remote(path, AGENT_GROUP_PREFIX + slug)
         self._agent_dirs[persona] = path
         return path
 
@@ -896,17 +899,22 @@ def _merge_json(path: pathlib.Path, additions: dict, *, list_keys=(), nested_lis
 
 
 def _ensure_group_remote(path: pathlib.Path, repo_name: str) -> None:
-    """Make `path` a git repo whose origin is named `repo_name`, unless it
-    already has an origin (never touch a remote someone else set)."""
+    """Make `path` a git repo whose origin is named `repo_name`. A remote the
+    bridge set earlier (under AGENT_REMOTE_BASE) is renamed to the current
+    scheme; any other origin is someone else's and never touched."""
+    want = f"{AGENT_REMOTE_BASE}{repo_name}.git"
     try:
         if not (path / ".git").exists():
             subprocess.run(["git", "init", "-q"], cwd=path, check=True, timeout=10,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        has_origin = subprocess.run(["git", "remote", "get-url", "origin"], cwd=path,
-                                    timeout=10, capture_output=True).returncode == 0
-        if not has_origin:
-            subprocess.run(["git", "remote", "add", "origin", f"{AGENT_REMOTE_BASE}{repo_name}.git"],
-                           cwd=path, check=True, timeout=10,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        got = subprocess.run(["git", "remote", "get-url", "origin"], cwd=path,
+                             timeout=10, capture_output=True, text=True)
+        current = got.stdout.strip() if got.returncode == 0 else None
+        if current is None:
+            subprocess.run(["git", "remote", "add", "origin", want], cwd=path, check=True,
+                           timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif current != want and current.startswith(AGENT_REMOTE_BASE):
+            subprocess.run(["git", "remote", "set-url", "origin", want], cwd=path, check=True,
+                           timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError) as e:
         logger.warning("Could not set up %s as a sidebar group (%s); its sessions show under Other", path, e)

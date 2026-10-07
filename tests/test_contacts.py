@@ -230,7 +230,7 @@ class AgentFolder(TempHome):
         path = mgr.agent_dir("agent-x1")
         self.assertEqual(path, session_manager.SOCIETY_AI_HOME / "Johnny")
         self.assertTrue((path / "contacts").is_dir())
-        self.assertEqual(self.git_origin(path), "https://societyai.com/agents/Johnny.git")
+        self.assertEqual(self.git_origin(path), "https://societyai.com/agents/Society-AI-Johnny.git")
         self.assertEqual((path / ".society-ai-agent").read_text().strip(), "agent-x1")
 
     def test_canonical_name_without_display_name(self):
@@ -245,7 +245,19 @@ class AgentFolder(TempHome):
         first, second = mgr.agent_dir("a1"), mgr.agent_dir("a2")
         self.assertEqual(second.name, "Johnny (a2)")
         self.assertNotEqual(first, second)
-        self.assertEqual(self.git_origin(second), "https://societyai.com/agents/Johnny-a2.git")
+        self.assertEqual(self.git_origin(second), "https://societyai.com/agents/Society-AI-Johnny-a2.git")
+
+    def test_remote_the_bridge_set_earlier_is_renamed(self):
+        import subprocess
+        path = session_manager.SOCIETY_AI_HOME / "Johnny"
+        path.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+        subprocess.run(["git", "remote", "add", "origin", "https://societyai.com/agents/Johnny.git"],
+                       cwd=path, check=True)
+        mgr = self.manager()
+        mgr.set_policy(PersonaPolicy(name="agent-x1", display_name="Johnny", work_dir="/w"))
+        mgr.agent_dir("agent-x1")
+        self.assertEqual(self.git_origin(path), "https://societyai.com/agents/Society-AI-Johnny.git")
 
     def test_existing_origin_is_left_alone(self):
         import subprocess

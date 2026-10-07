@@ -1280,10 +1280,17 @@ class Bridge:
                             content = limit_line(sender) + "\n\n" + content
                             title = f"{sender.label}: {title}"
                             permission = sender.permission
+                        # Delivery ticks under the owner's message in the app
+                        # (Sent -> Received). Only the owner's own chat turns.
+                        delivery_chat_id = (
+                            _owner_chat_id(metadata)
+                            if sender.is_owner and kind == "chat" else None
+                        )
                         await self._execute_via_session(
                             task_id, str(work_item_key), title, content, kind=kind,
                             protocol_text=protocol_text, standing_text=standing_text,
                             sender=sender, permission=permission,
+                            delivery_chat_id=delivery_chat_id,
                         )
                     elif not sender.is_owner:
                         # The one-shot spawn path (session mode off, or the
@@ -1417,6 +1424,30 @@ class Bridge:
             if (env.get("AGENT_NAME") or "").strip() == self.ctx.name:
                 return persona
         return ""
+
+    async def _report_delivery(self, chat_id: str, state: str) -> None:
+        """Tell the app how the owner's message is getting to this agent, so
+        the ticks under it move (waking, received, unreachable). The app
+        accepts it only for the owner's own chat with this agent while a
+        delivery is pending, so a rejection is expected and not an error.
+        Never raises: ticks are a courtesy, not part of the reply path."""
+        try:
+            resp = await _get_http_client().post(
+                f"{self.ctx.api_url}/api/v1/chats/{chat_id}/delivery",
+                json={"state": state},
+                headers={
+                    "Authorization": f"Bearer {self.ctx.token}",
+                    "Content-Type": "application/json",
+                    "User-Agent": f"claude-code-agent/{__version__}",
+                },
+            )
+            if resp.status_code < 400:
+                logger.info("Delivery %s reported for chat %s", state, chat_id[:8])
+            else:
+                logger.debug("Delivery %s for chat %s not taken (HTTP %s)",
+                             state, chat_id[:8], resp.status_code)
+        except Exception as e:
+            logger.debug("Delivery %s report failed: %s", state, e)
 
     async def _report_update_outcome(self) -> None:
         """If update.sh left an outcome marker, post it to the owner's feed
@@ -2366,15 +2397,25 @@ class Bridge:
         standing_text: str = "",
         sender: Sender | None = None,
         permission: str | None = None,
+        delivery_chat_id: str | None = None,
     ) -> None:
         """Dispatch a work item into a persistent session and wait for its
         reply, then complete the A2A task. The event_id we send IS the A2A
         task_id, so the reply correlates straight back.
 
         `permission` is None for the owner; for a contact it is the level
-        the session is launched (or relaunched) with."""
+        the session is launched (or relaunched) with. `delivery_chat_id`
+        names the owner's chat whose message gets delivery ticks."""
         mgr = self._session_mgr
         hub = self._channel_hub
+
+        def report(state: str) -> None:
+            if delivery_chat_id:
+                asyncio.ensure_future(self._report_delivery(delivery_chat_id, state))
+
+        existing = mgr.get(work_item_key)
+        if existing is None or existing.state != "ready":
+            report("waking")  # a cold start or a reopen takes several seconds
         # Ensure (launch or resume) the work item's session. Trigger-kind
         # work (wakes, schedules, status echoes) runs headless — no Remote
         # Control sidebar row.
@@ -2387,6 +2428,7 @@ class Bridge:
             )
         except Exception as e:
             logger.exception("Session launch failed for %s", work_item_key)
+            report("unreachable")
             await self._send_task_complete(
                 task_id, f"Could not start a session: {type(e).__name__}: {e}", exit_code=1
             )
@@ -2428,6 +2470,7 @@ class Bridge:
             )
 
         if rec.state != "ready":
+            report("unreachable")
             await self._send_task_complete(
                 task_id, rec.failure or "Could not start a Claude Code session.", exit_code=1
             )
@@ -2449,6 +2492,7 @@ class Bridge:
                 "Channel for %s (session %s) did not connect to %s within 10s",
                 channel_key, rec.session_id[:8], hub.path,
             )
+            report("unreachable")
             await self._send_task_complete(
                 task_id, "Session started but its channel did not connect in time.", exit_code=1
             )
@@ -2475,6 +2519,7 @@ class Bridge:
                 {"event_id": task_id, "kind": kind},
             )
             mgr.touch(channel_key)
+            report("received" if delivered else "unreachable")
             if not delivered:
                 logger.error(
                     "Delivery failed for task %s into session %s (%s)",
@@ -2681,6 +2726,18 @@ class Bridge:
             return
         self.running = False
         logger.info("Shutting down...")
+
+
+# -- Delivery ticks -------------------------------------------------------------
+
+def _owner_chat_id(metadata: dict) -> str | None:
+    """The Society AI app chat a dispatch came from, if any (top-level, or
+    nested under `context` in stored task metadata)."""
+    for source in (metadata, metadata.get("context") if isinstance(metadata.get("context"), dict) else {}):
+        chat_id = source.get("chat_id")
+        if isinstance(chat_id, str) and chat_id.strip():
+            return chat_id.strip()
+    return None
 
 
 # -- Env files ----------------------------------------------------------------
