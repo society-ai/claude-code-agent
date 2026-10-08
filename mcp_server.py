@@ -95,10 +95,10 @@ _VALID_AGENT_LIFECYCLE_ROLES = {
     "team_lead", "individual_contributor",
 }
 _VALID_DEPLOY_MODES = {"serverless", "dedicated"}
-_VALID_PLATFORMS = {"cloud_run", "gce"}
+_VALID_HOSTINGS = {"cloud_run", "gce"}
 _VALID_AGENT_TYPES = {"openclaw", "zeroclaw"}
 _VALID_ACCESS_ROLES = {"admin", "member", "viewer"}
-_VALID_VISIBILITIES = {"private", "shared", "public"}
+_VALID_VISIBILITIES = {"private", "public"}
 # Company lifecycle states an agent may set. The DB also knows draft /
 # bootstrapping / deploying, but those belong to the creation flow, not to
 # an agent editing a live company.
@@ -2423,19 +2423,31 @@ async def deploy_agent(
     model: Optional[str] = None,
     reports_to: Optional[str] = None,
     space_id: Optional[str] = None,
-    access_role: str = "member",
+    access_role: Optional[str] = None,
     skill_packs: Optional[list[str]] = None,
     env_secrets: Optional[dict[str, str]] = None,
     api_keys: Optional[dict[str, str]] = None,
     visibility: str = "private",
     agent_type: str = "zeroclaw",
-    platform: str = "cloud_run",
+    hosting: str = "cloud_run",
     deployment_mode: str = "serverless",
 ) -> str:
     """[GATED] Deploy a new agent into a company.
 
     Requires ENABLE_AGENT_LIFECYCLE=true on the bridge process. This is a
     high-power, real-money operation — Claude can spawn real cloud agents.
+
+    Args:
+        role_position: Org chart position, e.g. 'ceo', 'coo', 'individual_contributor'.
+        model: The LLM as '<provider>/<model>', e.g. 'anthropic/claude-sonnet-4-6'
+            or 'openrouter/openai/gpt-5.4'. Omit for the platform default.
+        api_keys: Provider API keys keyed by provider, e.g. {"anthropic": "..."}.
+            Must include a key for the chosen model's provider, or the deploy
+            is rejected.
+        access_role: 'admin', 'member' or 'viewer'. Omit to use the default for
+            the position (admin for ceo/coo, member otherwise).
+        hosting: 'cloud_run' (serverless) or 'gce' (a VM).
+        visibility: 'private' or 'public'.
     """
     gate = _gate_or_error()
     if gate:
@@ -2444,10 +2456,10 @@ async def deploy_agent(
         return _result(_error("role_position is required (e.g. 'ceo', 'individual_contributor')"))
     for err in (
         _enum_check(role_position, _VALID_AGENT_LIFECYCLE_ROLES, "role_position"),
-        _enum_check(access_role, _VALID_ACCESS_ROLES, "access_role"),
+        _enum_check(access_role, _VALID_ACCESS_ROLES, "access_role") if access_role else None,
         _enum_check(visibility, _VALID_VISIBILITIES, "visibility"),
         _enum_check(agent_type, _VALID_AGENT_TYPES, "agent_type"),
-        _enum_check(platform, _VALID_PLATFORMS, "platform"),
+        _enum_check(hosting, _VALID_HOSTINGS, "hosting"),
         _enum_check(deployment_mode, _VALID_DEPLOY_MODES, "deployment_mode"),
     ):
         if err:
@@ -2459,10 +2471,9 @@ async def deploy_agent(
     except ValueError as e:
         return _result(_error(str(e)))
 
-    org_chart: dict[str, Any] = {
-        "position": role_position,
-        "access_role": access_role,
-    }
+    org_chart: dict[str, Any] = {"position": role_position}
+    if access_role:
+        org_chart["access_role"] = access_role
     if title is not None:
         org_chart["title"] = title
     if space_id is not None:
@@ -2472,7 +2483,7 @@ async def deploy_agent(
 
     body: dict[str, Any] = {
         "agent_type": agent_type,
-        "platform": platform,
+        "hosting": hosting,
         "deployment_mode": deployment_mode,
         "org_chart": org_chart,
         "visibility": visibility,
