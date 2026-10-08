@@ -166,7 +166,7 @@ Every session the bridge starts has Remote Control on, so it appears in the Clau
 - **Open sessions are listed; closed ones are not.** A session is closed after `IDLE_REAP_MINUTES` (15) idle, or when the agent has `MAX_CONCURRENT` (10) open and needs room. Each open session is a Claude Code process of about 300 MB.
 - **Closed is not lost.** The next message in that conversation reopens the same session with its history, under the same sidebar entry. The bridge remembers which conversation belongs to which session across restarts (`sessions.json` in its state folder). `./status.sh` lists recent closed sessions with a **Reopen** button.
 - Every conversation is also recorded in the Society AI app, which keeps them permanently.
-- **Delivery ticks.** For your messages in the Society AI app, the bridge reports how each one is getting to the agent: `waking` (its session is starting or reopening), `received` (it landed in the session) or `unreachable` (the session could not start or never picked it up).
+- **Delivery ticks.** For your messages in the Society AI app, the bridge reports how each one is getting to the agent: `waking` (its session is starting or reopening), `received` (it landed in the session) or `unreachable` (the session could not start or never picked it up). Each state is reported to the app and also sent on the live reply stream (a `delivery` data part), so the tick moves the moment it happens.
 
 ### What `.env` contains
 `SOCIETY_AI_AUTH_TOKEN` ends up in `~/.claude/settings.json` (so the MCP server can authenticate) and in the bridge process env. Both files are user-readable only. If you share a machine, consider a per-user account or secured mode.

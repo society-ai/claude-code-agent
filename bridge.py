@@ -70,7 +70,7 @@ from contacts import (
     strip_private_blocks,
 )
 from dataclasses import replace
-from streaming import StreamMapper
+from streaming import StreamMapper, _data_part
 from typing import Any, Awaitable, Callable, Optional
 
 logging.basicConfig(
@@ -1449,6 +1449,16 @@ class Bridge:
         except Exception as e:
             logger.debug("Delivery %s report failed: %s", state, e)
 
+    async def _stream_delivery(self, task_id: str, state: str) -> None:
+        """The delivery state as a `delivery` data part on the task's stream
+        (task.status, not final). Same never-raise rule as the report."""
+        try:
+            await self._send_status_update(
+                task_id, [_data_part("delivery", f"delivery-{task_id}", {"state": state})]
+            )
+        except Exception as e:
+            logger.debug("Delivery %s stream update failed: %s", state, e)
+
     async def _report_update_outcome(self) -> None:
         """If update.sh left an outcome marker, post it to the owner's feed
         and delete the marker. Fire-and-forget at startup: never blocks or
@@ -2412,6 +2422,9 @@ class Bridge:
         def report(state: str) -> None:
             if delivery_chat_id:
                 asyncio.ensure_future(self._report_delivery(delivery_chat_id, state))
+                # Also on the reply stream the page already has open, so the
+                # tick moves the moment it happens instead of on its next poll.
+                asyncio.ensure_future(self._stream_delivery(task_id, state))
 
         existing = mgr.get(work_item_key)
         if existing is None or existing.state != "ready":

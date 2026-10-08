@@ -70,5 +70,42 @@ class Report(unittest.TestCase):
         self.run_report(FakeClient(fail=True))
 
 
+class Stream(unittest.TestCase):
+    def test_delivery_rides_the_reply_stream(self):
+        with tempfile.TemporaryDirectory() as d:
+            ctx = bridge.AgentContext(
+                name="jenkins", token="sai_test", work_dir=d, extra_dirs=[], company_id="",
+                api_url="https://api.example.com", socket=f"{d}/b.sock", state_dir=d,
+            )
+            b = bridge.Bridge(ctx)
+            sent = []
+
+            async def capture(msg):
+                sent.append(msg)
+
+            b.send = capture
+            asyncio.run(b._stream_delivery("task-7", "received"))
+        msg = sent[0]
+        self.assertEqual(msg["method"], "task.status")
+        self.assertFalse(msg["params"]["final"])
+        part = msg["params"]["status"]["message"]["parts"][0]
+        self.assertEqual(part, {"type": "data", "data": {
+            "component": "delivery", "id": "delivery-task-7", "payload": {"state": "received"}}})
+
+    def test_stream_failure_never_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            ctx = bridge.AgentContext(
+                name="jenkins", token="sai_test", work_dir=d, extra_dirs=[], company_id="",
+                api_url="https://api.example.com", socket=f"{d}/b.sock", state_dir=d,
+            )
+            b = bridge.Bridge(ctx)
+
+            async def boom(msg):
+                raise ConnectionError("ws closed")
+
+            b.send = boom
+            asyncio.run(b._stream_delivery("task-7", "waking"))
+
+
 if __name__ == "__main__":
     unittest.main()
