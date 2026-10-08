@@ -11,7 +11,8 @@ Env vars (see config.py for full validation):
     AGENT_ROUTER_API_URL  — API URL (default: https://api.societyai.com)
     AGENT_NAME            — Agent name (default: claude-code)
     COMPANY_ID            — Default company UUID (optional)
-    WORK_DIR              — Working directory for Claude Code (default: cwd)
+    WORK_DIR              — Working directory for Claude Code (default: the agent's
+                            own folder, <Society AI folder>/<agent>)
     MAX_CONCURRENT_TASKS  — Max parallel tasks (default: 3)
     EXECUTION_MODE        — "standard" (direct) or "secured" (OpenShell sandbox)
     SANDBOX_NAME          — Sandbox name (default: society-ai-agent)
@@ -71,6 +72,7 @@ from contacts import (
 )
 from dataclasses import replace
 from streaming import StreamMapper, _data_part
+import folders
 from typing import Any, Awaitable, Callable, Optional
 
 logging.basicConfig(
@@ -80,7 +82,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("bridge")
 
-WORK_DIR = os.getenv("WORK_DIR", os.getcwd())
+# The agent's work folder. Unset = its own folder under the Society AI folder
+# (folders.agent_workspace), resolved in main(), never this repository.
+WORK_DIR = os.getenv("WORK_DIR", "").strip()
 HEARTBEAT_INTERVAL = 60  # seconds (hub timeout is 90s)
 # How long a fresh connection may wait for the hub to accept our
 # registration. Heartbeats only run once registered, so without this a
@@ -921,6 +925,11 @@ class Bridge:
                     owner_id = result.get("owner_user_id")
                     if isinstance(owner_id, str) and owner_id.strip():
                         self._owner_user_id = owner_id.strip()
+                    owner_name = result.get("owner_name")
+                    if (self._session_mgr is not None and isinstance(owner_name, str)
+                            and owner_name.strip() and not os.getenv("OWNER_NAME", "").strip()):
+                        self._session_mgr.policy(self.ctx.name).owner_label = \
+                            owner_name.strip().split()[0]
                     logger.info("Registered as %s", result.get("agent_id", self.ctx.name))
                 else:
                     reason = str(result.get("error") or "")
@@ -1278,8 +1287,11 @@ class Bridge:
                             # messages, and the machine limit can make it
                             # lower than what the platform says.
                             content = limit_line(sender) + "\n\n" + content
-                            title = f"{sender.label}: {title}"
                             permission = sender.permission
+                        # Sidebar groups are per sender and can hold several
+                        # of this machine's agents, so titles name the agent.
+                        agent_label = os.getenv("DISPLAY_NAME", "").strip() or self.ctx.name
+                        title = f"{agent_label}: {title}"
                         # Delivery ticks under the owner's message in the app
                         # (Sent -> Received). Only the owner's own chat turns.
                         delivery_chat_id = (
@@ -1424,6 +1436,34 @@ class Bridge:
             if (env.get("AGENT_NAME") or "").strip() == self.ctx.name:
                 return persona
         return ""
+
+    async def _resolve_owner_label(self) -> str:
+        """The owner's name for the sidebar group of their sessions
+        ("Society-AI-<name>"): OWNER_NAME from ./status.sh, else the first
+        name on their Society AI profile, else their email's first part."""
+        configured = os.getenv("OWNER_NAME", "").strip()
+        if configured:
+            return configured
+        try:
+            resp = await _get_http_client().get(
+                f"{self.ctx.api_url}/api/v1/users/context",
+                headers={"Authorization": f"Bearer {self.ctx.token}",
+                         "User-Agent": f"claude-code-agent/{__version__}"},
+            )
+            if resp.status_code < 400:
+                data = resp.json()
+                user = data.get("user", data) if isinstance(data, dict) else {}
+                name = str(user.get("name") or "").strip()
+                if name:
+                    return name.split()[0]
+                email = str(user.get("email") or "").strip()
+                if "@" in email:
+                    local = re.split(r"[._+-]", email.split("@")[0])[0]
+                    if local:
+                        return local[:1].upper() + local[1:]
+        except Exception as e:
+            logger.debug("Owner name lookup failed: %s", e)
+        return "Owner"
 
     async def _report_delivery(self, chat_id: str, state: str) -> None:
         """Tell the app how the owner's message is getting to this agent, so
@@ -2438,6 +2478,7 @@ class Bridge:
                 background=(kind == "trigger"),
                 permission=permission,
                 contact_label=sender.label if sender is not None and not sender.is_owner else "",
+                sender_group=sender.group if sender is not None and not sender.is_owner else "",
             )
         except Exception as e:
             logger.exception("Session launch failed for %s", work_item_key)
@@ -2463,7 +2504,9 @@ class Bridge:
         # 'trigger' = platform automation (orchestrator wakes, schedules) —
         # the distinction loop-guards the supervisor: scribe sessions ending
         # never re-wake the orchestrator.
-        if self._shipper is not None:
+        is_contact = sender is not None and not sender.is_owner
+        record = not is_contact or mgr.policy(self.ctx.name).mirror_contacts
+        if self._shipper is not None and record:
             if kind == "chat":
                 wi_kind = "chat"
             elif kind == "task_assigned":
@@ -2646,6 +2689,12 @@ class Bridge:
                     apply_local_env(pol, self.ctx.name)  # local always wins
                     pol.session_env = self.ctx.session_env()  # keep per-agent env
                     logger.info("Applied platform policy for %s", self.ctx.name)
+                pol = self._session_mgr.policy(self.ctx.name)
+                pol.owner_label = await self._resolve_owner_label()
+                if self._shipper is not None and not pol.mirror_contacts:
+                    dropped = self._shipper.forget_contact_sessions()
+                    if dropped:
+                        logger.info("Stopped recording %d contact session(s) to Society AI", dropped)
             except Exception:
                 logger.exception("Session-mode startup failed; falling back to spawn path")
                 self._session_mode = False
@@ -2816,6 +2865,9 @@ def main():
     # One process per agent. bridge_launcher.sh sources exactly one agent's
     # env file (.env or .env.<persona>) before exec'ing us, so the process
     # env IS the agent.
+    global WORK_DIR
+    if not WORK_DIR and AGENT_NAME:
+        WORK_DIR = str(folders.agent_workspace(AGENT_NAME, os.getenv("DISPLAY_NAME", "").strip()))
     ctx = AgentContext.from_env()
     if not ctx.name or not ctx.token:
         print(

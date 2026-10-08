@@ -36,23 +36,13 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Optional
 
+import folders
+
 logger = logging.getLogger("session_manager")
 
 REPO_DIR = pathlib.Path(__file__).resolve().parent
 CHANNEL_SERVER = str(REPO_DIR / "channel" / "server.mjs")
 CHANNEL_SERVER_NAME = "society-ai-channel"
-
-# Every agent's sessions start in its own folder under ~/Society AI. Claude
-# Code's sidebar (desktop app, claude.ai/code) groups Remote Control sessions
-# by the git remote's repository name (only the last path segment shows, so
-# "Society-AI/Jenkins" would read "Jenkins"), so each agent folder is a git
-# repo whose placeholder remote is named "Society-AI-<agent>": its sessions
-# then group under that instead of "Other". The remote is never pushed to and
-# does not need to exist.
-SOCIETY_AI_HOME = pathlib.Path.home() / "Society AI"
-AGENT_REMOTE_BASE = "https://societyai.com/agents/"
-AGENT_GROUP_PREFIX = "Society-AI-"
-AGENT_FOLDER_MARKER = ".society-ai-agent"
 
 # Closed sessions the bridge remembers (so a later message resumes them with
 # their history, and the panel can reopen them), newest first.
@@ -102,8 +92,14 @@ class PersonaPolicy:
     # MCP reads these from its environment, so they must be the agent's, not
     # whatever the user-scope MCP config falls back to.
     session_env: dict = field(default_factory=dict)
-    # Names the agent's folder and its sidebar group ("" = the agent name).
+    # Names the agent's folder and prefixes its session titles ("" = the agent name).
     display_name: str = ""
+    # The owner's name: the sidebar group of the owner's sessions,
+    # "Society-AI-<owner_label>".
+    owner_label: str = "Owner"
+    # Whether conversations with contacts are recorded to Society AI. Off by
+    # default: agent-to-agent conversations are private to the owner's machine.
+    mirror_contacts: bool = False
     # Machine owner's cap on what this agent may do for ANY contact
     # (chat | read | act). Local only: the platform can never raise it.
     contact_permission_limit: str = "act"
@@ -133,11 +129,13 @@ class SessionRecord:
     cwd: str = ""                      # the folder it first launched in; a resume
                                        # must use the same one (Claude Code files
                                        # transcripts by folder)
+    sender_group: str = ""             # who the conversation is with: names its
+                                       # sidebar group ("" = the owner)
 
 # Fields saved to disk; the rest is per-process runtime state.
 _REMEMBERED_FIELDS = (
     "work_item_key", "persona", "session_id", "tmux_name", "title", "last_active",
-    "has_run_once", "background", "permission", "contact_label", "cwd",
+    "has_run_once", "background", "permission", "contact_label", "cwd", "sender_group",
 )
 
 
@@ -147,7 +145,6 @@ class SessionManager:
         self._sessions: dict[str, SessionRecord] = {}
         self._aliases: dict[str, str] = {}  # alias key -> canonical work_item_key
         self._policies: dict[str, PersonaPolicy] = {}
-        self._agent_dirs: dict[str, pathlib.Path] = {}
         # Which work item each Claude session belongs to, kept across bridge
         # restarts: without it, a message after a restart opened a fresh
         # session and lost the conversation's history.
@@ -252,6 +249,7 @@ class SessionManager:
         background: bool = False,
         permission: Optional[str] = None,
         contact_label: str = "",
+        sender_group: str = "",
     ) -> SessionRecord:
         """Return a live session for the work item, launching or resuming as
         needed. Concurrency-safe per work item.
@@ -290,6 +288,8 @@ class SessionManager:
                 rec.title = title or rec.title
             rec.permission = permission
             rec.contact_label = contact_label
+            if not rec.cwd:
+                rec.sender_group = sender_group
 
             resume = rec.has_run_once and self._has_history(rec)
             rec.fresh_launch = not resume
@@ -317,6 +317,7 @@ class SessionManager:
         return await self.ensure_session(
             rec.work_item_key, rec.persona, title=rec.title,
             permission=rec.permission, contact_label=rec.contact_label,
+            sender_group=rec.sender_group,
         )
 
     # -- remembered sessions --------------------------------------------------
@@ -331,6 +332,8 @@ class SessionManager:
                 rec = SessionRecord(**{k: row[k] for k in _REMEMBERED_FIELDS if k in row})
             except TypeError:
                 continue
+            if rec.cwd and not os.path.isdir(rec.cwd):
+                continue  # its folder is gone, so its history can't be resumed
             rec.state = "closed"  # nothing survives a bridge restart
             self._sessions[rec.work_item_key] = rec
         aliases = data.get("aliases")
@@ -491,37 +494,14 @@ class SessionManager:
 
     def session_cwd(self, rec: SessionRecord) -> str:
         """The folder a session runs in, which is also where Claude Code
-        keeps its transcript. A session keeps the folder it first launched
-        in for life."""
+        keeps its transcript: <Society AI folder>/.sessions/<sender>/<agent>,
+        so the sidebar groups conversations by who they are with. A session
+        keeps the folder it first launched in for life."""
         if rec.cwd:
             return rec.cwd
-        agent_dir = self.agent_dir(rec.persona)
-        return str(agent_dir if rec.permission is None else agent_dir / "contacts")
-
-    def agent_dir(self, persona: str) -> pathlib.Path:
-        """~/Society AI/<display name>: where the agent's sessions start, set
-        up so its sessions group under its name in the Claude Code sidebar.
-        Created on first use; a marker file records which agent owns it, so
-        two agents with the same display name never share a folder."""
-        cached = self._agent_dirs.get(persona)
-        if cached is not None:
-            return cached
-        pol = self.policy(persona)
-        name = re.sub(r'[\x00-\x1f/\\:*?"<>|]+', "-", pol.display_name or persona).strip(" .-") or persona
-        path = SOCIETY_AI_HOME / name
-        marker = path / AGENT_FOLDER_MARKER
-        if marker.exists() and marker.read_text().strip() != persona:
-            name = f"{name} ({persona})"
-            path = SOCIETY_AI_HOME / name
-            marker = path / AGENT_FOLDER_MARKER
-        (path / "contacts").mkdir(parents=True, exist_ok=True)
-        if not marker.exists():
-            marker.write_text(persona + "\n")
-        _write_folder_guide(path, pol)
-        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-") or persona
-        _ensure_group_remote(path, AGENT_GROUP_PREFIX + slug)
-        self._agent_dirs[persona] = path
-        return path
+        pol = self.policy(rec.persona)
+        sender = rec.sender_group or pol.owner_label
+        return str(folders.session_dir(sender, rec.persona, pol.display_name))
 
     def _session_flags(self, rec: SessionRecord, pol: PersonaPolicy, resume: bool) -> list[str]:
         # Fresh launch sets the session id with --session-id; resume reopens
@@ -536,9 +516,9 @@ class SessionManager:
         return cmd
 
     def _owner_command(self, rec: SessionRecord, pol: PersonaPolicy, resume: bool):
-        """The owner's session starts in the agent's folder (so it groups
-        under the agent in the sidebar) with full access to its work
-        folders, whose CLAUDE.md instructions still load."""
+        """The owner's session starts in the owner's sidebar group folder,
+        with full access to the agent's work folders, whose CLAUDE.md
+        instructions still load."""
         cmd = self._session_flags(rec, pol, resume)
         for d in [pol.work_dir, *pol.extra_dirs]:
             cmd += ["--add-dir", d]
@@ -551,14 +531,14 @@ class SessionManager:
         env = dict(pol.session_env or {})
         env["SOCIETY_AI_DISPATCHED"] = "1"
         env["CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD"] = "1"
-        return str(self.agent_dir(rec.persona)), cmd, env, ()
+        cwd = self.session_cwd(rec)
+        folders.write_session_guide(pathlib.Path(cwd), [pol.work_dir, *pol.extra_dirs])
+        return cwd, cmd, env, ()
 
     def _contact_command(self, rec: SessionRecord, pol: PersonaPolicy, resume: bool):
-        """A session working on a contact's request. All of an agent's
-        contact sessions share the empty contacts/ folder inside the agent's
-        folder: the same sidebar group as the owner's sessions, but file
-        access confined away from whatever the owner's sessions leave in the
-        agent's folder.
+        """A session working on a contact's request. It starts in that
+        contact's sidebar group folder (<Society AI folder>/.sessions/
+        <contact>/<agent>), an empty folder holding no owner files.
 
         chat / read: --restricted (no command-running tools, user/project
         settings and memory ignored, file tools confined to the working
@@ -579,7 +559,9 @@ class SessionManager:
             env = dict(pol.session_env or {})
             env["SOCIETY_AI_DISPATCHED"] = "1"
             env["CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD"] = "1"
-            return str(self.agent_dir(rec.persona) / "contacts"), cmd, env, ()
+            cwd = self.session_cwd(rec)
+            folders.write_session_guide(pathlib.Path(cwd), work_dirs)
+            return cwd, cmd, env, ()
 
         cmd += [
             "--restricted",
@@ -591,7 +573,7 @@ class SessionManager:
         if rec.permission == "read":
             for d in work_dirs:
                 cmd += ["--add-dir", d]
-        return str(self.agent_dir(rec.persona) / "contacts"), cmd, {"SOCIETY_AI_DISPATCHED": "1"}, CONTACT_STRIPPED_ENV
+        return self.session_cwd(rec), cmd, {"SOCIETY_AI_DISPATCHED": "1"}, CONTACT_STRIPPED_ENV
 
     @staticmethod
     def _reply_hook_settings() -> dict:
@@ -898,59 +880,3 @@ def _merge_json(path: pathlib.Path, additions: dict, *, list_keys=(), nested_lis
     os.replace(tmp, path)
 
 
-
-def _ensure_group_remote(path: pathlib.Path, repo_name: str) -> None:
-    """Make `path` a git repo whose origin is named `repo_name`. A remote the
-    bridge set earlier (under AGENT_REMOTE_BASE) is renamed to the current
-    scheme; any other origin is someone else's and never touched."""
-    want = f"{AGENT_REMOTE_BASE}{repo_name}.git"
-    try:
-        if not (path / ".git").exists():
-            subprocess.run(["git", "init", "-q"], cwd=path, check=True, timeout=10,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        got = subprocess.run(["git", "remote", "get-url", "origin"], cwd=path,
-                             timeout=10, capture_output=True, text=True)
-        current = got.stdout.strip() if got.returncode == 0 else None
-        if current is None:
-            subprocess.run(["git", "remote", "add", "origin", want], cwd=path, check=True,
-                           timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        elif current != want and current.startswith(AGENT_REMOTE_BASE):
-            subprocess.run(["git", "remote", "set-url", "origin", want], cwd=path, check=True,
-                           timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except (OSError, subprocess.SubprocessError) as e:
-        logger.warning("Could not set up %s as a sidebar group (%s); its sessions show under Other", path, e)
-
-
-AGENT_FOLDER_GUIDE = """\
-# This folder is not a project
-
-Your Society AI sessions start here so they group together in the Claude Code
-sidebar. It is a placeholder: the git repository and its `origin` remote only
-name that group. Nothing here is real work, and the remote does not exist.
-
-Do not create files, commit or push here.
-
-## Your work folders
-
-{folders}
-
-Do your work in those folders. You have full access to them, and their own
-CLAUDE.md instructions are loaded.
-
-(Written by the Society AI bridge on every start; edits here are overwritten.
-Change the folders with ./status.sh in the claude-code-agent folder.)
-"""
-
-
-def _write_folder_guide(path: pathlib.Path, pol: PersonaPolicy) -> None:
-    """Tell sessions what the agent folder is and where the real work is. A
-    session starting in an empty placeholder repo otherwise takes it for its
-    project and loses track of its work folders. The .gitignore keeps the
-    placeholder repo clean, so its git status says nothing misleading."""
-    folders = [d for d in [pol.work_dir, *pol.extra_dirs] if d]
-    listing = "\n".join(f"- `{d}`" for d in folders) or "- (none configured: ask your owner)"
-    try:
-        (path / "CLAUDE.md").write_text(AGENT_FOLDER_GUIDE.format(folders=listing))
-        (path / ".gitignore").write_text("# Society AI agent folder: nothing here is tracked.\n*\n")
-    except OSError as e:
-        logger.warning("Could not write the folder guide in %s: %s", path, e)

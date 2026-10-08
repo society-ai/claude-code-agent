@@ -228,6 +228,18 @@ class TranscriptShipper:
         self._prune()
         self._save_state()
 
+    def forget_contact_sessions(self) -> int:
+        """Stop recording every contact session (work items "contact:...")
+        registered so far. Used when recording contact conversations is off,
+        so a session registered by an earlier version stops shipping too."""
+        gone = [sid for sid, rec in self._state.items()
+                if str(rec.get("work_item_id") or "").startswith("contact:")]
+        for sid in gone:
+            del self._state[sid]
+        if gone:
+            self._save_state()
+        return len(gone)
+
     def is_registered(self, session_id: str) -> bool:
         return session_id in self._state
 

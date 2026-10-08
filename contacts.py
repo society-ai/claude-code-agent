@@ -75,6 +75,9 @@ class Sender:
     key: str = ""
     label: str = ""
     permission: str = DEFAULT_PERMISSION
+    # Names the sidebar group of this sender's conversations,
+    # "Society-AI-<group>".
+    group: str = ""
 
 
 OWNER = Sender(is_owner=True)
@@ -108,14 +111,16 @@ def classify_sender(frame: Optional[dict], metadata: dict, owner_id: Optional[st
         key = f"agent:{_safe_key_part(name)}"
         owner_name = str(frm.get("owner_name") or "").strip()
         label = f"{name} ({owner_name})" if owner_name else name
+        group = name[:1].upper() + name[1:] if name.islower() else name
     else:
         uid = str(frm.get("id") or user_id or "").strip()
         key = f"user:{_safe_key_part(uid)}"
         label = name or (f"user {uid[:8]}" if uid else "an unknown sender")
+        group = name or (f"user-{uid[:8]}" if uid else "Unknown")
     permission = frm.get("permission")
     if permission not in PERMISSION_LEVELS:
         permission = DEFAULT_PERMISSION
-    return Sender(is_owner=False, key=key, label=label, permission=permission)
+    return Sender(is_owner=False, key=key, label=label, permission=permission, group=group)
 
 
 def contact_work_item_key(sender: Sender, frame: Optional[dict], metadata: dict,

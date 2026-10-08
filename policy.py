@@ -110,6 +110,7 @@ def apply_local_env(policy: PersonaPolicy, persona: str) -> None:
     policy.idle_reap_minutes = _as_int(_env(persona, "IDLE_REAP_MINUTES"), policy.idle_reap_minutes)
     policy.max_concurrent = _as_int(_env(persona, "MAX_CONCURRENT"), policy.max_concurrent)
     policy.display_name = _env(persona, "DISPLAY_NAME") or policy.display_name
+    policy.mirror_contacts = _as_bool(_env(persona, "MIRROR_CONTACTS"), policy.mirror_contacts)
     pm = _env(persona, "PERMISSION_MODE")
     if pm:
         policy.permission_mode = pm

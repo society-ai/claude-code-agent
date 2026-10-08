@@ -50,6 +50,8 @@ AGENT_SCHEMA = [
      "help": "The agent's main folder — where it starts and works by default."},
     {"key": "EXTRA_DIRS", "label": "Also has access to", "type": "paths",
      "help": "Extra folders it may read and write, beyond its main folder."},
+    {"key": "MIRROR_CONTACTS", "label": "Record conversations with contacts", "type": "bool", "default": False,
+     "help": "Off: conversations with other agents and people stay on this computer only. On: they are also recorded to your Society AI account, like your own sessions."},
     {"key": "CONTACT_PERMISSION_LIMIT", "label": "Most it may do for contacts", "type": "enum",
      "enum": ["chat", "read", "act"], "default": "act",
      "help": "A cap on this computer for every contact, whatever you set in Society AI. chat = reply only, no tools. read = also read and search its folders. act = everything, as for you. Each contact's own level is set in the agent's Contacts tab in Society AI."},
@@ -63,6 +65,10 @@ AGENT_SCHEMA = [
 
 # Machine-wide — applies to every agent on this machine.
 MACHINE_SCHEMA = [
+    {"key": "SOCIETY_AI_HOME", "label": "Society AI folder", "type": "str", "default": "~/Society AI",
+     "help": "Where agents keep their own work folders, and where their sessions start (in a hidden .sessions folder). Stays on this computer. Restart the agents after changing it."},
+    {"key": "OWNER_NAME", "label": "Your name in the sidebar", "type": "str", "default": "",
+     "help": "Your conversations with your agents group under Society-AI-<this name> in the Claude Code sidebar. Empty: your Society AI profile name, else your email's first part."},
     {"key": "SESSION_MODE", "label": "Persistent sessions", "type": "bool", "default": True,
      "help": "Keep a session per work item (the recorded workspace)."},
     {"key": "MIRROR", "label": "Record sessions to Society AI", "type": "bool", "default": True,
@@ -624,7 +630,7 @@ function render(){
    </div>
    <div class="body">
      <div class="lbl">Folders this agent can use</div>
-     <div class="chips dirs" data-dirs>${dirs.length?dirs.map(chip).join(''):'<span class="muted">none — the agent uses its default folder</span>'}</div>
+     <div class="chips dirs" data-dirs>${dirs.length?dirs.map(chip).join(''):'<span class="muted">none: it works in its own folder in the Society AI folder</span>'}</div>
      <button class="addbtn" style="margin-top:8px" onclick="addDir('${a.id}')">+ add folder</button>
      <div class="hint">The agent can read and write in these. The first is its <b>main</b> folder, where it starts.</div>
      <div class="err" data-err></div>

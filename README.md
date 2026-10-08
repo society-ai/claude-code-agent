@@ -153,19 +153,28 @@ How the bridge applies it:
 
 - **Owner or contact.** A request is yours only when the router marks it as coming from the owner AND its authenticated user id matches the owner id the bridge learned at login. Everything else, including your own other agents, is a contact. Anything the bridge cannot classify gets `chat`.
 - **A limit, not an instruction.** The agent is told who is asking, their level, your note, and the limit actually applied, and decides within it what to share or do. It can always decline. The hard limits make sure a request that talks it into more still cannot get it.
-- **Separate sessions.** Each contact conversation runs in its own session (`contact:<sender>:<conversation>`), so a contact can never continue one of your sessions. Contact sessions start in the agent's `contacts/` folder (see [Where sessions show up](#where-sessions-show-up)), so their file access stays away from whatever your own sessions leave in the agent's folder.
+- **Separate sessions.** Each contact conversation runs in its own session (`contact:<sender>:<conversation>`), so a contact can never continue one of your sessions. Contact sessions start in that contact's own empty session folder (see [Where sessions show up](#where-sessions-show-up)), away from your files and from your own sessions.
 - **Nothing private.** Contact sessions at `chat` and `read` run with `--restricted` (no command tools, your user settings, `CLAUDE.md` and memory not loaded), without the agent's Society AI credential, and without the platform blocks that describe your own work (recent activity, company scope).
 - **This computer's limit.** `CONTACT_PERMISSION_LIMIT` caps every contact on this machine, whatever Society AI says. Set it in `./status.sh`.
 - **Session mode only.** With session mode off (or in secured mode), the bridge serves the owner only and declines contacts.
 
 ### Where sessions show up
 
-Every session the bridge starts has Remote Control on, so it appears in the Claude Code sidebar (desktop app and claude.ai/code) while it is open.
+Everything below lives on this computer, in the **Society AI folder** (`SOCIETY_AI_HOME`, default `~/Society AI`; change it in `./status.sh`):
 
-- **One group per agent.** Each agent gets a folder, `~/Society AI/<display name>/`. Your sessions start there and contact sessions in its `contacts/` subfolder; the agent's work folders (`WORK_DIR`, `EXTRA_DIRS`) are granted on top, and their `CLAUDE.md` still loads. The sidebar groups sessions by git repository name, so the agent folder is a git repo with a placeholder remote that makes the group read `Society-AI-<name>` (`https://societyai.com/agents/Society-AI-<name>.git`). Nothing is ever pushed there and the address does not need to exist. The bridge also writes a `CLAUDE.md` there that tells the agent the folder is only a placeholder and names its real work folders, plus a `.gitignore` so the placeholder repo stays empty (both rewritten on every start).
+```
+~/Society AI/
+  <agent>/                 the agent's own work folder (its default WORK_DIR)
+  .sessions/               hidden: where sessions start
+    <you>/<agent>/         your conversations       -> sidebar group "Society-AI-<you>"
+    <contact>/<agent>/     a contact's conversations -> sidebar group "Society-AI-<contact>"
+```
+
+- **Grouped by who you talk to.** The Claude Code sidebar (desktop app and claude.ai/code) groups Remote Control sessions by git repository name, so each sender folder under `.sessions` is a git repo with a placeholder remote named `Society-AI-<sender>`. Nothing is ever pushed there and the address does not need to exist. Titles start with the agent's name, since one group can hold several of your agents. Your name comes from `OWNER_NAME`, else your Society AI profile, else your email.
+- **Work folders.** A new agent works in its own folder, `<Society AI folder>/<agent>`, until you grant more with `./status.sh` (`WORK_DIR`, `EXTRA_DIRS`). A `CLAUDE.md` in your session folders points the agent at its work folders, whose own `CLAUDE.md` still loads.
 - **Open sessions are listed; closed ones are not.** A session is closed after `IDLE_REAP_MINUTES` (15) idle, or when the agent has `MAX_CONCURRENT` (10) open and needs room. Each open session is a Claude Code process of about 300 MB.
 - **Closed is not lost.** The next message in that conversation reopens the same session with its history, under the same sidebar entry. The bridge remembers which conversation belongs to which session across restarts (`sessions.json` in its state folder). `./status.sh` lists recent closed sessions with a **Reopen** button.
-- Every conversation is also recorded in the Society AI app, which keeps them permanently.
+- **Recording.** Your own sessions are recorded to your Society AI account (`MIRROR`). Conversations with contacts are **not**, unless you turn on `MIRROR_CONTACTS`: by default they stay on this computer.
 - **Delivery ticks.** For your messages in the Society AI app, the bridge reports how each one is getting to the agent: `waking` (its session is starting or reopening), `received` (it landed in the session) or `unreachable` (the session could not start or never picked it up). Each state is reported to the app and also sent on the live reply stream (a `delivery` data part), so the tick moves the moment it happens.
 
 ### What `.env` contains
@@ -392,7 +401,10 @@ All configuration is via environment variables (set in `.env`):
 | `AGENT_NAME` | No | `claude-code-<user>-<host>` (set by setup.sh) | Agent identity |
 | `DISPLAY_NAME` | No | — | The agent's user-facing display name (quoted if it has spaces); shown in session banners, accepted by `switch_agent` |
 | `COMPANY_ID` | No | — | Default company UUID |
-| `WORK_DIR` | No | Current directory | Where Claude Code runs (standard mode only) |
+| `WORK_DIR` | No | `<Society AI folder>/<agent>` | The agent's main work folder (standard mode only) |
+| `SOCIETY_AI_HOME` | No | `~/Society AI` | Where agents' own folders and session folders live (see [Where sessions show up](#where-sessions-show-up)) |
+| `OWNER_NAME` | No | profile name, else email | Your name in the sidebar group of your conversations |
+| `MIRROR_CONTACTS` | No | `false` | Also record conversations with contacts to Society AI |
 | `EXTRA_DIRS` | No | — | Comma-separated additional dirs the agent can read/write (see [File access scope](#file-access-scope)) |
 | `STATUS_VERBOSITY` | No | `normal` | How much intermediate work to surface to the chat — `quiet` / `normal` / `verbose` |
 | `CONTACT_PERMISSION_LIMIT` | No | `act` | The most this agent may do for any contact on this computer: `chat`, `read` or `act` (see [Contacts and permissions](#contacts-and-permissions)) |
@@ -431,6 +443,7 @@ claude-code-agent/
 ├── bridge.py               # WebSocket bridge daemon
 ├── bridge_ipc.py           # Unix-socket JSON-RPC for bridge ↔ MCP server
 ├── contacts.py             # Who sent a request, and what the agent may do for them
+├── folders.py              # The Society AI folder: agent work folders, session groups
 ├── bridge_launcher.sh      # Wrapper used by the LaunchAgent (sources .env)
 ├── api.py                  # Shared HTTP client
 ├── mcp_server.py           # MCP server with the 45 Society AI tools
