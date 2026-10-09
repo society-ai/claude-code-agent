@@ -196,7 +196,9 @@ class LaunchFlags(TempHome):
         cwd, cmd, env, unset = self.mgr._contact_command(self.rec("chat"), self.pol, False)
         self.assertEqual(cwd, self.contacts)
         self.assertIn("--restricted", cmd)
-        self.assertEqual(cmd[cmd.index("--tools") + 1], "")
+        # Read only, to open files this contact attached; --restricted keeps it
+        # inside the contact's own session folder (no --add-dir).
+        self.assertEqual(cmd[cmd.index("--tools") + 1], "Read")
         self.assertIn("--strict-mcp-config", cmd)
         self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "dontAsk")
         self.assertNotIn("bypassPermissions", cmd)

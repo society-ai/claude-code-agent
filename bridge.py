@@ -26,6 +26,7 @@ import asyncio
 import json
 import logging
 import os
+import pathlib
 import re
 import signal
 import socket
@@ -73,6 +74,7 @@ from contacts import (
 from dataclasses import replace
 from streaming import StreamMapper, _data_part
 import folders
+from attachments import FILES_DIRNAME, Attachment, fetch_all, parse_file_parts, prompt_block
 from typing import Any, Awaitable, Callable, Optional
 
 logging.basicConfig(
@@ -111,6 +113,11 @@ STANDING_BLOCK_KINDS = frozenset({"identity", "scope", "activity"})
 # The event we are looking for was pushed seconds ago, so it is always in the
 # tail; a resumed session's full transcript can be megabytes.
 _ACK_TAIL_BYTES = 256 * 1024
+# A turn is over when its last assistant entry has one of these stop
+# reasons ("tool_use" means more is coming; "refusal" is often followed by a
+# fallback model's retry). How long to wait for that after the Stop hook.
+FINAL_STOP_REASONS = frozenset({"end_turn", "stop_sequence", "max_tokens"})
+TURN_FINAL_WAIT_S = 6.0
 # Registration rejections that retrying can never clear. Anything else (a
 # stale connection during a restart, a registry lookup that failed closed) is
 # transient and worth backing off into. Matched case-insensitively on the
@@ -629,6 +636,8 @@ class AgentContext:
             # says otherwise.
             "AGENT_ROUTER_API_URL": self.api_url,
             "SOCIETY_AI_BRIDGE_SOCKET": self.socket,
+            # Where get_file saves what it opens: the agent's work folder.
+            "SOCIETY_AI_WORK_DIR": self.work_dir,
         }
 
 
@@ -1154,6 +1163,9 @@ class Bridge:
                 user_text += part.get("text", "")
             elif isinstance(part, str):
                 user_text += part
+        # Files travel as references (artifact ids); the session path
+        # downloads them and names them in the prompt.
+        attachments = parse_file_parts(parts)
 
         # Composed dispatch (docs/design/agent-instruction-hierarchy.md):
         # routers that run the dispatch composer send structured fields —
@@ -1303,6 +1315,7 @@ class Bridge:
                             protocol_text=protocol_text, standing_text=standing_text,
                             sender=sender, permission=permission,
                             delivery_chat_id=delivery_chat_id,
+                            attachments=attachments,
                         )
                     elif not sender.is_owner:
                         # The one-shot spawn path (session mode off, or the
@@ -2150,8 +2163,12 @@ class Bridge:
             return {"error": True, "message": str(e)}
 
     @staticmethod
-    def _turn_reply_text(cwd: str, session_id: str, event_id: str) -> Optional[str]:
-        """The prose a session wrote in response to one channel event.
+    def _turn_reply(cwd: str, session_id: str, event_id: str) -> tuple[Optional[str], bool]:
+        """The prose a session wrote in response to one channel event, and
+        whether the turn's last entry is final (stop_reason end_turn,
+        stop_sequence or max_tokens). A turn that used a tool has an earlier
+        text block with stop_reason tool_use: reading before the final block
+        is flushed would return the agent's opening line as its whole answer.
 
         This is the response, full stop. There is no reply tool: asking the
         model to call one made delivery depend on it choosing to, which it
@@ -2181,19 +2198,20 @@ class Bridge:
                       errors="replace") as fh:
                 lines = fh.read().splitlines()
         except FileNotFoundError:
-            return None
+            return None, False
         except OSError as e:
             logger.warning("Could not read transcript for %s: %s", session_id[:8], e)
-            return None
+            return None, False
 
         start = -1
         for i, raw in enumerate(lines):
             if any(n in raw for n in needles):
                 start = i
         if start < 0:
-            return None
+            return None, False
 
         out: list[str] = []
+        last_stop: Optional[str] = None
         for raw in lines[start + 1:]:
             try:
                 d = json.loads(raw)
@@ -2210,13 +2228,14 @@ class Bridge:
                 continue
             if kind != "assistant" or not isinstance(msg, dict):
                 continue
+            last_stop = msg.get("stop_reason")
             for c in msg.get("content", []):
                 if isinstance(c, dict) and c.get("type") == "text":
                     text = (c.get("text") or "").strip()
                     # Streaming can re-emit a block; never repeat it.
                     if text and (not out or out[-1] != text):
                         out.append(text)
-        return "\n\n".join(out).strip()
+        return "\n\n".join(out).strip(), last_stop in FINAL_STOP_REASONS
 
     @staticmethod
     def _turn_api_error(cwd: str, session_id: str, event_id: str) -> Optional[str]:
@@ -2230,7 +2249,7 @@ class Bridge:
         Scanning for the flag turns that into an immediate, explainable
         failure.
 
-        Same bounded window as _turn_reply_text: after our channel event,
+        Same bounded window as _turn_reply: after our channel event,
         stopping at the next one, main session only.
         """
         from transcript_shipper import transcript_path
@@ -2320,15 +2339,23 @@ class Bridge:
         if not isinstance(fut, asyncio.Future) or fut.done():
             return False
 
-        # The hook can beat the transcript's last flush by a hair; a couple
-        # of short retries costs nothing and avoids completing a task with
-        # an empty body that the session did in fact write.
+        # The Stop hook can beat the transcript's last flush: the final text
+        # block is written a moment later. Wait (briefly) for the turn's last
+        # entry to be final; a turn that used a tool otherwise comes back as
+        # just its opening line. If it never turns final (a refusal with no
+        # fallback, an odd stop reason), take what is there.
         text: Optional[str] = None
-        for _ in range(3):
-            text = self._turn_reply_text(pending["cwd"], session_id, task_id)
-            if text:
+        deadline = time.time() + TURN_FINAL_WAIT_S
+        while True:
+            text, final = self._turn_reply(pending["cwd"], session_id, task_id)
+            if text is not None and final:
                 break
-            await asyncio.sleep(0.4)
+            if time.time() >= deadline:
+                if text is not None:
+                    logger.warning("Turn for task %s never reached a final entry; using %d chars",
+                                   task_id, len(text))
+                break
+            await asyncio.sleep(0.3)
 
         if text is None:
             # A turn ended, but not ours — our event is not in the transcript
@@ -2448,6 +2475,7 @@ class Bridge:
         sender: Sender | None = None,
         permission: str | None = None,
         delivery_chat_id: str | None = None,
+        attachments: list[Attachment] | None = None,
     ) -> None:
         """Dispatch a work item into a persistent session and wait for its
         reply, then complete the A2A task. The event_id we send IS the A2A
@@ -2469,6 +2497,24 @@ class Bridge:
         existing = mgr.get(work_item_key)
         if existing is None or existing.state != "ready":
             report("waking")  # a cold start or a reopen takes several seconds
+
+        # The message's files download while the session starts. The owner's
+        # land in the agent's work folder; a contact's in that contact's own
+        # session folder, where no other contact (and none of the owner's
+        # sessions) works, so one contact's file is never visible to another.
+        is_contact = sender is not None and not sender.is_owner
+        fetch_task = None
+        if attachments:
+            if is_contact:
+                pol = mgr.policy(self.ctx.name)
+                base = (existing.cwd if existing is not None and existing.cwd
+                        else str(folders.session_dir(sender.group, self.ctx.name, pol.display_name)))
+            else:
+                base = self.ctx.work_dir
+            fetch_task = asyncio.ensure_future(fetch_all(
+                _get_http_client(), self.ctx.api_url, self.ctx.token,
+                attachments, pathlib.Path(base) / FILES_DIRNAME,
+            ))
         # Ensure (launch or resume) the work item's session. Trigger-kind
         # work (wakes, schedules, status echoes) runs headless — no Remote
         # Control sidebar row.
@@ -2554,6 +2600,14 @@ class Bridge:
             )
             return
 
+        if fetch_task is not None:
+            # get_file is only in sessions that load the society-ai MCP:
+            # the owner's, and "act" contacts'.
+            fetched = await fetch_task
+            content = content + "\n\n" + prompt_block(
+                fetched, can_get_file=not is_contact or permission == "act"
+            )
+
         loop = asyncio.get_event_loop()
         fut: asyncio.Future = loop.create_future()
         self._pending_session_tasks[event_id := task_id] = fut
@@ -2625,7 +2679,7 @@ class Bridge:
                 # The turn never ended: still working past the limit, or the
                 # Stop hook never fired. Fall back to whatever the session
                 # has written so far rather than discarding a real answer.
-                text = self._turn_reply_text(work_dir, rec.session_id, task_id)
+                text, _ = self._turn_reply(work_dir, rec.session_id, task_id)
                 if text:
                     logger.warning(
                         "Task %s timed out; returning %d chars written so far",

@@ -177,6 +177,14 @@ Everything below lives on this computer, in the **Society AI folder** (`SOCIETY_
 - **Recording.** Your own sessions are recorded to your Society AI account (`MIRROR`). Conversations with contacts are **not**, unless you turn on `MIRROR_CONTACTS`: by default they stay on this computer.
 - **Delivery ticks.** For your messages in the Society AI app, the bridge reports how each one is getting to the agent: `waking` (its session is starting or reopening), `received` (it landed in the session) or `unreachable` (the session could not start or never picked it up). Each state is reported to the app and also sent on the live reply stream (a `delivery` data part), so the tick moves the moment it happens.
 
+### Files in messages
+
+A message can carry files: references to Society AI artifacts, never the bytes. When one arrives, the bridge downloads its files with the agent's own token (the platform checks access) while the session starts, then lists them under `[Attachments]` in the prompt. Claude opens images with its Read tool, which shows them.
+
+- **Where they land depends on who sent them.** Yours go to `<work folder>/files/`. A contact's go to that contact's own session folder (`files/` under `.sessions/<contact>/<agent>/`), so one contact's file is never visible to another contact or among your files. "Chat only" contacts get the Read tool for exactly this, confined to that folder.
+- **Limits.** 50 MB per file and 100 MB per message; larger files are listed but not downloaded (your sessions can open them with `get_file`). Images over Claude's 5 MB limit are noted. Files are never executable, archives are not unpacked, names are sanitized and prefixed with the file's id. A file that cannot be fetched is listed with the reason, and the message is delivered anyway.
+- **Tools.** `get_file` and `list_files` are only in sessions that load the Society AI tools: yours, and contacts at "act". Contacts below that can never open your workspace files.
+
 ### What `.env` contains
 `SOCIETY_AI_AUTH_TOKEN` ends up in `~/.claude/settings.json` (so the MCP server can authenticate) and in the bridge process env. Both files are user-readable only. If you share a machine, consider a per-user account or secured mode.
 
@@ -319,6 +327,8 @@ Both tools talk to the bridge over a local Unix socket at `$SOCIETY_AI_BRIDGE_SO
 | Tool | Description |
 |------|-------------|
 | `save_artifact` | Upload a local file as an artifact (see [Publishing Artifacts](#publishing-artifacts)) |
+| `get_file` | Open a file the agent may see (its own, sent to it, or in its workspaces) and save it under `<work folder>/files/` (see [Files in messages](#files-in-messages)) |
+| `list_files` | List the files in a company, space or project the agent belongs to |
 | `pin_artifact` / `unpin_artifact` | Pin an artifact to a company/space/project/task |
 | `list_pinned_artifacts` | List artifacts pinned to an entity |
 | `search_kb` | Semantic KB search |

@@ -44,8 +44,10 @@ PRIVATE_BLOCK_KINDS = frozenset({"activity", "scope"})
 # machine (the machine limit can make it lower than the platform's level).
 LIMIT_TEXT = {
     "chat": (
-        "In this conversation you cannot use any tools, files or commands. "
-        "Answer only from what you already know."
+        "In this conversation you cannot run commands, change files or use "
+        "Society AI tools, and you cannot see your owner's files. You can only "
+        "open files this sender attached, listed under [Attachments]. Answer "
+        "from what you already know."
     ),
     "read": (
         "In this conversation you can read and search files in your work "

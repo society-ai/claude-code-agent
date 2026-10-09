@@ -56,7 +56,10 @@ CONTACT_STRIPPED_ENV = (
 )
 
 # Built-in tools a contact session gets per level. `act` gets everything.
-CONTACT_TOOLS = {"chat": "", "read": "Read,Grep,Glob"}
+# "chat" gets Read only to open the files that sender attached: the session
+# runs in that contact's own empty folder (no --add-dir), and --restricted
+# confines file tools to it.
+CONTACT_TOOLS = {"chat": "Read", "read": "Read,Grep,Glob"}
 
 # How long to hold out for the channel banner before accepting a bare input
 # prompt as "ready". Channel load takes ~1-3s on a warm machine; this leaves
@@ -669,14 +672,18 @@ class SessionManager:
                 await asyncio.sleep(1.0)
                 continue
             if "trust" in low and ("yes, i trust" in low or "do you trust" in low):
-                # Normally the highlighted default is "trust"; in --restricted
-                # mode it is "No, exit". Move off it before confirming.
+                # The highlighted default is "No, exit" (in --restricted mode,
+                # and in normal mode since CLI 2.1.29x). Enter on it ends the
+                # session, so confirm only once the cursor is on "trust": a key
+                # sent before the TUI accepts input is dropped, so move, then
+                # look again on the next pass rather than pressing Enter blind.
                 cursor = next((ln for ln in pane.splitlines() if "❯" in ln), "").lower()
-                if "no" in cursor and "trust" not in cursor:
+                if "trust" in cursor:
+                    await self._tmux_send(tmux_name, "", enter=True)
+                    await asyncio.sleep(1.0)
+                else:
                     await self._tmux_send(tmux_name, "Down")
-                    await asyncio.sleep(0.3)
-                await self._tmux_send(tmux_name, "", enter=True)
-                await asyncio.sleep(1.0)
+                    await asyncio.sleep(0.5)
                 continue
             if "loading development channels" in low and "local development" in low:
                 await self._tmux_send(tmux_name, "", enter=True)  # default = dev

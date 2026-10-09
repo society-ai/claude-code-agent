@@ -53,6 +53,7 @@ from typing import Any, Optional
 from mcp.server.fastmcp import FastMCP
 
 import api
+import attachments
 import bridge_ipc
 import identity
 from config import ENABLE_AGENT_LIFECYCLE
@@ -1068,6 +1069,94 @@ async def save_artifact(
         body["pin_to"] = pin
 
     return _result(await api.post("/api/v1/artifacts", body))
+
+
+def _files_dir() -> str:
+    """Where get_file saves: the agent's work folder (injected by the bridge
+    into the sessions it launches), else the session's own folder."""
+    return os.path.join(os.environ.get("SOCIETY_AI_WORK_DIR") or os.getcwd(), attachments.FILES_DIRNAME)
+
+
+@mcp.tool()
+async def get_file(artifact_id: str) -> str:
+    """Open a Society AI file (an artifact) and save it locally.
+
+    Works for files this agent produced, files sent to it in a message, and
+    files in workspaces (companies, spaces, projects) the agent belongs to.
+    Files that arrive with a message are already downloaded and listed under
+    [Attachments], so use this for other files: ones named in a task result,
+    an older message, or found with list_files.
+
+    Saves into the agent's work folder under files/ and returns the local
+    path. Open images with the Read tool to see them. Files over 50 MB are
+    not downloaded: the result carries a 10-minute download link instead.
+
+    Args:
+        artifact_id: The file's artifact id.
+    """
+    try:
+        _validate_uuid(artifact_id, "artifact_id")
+    except ValueError as e:
+        return _result(_error(str(e)))
+    ident = _ident()
+    try:
+        info = await attachments.file_info(api.client(), ident.api_url, ident.token, artifact_id)
+    except PermissionError:
+        return _result(_error("No such file, or this agent cannot open it.", status=404))
+    except Exception as e:
+        return _result(_error(f"Could not look up the file: {e}"))
+    out = attachments.describe(info)
+    size = int(info.get("size") or 0)
+    if size > attachments.MAX_FILE_BYTES:
+        out.update(url=info.get("url"), url_expires_at=info.get("url_expires_at"),
+                   note="Over 50 MB, not downloaded. The link expires in about 10 minutes.")
+        return _result(out)
+    dest = os.path.join(_files_dir(), attachments.safe_filename(artifact_id, info.get("name") or "file"))
+    try:
+        size = await attachments.download(api.client(), info["url"], attachments.pathlib.Path(dest),
+                                          attachments.MAX_FILE_BYTES)
+    except Exception as e:
+        return _result(_error(f"Could not download the file: {e}"))
+    out.update(path=dest, size=size)
+    if str(info.get("mime_type") or "").startswith("image/"):
+        out["note"] = "An image: open the path with the Read tool to see it."
+    return _result(out)
+
+
+@mcp.tool()
+async def list_files(
+    company_id: Optional[str] = None,
+    space_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+    limit: int = 50,
+    cursor: Optional[str] = None,
+) -> str:
+    """List the files in a workspace this agent belongs to.
+
+    Give exactly one of company_id, space_id or project_id. Returns
+    {files: [{id, name, mime_type, size, added_by, created_at}], next_cursor};
+    open one with get_file(id). Pass next_cursor back as cursor for more.
+
+    Args:
+        company_id: A company the agent belongs to.
+        space_id: A space the agent belongs to.
+        project_id: A project the agent belongs to.
+        limit: How many to return (1-200, default 50).
+        cursor: next_cursor from a previous call.
+    """
+    scopes = {k: v for k, v in (("company_id", company_id), ("space_id", space_id),
+                                ("project_id", project_id)) if v}
+    if len(scopes) != 1:
+        return _result(_error("Give exactly one of company_id, space_id or project_id."))
+    for name, value in scopes.items():
+        try:
+            _validate_uuid(value, name)
+        except ValueError as e:
+            return _result(_error(str(e)))
+    params: dict[str, Any] = {**scopes, "limit": max(1, min(int(limit or 50), 200))}
+    if cursor:
+        params["cursor"] = cursor
+    return _result(await api.get("/api/v1/files", params=params))
 
 
 @mcp.tool()
