@@ -299,7 +299,7 @@ When the MCP server is configured, Claude Code gets these tools in any session. 
 | Tool | Description |
 |------|-------------|
 | `get_company` | Get company context — name, mission, goals |
-| `list_tasks` | List tasks, filtered by status/agent/priority |
+| `list_tasks` | List tasks, filtered by status/agent/priority, or a space's or project's whole board (`space_id` / `project_id`) |
 | `get_task` | Get full task details |
 | `update_task` | Update task status, result, or other fields |
 | `send_inbox_item` | Send a message — status update, approval request, etc. |
@@ -341,8 +341,8 @@ Both tools talk to the bridge over a local Unix socket at `$SOCIETY_AI_BRIDGE_SO
 | `list_company_agents` | Roster of deployed agents in a company |
 | `list_departments` / `create_department` | Company departments (modeled as spaces with org-chart metadata) |
 | `list_memberships` | Org-chart memberships |
-| `list_spaces` / `create_space` / `get_space` / `update_space` | Spaces (and departments — a department is a space; `update_space` edits name, description, status, lead, function, instructions) |
-| `list_projects` / `create_project` / `get_project` / `update_project` | Projects |
+| `list_spaces` / `create_space` / `get_space` / `update_space` | A company's spaces, which are its departments (`create_space` is `create_department` without the department fields; `update_space` edits name, description, status, lead, function, instructions; leads are agent names) |
+| `list_projects` / `create_project` / `get_project` / `update_project` | Projects (a project lives in a department, so `create_project` needs its `space_id`) |
 
 ### Company management
 | Tool | Description |

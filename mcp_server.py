@@ -142,6 +142,15 @@ def _validate_uuid(value: str, name: str) -> str:
     return value
 
 
+def _validate_agent_name(value: str, name: str) -> str:
+    """An agent's canonical name (its handle, e.g. "jenkins"): what lead
+    fields store and what the app links to as /agents/<name>."""
+    value = (value or "").strip()
+    if not value or len(value) > 255 or any(c.isspace() for c in value):
+        raise ValueError(f"{name} must be an agent's name (its handle, e.g. 'jenkins')")
+    return value
+
+
 def _validate_agent_name(value: str, name: str = "agent_name") -> str:
     """Reject names containing path separators or shell metacharacters."""
     if not isinstance(value, str) or not _AGENT_NAME_RE.match(value):
@@ -268,21 +277,39 @@ async def list_tasks(
     status: Optional[str] = None,
     assigned_to_agent: Optional[str] = None,
     priority: Optional[str] = None,
+    space_id: Optional[str] = None,
+    project_id: Optional[str] = None,
     limit: int = 50,
 ) -> str:
-    """List tasks, optionally filtered by company, status, agent, or priority.
+    """List tasks, optionally filtered by company, workspace, status, agent, or priority.
 
-    Works in both personal scope (no company_id) and company scope. When called
-    by an agent without ``company_id`` and without an explicit ``assigned_to_agent``
-    filter, the platform defaults to tasks where this agent is creator or assignee
-    across every scope it touches.
+    - With ``space_id`` or ``project_id``: that workspace's board, every task
+      filed there, for anyone who can read the space or project.
+    - With ``company_id``: the company's tasks (needs membership).
+    - With neither: the tasks this agent created or is assigned, across every
+      scope it touches (personal and every company).
+
+    Args:
+        company_id: A company UUID. Falls back to COMPANY_ID, except when a
+            space or project is given (then only an explicit company_id is
+            sent, so a plain space's board is not filtered away).
+        status, priority: Filters.
+        assigned_to_agent: Only tasks assigned to this agent name.
+        space_id: A space (department, team) UUID: its board.
+        project_id: A project UUID: its board.
+        limit: 1-200, default 50.
     """
-    cid = (company_id or _ident().company_id or "").strip()
-    if cid:
-        try:
+    workspace = bool(space_id or project_id)
+    cid = (company_id or ("" if workspace else _ident().company_id) or "").strip()
+    try:
+        if cid:
             _validate_uuid(cid, "company_id")
-        except ValueError as e:
-            return _result(_error(str(e)))
+        if space_id:
+            _validate_uuid(space_id, "space_id")
+        if project_id:
+            _validate_uuid(project_id, "project_id")
+    except ValueError as e:
+        return _result(_error(str(e)))
     for err in (
         _enum_check(status, _VALID_TASK_STATUSES, "status"),
         _enum_check(priority, _VALID_TASK_PRIORITIES, "priority"),
@@ -299,6 +326,10 @@ async def list_tasks(
         params["assigned_to_agent"] = assigned_to_agent
     if priority:
         params["priority"] = priority
+    if space_id:
+        params["space_id"] = space_id
+    if project_id:
+        params["project_id"] = project_id
     return _result(await api.get("/api/v1/agent-tasks", params=params))
 
 
@@ -335,6 +366,10 @@ async def update_task(
     moves the task to in_review, pass ``review_assigned_to`` together with
     ``review_assigned_to_type`` ('agent' or 'user'). The trigger routing
     uses these fields to direct the in_review notification.
+
+    Changing someone else's company task needs editor or higher in that
+    company, or a role on the task: the assignee hands it in for review
+    (in_review); the creator or reviewer closes it.
     """
     try:
         _validate_uuid(task_id, "task_id")
@@ -642,6 +677,10 @@ async def create_task(
     typically the agent assigns to itself. Without an assignee the task lands
     in 'todo' but never dispatches.
 
+    Who can see and change it: the agent's owner can read any task given to
+    their agent; writing tasks in a workspace needs editor or higher there, or
+    member or higher for tasks the caller created.
+
     Args:
         title: Short task title (required).
         company_id: Optional company UUID. Falls back to COMPANY_ID env var.
@@ -649,8 +688,12 @@ async def create_task(
         description: Longer free-form description.
         assigned_to_agent: Agent name to assign the task to.
         priority: low, medium, high, critical. Defaults to medium.
-        space_id: Optional space (department) UUID — company tasks only.
-        project_id: Optional project UUID — company tasks only.
+        space_id: Optional space UUID (a company department, or a plain
+            space or team) to file the task on that space's board. A
+            personal task can be filed into a plain space or project when
+            this agent is a member of it (or higher), judged by the agent's
+            own membership, not its owner's.
+        project_id: Optional project UUID, the same way.
         acceptance_criteria: List of acceptance criteria strings.
         parent_task_id: Optional parent task for sub-tasks.
         review_assigned_to: Optional reviewer for this task. When set, the
@@ -1706,21 +1749,22 @@ async def create_department(
     dept_function: Optional[str] = None,
     lead_agent_id: Optional[str] = None,
 ) -> str:
-    """Create a department (space with department metadata) in a company.
+    """Create a department in a company. A company's departments are its
+    spaces (list them with list_spaces or list_departments).
 
     Args:
         name: Department name.
         company_id: Company UUID.
         description: Optional description.
         dept_function: Optional dept function tag (e.g. "engineering").
-        lead_agent_id: Optional lead agent UUID.
+        lead_agent_id: Optional lead agent's name (its handle, e.g. "jenkins").
     """
     if not name or not name.strip():
         return _result(_error("name is required"))
     try:
         cid = _resolve_company_id(company_id)
         if lead_agent_id:
-            _validate_uuid(lead_agent_id, "lead_agent_id")
+            lead_agent_id = _validate_agent_name(lead_agent_id, "lead_agent_id")
     except ValueError as e:
         return _result(_error(str(e)))
     body: dict[str, Any] = {"name": name.strip()}
@@ -1751,7 +1795,8 @@ async def list_memberships(
 
 @mcp.tool()
 async def list_spaces(company_id: Optional[str] = None) -> str:
-    """List spaces in a company (companies model departments as spaces)."""
+    """List a company's spaces. A company's spaces are its departments:
+    create one with create_space or create_department."""
     try:
         cid = _resolve_company_id(company_id)
     except ValueError as e:
@@ -1765,7 +1810,15 @@ async def create_space(
     company_id: Optional[str] = None,
     description: Optional[str] = None,
 ) -> str:
-    """Create a space in a company."""
+    """Create a space in a company, for your owner. A company's spaces are
+    its departments: this is create_department without the department fields
+    (function tag, lead); set those later with update_space if needed.
+
+    Args:
+        name: Space name.
+        company_id: Company UUID. Falls back to COMPANY_ID.
+        description: Optional description.
+    """
     if not name or not name.strip():
         return _result(_error("name is required"))
     try:
@@ -1802,24 +1855,30 @@ async def list_projects(company_id: Optional[str] = None) -> str:
 @mcp.tool()
 async def create_project(
     name: str,
+    space_id: str,
     company_id: Optional[str] = None,
-    space_id: Optional[str] = None,
     description: Optional[str] = None,
 ) -> str:
-    """Create a project in a company."""
+    """Create a project in a company. A project lives in a space (one of the
+    company's departments), so space_id is required: find it with
+    list_departments or list_spaces.
+
+    Args:
+        name: Project name.
+        space_id: The department (space) UUID the project belongs to.
+        company_id: Company UUID. Falls back to COMPANY_ID.
+        description: Optional description.
+    """
     if not name or not name.strip():
         return _result(_error("name is required"))
     try:
         cid = _resolve_company_id(company_id)
-        if space_id:
-            _validate_uuid(space_id, "space_id")
+        _validate_uuid(space_id, "space_id")
     except ValueError as e:
         return _result(_error(str(e)))
-    body: dict[str, Any] = {"name": name.strip()}
+    body: dict[str, Any] = {"name": name.strip(), "space_id": space_id}
     if description is not None:
         body["description"] = description
-    if space_id:
-        body["space_id"] = space_id
     return _result(await api.post(f"/api/v1/companies/{cid}/projects", body))
 
 
@@ -1855,7 +1914,7 @@ async def update_space(
         space_id: Space (department) UUID.
         company_id: Company UUID.
         name, description, status: Basic fields.
-        lead_agent_id: Lead agent UUID.
+        lead_agent_id: Lead agent's name (its handle, e.g. "jenkins").
         dept_function: Function tag (e.g. "engineering").
         instructions: Standing instructions for work in this space.
     """
@@ -1863,7 +1922,7 @@ async def update_space(
         cid = _resolve_company_id(company_id)
         _validate_uuid(space_id, "space_id")
         if lead_agent_id:
-            _validate_uuid(lead_agent_id, "lead_agent_id")
+            lead_agent_id = _validate_agent_name(lead_agent_id, "lead_agent_id")
     except ValueError as e:
         return _result(_error(str(e)))
     body: dict[str, Any] = {}
@@ -1896,7 +1955,7 @@ async def update_project(
         project_id: Project UUID.
         company_id: Company UUID.
         name, description, status: Basic fields.
-        lead_agent_id: Lead agent UUID.
+        lead_agent_id: Lead agent's name (its handle, e.g. "jenkins").
         target_date: ISO-8601 date or datetime.
         instructions: Standing instructions for work in this project.
     """
@@ -1904,7 +1963,7 @@ async def update_project(
         cid = _resolve_company_id(company_id)
         _validate_uuid(project_id, "project_id")
         if lead_agent_id:
-            _validate_uuid(lead_agent_id, "lead_agent_id")
+            lead_agent_id = _validate_agent_name(lead_agent_id, "lead_agent_id")
     except ValueError as e:
         return _result(_error(str(e)))
     body: dict[str, Any] = {}
