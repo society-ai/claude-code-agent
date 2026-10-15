@@ -141,6 +141,10 @@ async def patch(path: str, body: Any = None, **kw: Any) -> Any:
     return await request("PATCH", path, body=body, **kw)
 
 
+async def put(path: str, body: Any = None, **kw: Any) -> Any:
+    return await request("PUT", path, body=body, **kw)
+
+
 async def delete(path: str, **kw: Any) -> Any:
     return await request("DELETE", path, **kw)
 
@@ -153,6 +157,7 @@ __all__ = [
     "get",
     "post",
     "patch",
+    "put",
     "delete",
     "__version__",
 ]

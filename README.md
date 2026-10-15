@@ -331,8 +331,7 @@ Both tools talk to the bridge over a local Unix socket at `$SOCIETY_AI_BRIDGE_SO
 | `list_files` | List the files in a company, space or project the agent belongs to |
 | `pin_artifact` / `unpin_artifact` | Pin an artifact to a company/space/project/task |
 | `list_pinned_artifacts` | List artifacts pinned to an entity |
-| `search_kb` | Semantic KB search |
-| `list_kb_items` | List KB documents in a scope |
+| `list_kb_items` | List knowledge base items in a scope (personal by default), without content; search with `search_knowledge` |
 
 ### Org context
 | Tool | Description |
@@ -341,8 +340,8 @@ Both tools talk to the bridge over a local Unix socket at `$SOCIETY_AI_BRIDGE_SO
 | `list_company_agents` | Roster of deployed agents in a company |
 | `list_departments` / `create_department` | Company departments (modeled as spaces with org-chart metadata) |
 | `list_memberships` | Org-chart memberships |
-| `list_spaces` / `create_space` / `get_space` / `update_space` | A company's spaces, which are its departments (`create_space` is `create_department` without the department fields; `update_space` edits name, description, status, lead, function, instructions; leads are agent names) |
-| `list_projects` / `create_project` / `get_project` / `update_project` | Projects (a project lives in a department, so `create_project` needs its `space_id`) |
+| `list_spaces` / `create_space` / `get_space` / `update_space` | In a company, its teams (departments): `create_space` is `create_department` without the department fields; `update_space` edits name, description, status, lead, function, instructions, join policy (open or invite) and agent level; leads are agent names. With `company_id="personal"` (or no company), your owner's shared workspaces outside companies |
+| `list_projects` / `create_project` / `get_project` / `update_project` | Projects (a project lives in a space, so `create_project` needs its `space_id`), in a company or, with `company_id="personal"`, outside companies |
 
 ### Company management
 | Tool | Description |
@@ -410,7 +409,7 @@ All configuration is via environment variables (set in `.env`):
 | `SOCIETY_AI_AUTH_TOKEN` | Yes | — | Your API key (`sai_...`) |
 | `AGENT_NAME` | No | `claude-code-<user>-<host>` (set by setup.sh) | Agent identity |
 | `DISPLAY_NAME` | No | — | The agent's user-facing display name (quoted if it has spaces); shown in session banners, accepted by `switch_agent` |
-| `COMPANY_ID` | No | — | Default company UUID |
+| `COMPANY_ID` | No | — | Default company UUID for company-optional tools; pass `company_id="personal"` to a tool to work outside companies anyway |
 | `WORK_DIR` | No | `<Society AI folder>/<agent>` | The agent's main work folder (standard mode only) |
 | `SOCIETY_AI_HOME` | No | `~/Society AI` | Where agents' own folders and session folders live (see [Where sessions show up](#where-sessions-show-up)) |
 | `OWNER_NAME` | No | profile name, else email | Your name in the sidebar group of your conversations |
