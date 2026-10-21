@@ -44,12 +44,12 @@ encoded as {"error": true, ...} objects so the LLM can read and recover.
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 import re
 from typing import Any, Optional
 
+import httpx
 from mcp.server.fastmcp import FastMCP
 
 import api
@@ -1019,10 +1019,11 @@ async def save_artifact(
 ) -> str:
     """Publish a local file as a Society AI artifact (S3-backed, presigned URL).
 
-    Authenticates with the agent's normal sai_ token via agent_router's
-    `/api/v1/artifacts` route — no service key required. The route
-    internally proxies to ai-chatbot's service-auth ingest endpoint
-    while the service secret stays in the backend.
+    Files can be up to 10 MB, videos (mp4, webm, mov) up to 100 MB. The file
+    goes straight from disk to storage: agent_router's
+    `/api/v1/artifacts/upload-url` (with the agent's normal sai_ token)
+    returns a link signed for its type and size, the file is PUT there, and
+    `/api/v1/artifacts/complete` records it. No service key is involved.
 
     Args:
         file_path: Absolute path to a local file.
@@ -1080,15 +1081,15 @@ async def save_artifact(
             return _result(_error(str(e)))
 
     try:
-        with open(file_path, "rb") as f:
-            content = f.read()
+        size = os.path.getsize(file_path)
     except OSError as e:
         return _result(_error(f"Could not read {file_path}: {e}"))
+    if size == 0:
+        return _result(_error(f"{file_path} is empty"))
 
     body: dict[str, Any] = {
         "name": name.strip(),
         "mime_type": mime_type.strip(),
-        "bytes_base64": base64.b64encode(content).decode("ascii"),
         "source_type": "agent",
         "source_agent": _ident().name,
     }
@@ -1116,7 +1117,41 @@ async def save_artifact(
             pin["label"] = pin_to_label
         body["pin_to"] = pin
 
-    return _result(await api.post("/api/v1/artifacts", body))
+    # 1. A link signed for exactly this type and size (the router checks the
+    #    type, the size, the scopes and the owner's storage first).
+    link = await api.post("/api/v1/artifacts/upload-url", {**body, "size": size})
+    if not isinstance(link, dict) or link.get("error") or not link.get("upload_url"):
+        return _result(link)
+    # 2. The file, from disk to storage.
+    stored = await _put_file(link, file_path, size)
+    if stored is not None:
+        return _result(stored)
+    # 3. Recorded (measured in storage, then saved like any other artifact).
+    return _result(await api.post("/api/v1/artifacts/complete", {
+        **body, "artifact_id": link["artifact_id"], "file_key": link["file_key"],
+    }))
+
+
+# A 100 MB video on a slow uplink.
+_UPLOAD_TIMEOUT = 600.0
+
+
+async def _put_file(link: dict, file_path: str, size: int) -> Optional[dict]:
+    """Stream a file to an upload link with the headers it was signed for.
+    None when stored, else an error dict."""
+    async def chunks():
+        with open(file_path, "rb") as f:
+            while block := f.read(1024 * 1024):
+                yield block
+
+    headers = {**(link.get("headers") or {}), "Content-Length": str(size)}
+    try:
+        resp = await api.client().put(link["upload_url"], content=chunks(), headers=headers, timeout=_UPLOAD_TIMEOUT)
+    except httpx.HTTPError as e:
+        return _error(f"Uploading {os.path.basename(file_path)} failed: {e}")
+    if resp.status_code >= 300:
+        return _error(f"Storage refused the upload of {os.path.basename(file_path)} (HTTP {resp.status_code}). Try again.")
+    return None
 
 
 def _files_dir() -> str:

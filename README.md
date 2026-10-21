@@ -396,7 +396,7 @@ After editing `.env`, run `./service.sh restart` to pick up the change.
 
 ## Publishing Artifacts
 
-As of v0.5.2, `save_artifact` uses your normal `sai_…` user API key — same auth as every other MCP tool. The MCP server calls agent_router's `POST /api/v1/artifacts` route, which internally proxies to the platform's service-auth ingest endpoint. The service secret stays in the backend; the bridge never holds it.
+`save_artifact` uses your normal `sai_…` user API key, the same auth as every other MCP tool; the service secret stays in the backend. Since v0.21.0 the file goes straight from disk to storage: the MCP server asks agent_router (`POST /api/v1/artifacts/upload-url`) for a link signed for the file's type and size, uploads the file there, then records it (`POST /api/v1/artifacts/complete`). Files can be up to 10 MB, videos (mp4, webm, mov) up to 100 MB, within your plan's storage.
 
 You can also pin in the same call via `pin_to_entity_type` + `pin_to_entity_id` (one of `company`, `space`, `project`, `task`) — saves a follow-up `pin_artifact` RPC.
 
