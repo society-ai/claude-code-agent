@@ -94,6 +94,10 @@ HEARTBEAT_INTERVAL = 60  # seconds (hub timeout is 90s)
 # unreachable indefinitely (seen 2026-10-07: jenkins sat 7 hours like that).
 REGISTRATION_TIMEOUT_S = 30
 MAX_RECONNECT_DELAY = 60
+# How long a task.* frame waits for a registered connection before it is
+# dropped: the longest reconnect backoff plus a fresh JWT and registration,
+# with room. Matches the hub's delegation timeout.
+TASK_FRAME_HOLD_S = 180
 MAX_CONCURRENT_TASKS = max(1, int(os.getenv("MAX_CONCURRENT_TASKS", "3")))
 MAX_TRACKED_SESSIONS = 1000  # cap history/lock maps to prevent memory leak
 MAX_CHAT_HISTORY_TURNS = 10  # how many (user, assistant) pairs we keep per task
@@ -655,6 +659,9 @@ class Bridge:
         self.ctx = ctx or AgentContext.from_env()
         self.ws = None
         self.registered = False
+        # Set while the current connection is registered; task.* frames wait
+        # on it (see send()).
+        self._registered_event = asyncio.Event()
         # Whether the current (or most recent) connection ever got past
         # registration. Drives the reconnect backoff reset; see run().
         self._conn_registered = False
@@ -780,7 +787,26 @@ class Bridge:
         return f"msg-{self._msg_counter}"
 
     async def send(self, message: dict):
-        """Send a JSON-RPC message."""
+        """Send a JSON-RPC message.
+
+        A task.* frame waits, up to TASK_FRAME_HOLD_S, for a registered
+        connection: the hub refuses task frames until agent.register is
+        accepted on the connection, and between connections there is no
+        socket at all. Without the hold, a task that finishes during a
+        reconnect loses its reply and the chat waits forever. Everything
+        else goes out at once (agent.register and heartbeat must), or not
+        at all while disconnected.
+        """
+        method = message.get("method") or ""
+        if method.startswith("task.") and not self._registered_event.is_set():
+            try:
+                await asyncio.wait_for(self._registered_event.wait(), TASK_FRAME_HOLD_S)
+            except asyncio.TimeoutError:
+                logger.error(
+                    "%s for task %s dropped: no registered connection within %ds",
+                    method, (message.get("params") or {}).get("task_id"), TASK_FRAME_HOLD_S,
+                )
+                return
         if self.ws:
             await self.ws.send(json.dumps(message))
 
@@ -926,6 +952,7 @@ class Bridge:
             if isinstance(result, dict) and "registered" in result:
                 if result["registered"]:
                     self.registered = True
+                    self._registered_event.set()
                     # Registration, not the socket handshake, is what makes
                     # this connection usable. The reconnect backoff resets
                     # here so that a hub which accepts the socket and then
@@ -2784,6 +2811,7 @@ class Bridge:
                 async with websockets.connect(url, ping_interval=None, ssl=ssl_ctx) as ws:
                     self.ws = ws
                     self.registered = False
+                    self._registered_event.clear()
                     # NOT reset here. A socket that connects and is then
                     # refused registration would otherwise pin the delay at
                     # 1s and retry forever at a fixed interval, which is
@@ -2811,6 +2839,7 @@ class Bridge:
                                 pass
                         self.ws = None
                         self.registered = False
+                        self._registered_event.clear()
                         # Anything waiting on a pending IPC reply must be
                         # told the WS is gone, otherwise the caller hangs
                         # until its own timeout.
