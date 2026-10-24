@@ -28,8 +28,15 @@ Mapping table (v0.4.1):
   assistant.text      → accumulated for final task.complete
   result.success      → caller sends task.complete with final=true
 
-Tool inputs are SANITIZED — only the extracted summary becomes `args`.
-Raw input dicts never leave the bridge.
+What leaves the machine follows MIRROR_LEVEL, the same local-only security
+boundary as the session mirror (transcript_shipper):
+  messages (default) — a tool row carries the tool name and the mirror's
+      safe target only (file path, Bash description, host). Never command
+      lines, MCP inputs, tool results or thinking: these frames are stored
+      on the platform with the chat, and secrets live in exactly those.
+  full — sanitized one-line input summaries, result summaries and thinking
+      markers. Debug opt-in for your own agents only.
+STATUS_VERBOSITY then picks how much of that allowed content is narrated.
 """
 
 from __future__ import annotations
@@ -38,6 +45,8 @@ import json
 import re
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
+
+from transcript_shipper import activity_target
 
 _DEFAULT_FALLBACK_CHARS = 80
 _THINKING_SUMMARY_CHARS = 120
@@ -168,9 +177,11 @@ class StreamMapper:
     NORMAL = "normal"
     VERBOSE = "verbose"
 
-    def __init__(self, task_id: str, verbosity: str = NORMAL):
+    def __init__(self, task_id: str, verbosity: str = NORMAL, mirror_level: str = "messages"):
         self.task_id = task_id
         self.verbosity = verbosity
+        # Anything but an explicit "full" gets the messages-level boundary.
+        self.full = mirror_level == "full"
         self._started_at: dict[str, str] = {}  # tool_id -> ISO timestamp
         self._known_tools: dict[str, str] = {}  # tool_id -> name (for orphan results)
         self._accumulated_text: list[str] = []
@@ -251,7 +262,10 @@ class StreamMapper:
                     # Should not happen in practice, but synthesize one
                     # so the upsert key in the hook stays unique.
                     tool_id = f"tool-{self.task_id}-{len(self._known_tools)}"
-                args_summary = summarize_tool_input(tool_name, tool_input)
+                if self.full:
+                    args_summary = summarize_tool_input(tool_name, tool_input)
+                else:
+                    args_summary = activity_target(tool_name, tool_input)
                 started = _now_iso()
                 self._started_at[tool_id] = started
                 self._known_tools[tool_id] = tool_name
@@ -272,7 +286,9 @@ class StreamMapper:
                 ))
 
             elif btype == "thinking":
-                if self.verbosity == self.QUIET:
+                # Reasoning quotes whatever the agent just read; like the
+                # mirror, it never leaves the machine at messages level.
+                if self.verbosity == self.QUIET or not self.full:
                     continue
                 text = str(block.get("text") or "")
                 summary = _first_sentence(text, _THINKING_SUMMARY_CHARS)
@@ -302,7 +318,6 @@ class StreamMapper:
                 continue
             tool_use_id = str(block.get("tool_use_id") or "")
             is_error = bool(block.get("is_error"))
-            result_summary = summarize_tool_result(block.get("content"))
             tool_name = self._known_tools.get(tool_use_id, "tool")
             started_at = self._started_at.get(tool_use_id)
             payload: dict[str, Any] = {
@@ -313,10 +328,11 @@ class StreamMapper:
             }
             if started_at:
                 payload["started_at"] = started_at
-            if is_error:
-                payload["error"] = result_summary
-            else:
-                payload["result"] = result_summary
+            # Tool output (file contents, env, command output) only at full;
+            # at messages level the row just flips to success / error.
+            if self.full:
+                result_summary = summarize_tool_result(block.get("content"))
+                payload["error" if is_error else "result"] = result_summary
 
             out.append(_data_part(
                 component="tool_execution",

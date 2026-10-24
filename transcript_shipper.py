@@ -96,7 +96,7 @@ def _clip(s: Any, n: int = 200) -> str:
     return s[:n]
 
 
-def _activity_target(name: str, inp: dict) -> str:
+def activity_target(name: str, inp: dict) -> str:
     """The one safe, human-meaningful string for a tool call. Never the
     Bash command line, never request bodies, never MCP payloads — those
     can carry secrets inline."""
@@ -162,7 +162,7 @@ def _messages_entries(record: dict) -> list[dict]:
                 elif b.get("type") == "tool_use":
                     name = str(b.get("name") or "tool")[:80]
                     stub: dict = {"tool": name}
-                    target = _activity_target(name, b.get("input") or {})
+                    target = activity_target(name, b.get("input") or {})
                     if target:
                         stub["target"] = target
                     out.append({"entry_type": "activity", "content": stub})

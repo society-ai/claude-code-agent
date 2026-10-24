@@ -11,7 +11,7 @@ import os
 import re
 import sys
 
-__version__ = "0.21.1"
+__version__ = "0.21.2"
 
 # -- Required / core ---------------------------------------------------------
 
@@ -41,9 +41,13 @@ ENABLE_AGENT_LIFECYCLE: bool = os.getenv("ENABLE_AGENT_LIFECYCLE", "false").stri
 # -- Streaming + visibility --------------------------------------------------
 # Controls how much intermediate progress the bridge surfaces to the Society
 # AI chat UI while Claude Code is working. Values are validated below.
+# MIRROR_LEVEL bounds what any of these may contain: at "messages" (the
+# default) tool rows carry only the tool name and a safe target, with no
+# results and no thinking, whatever the verbosity.
 #   quiet   = no thinking markers, no text deltas; tool calls + results only
 #   normal  = tool calls, tool results, and a "Thinking: <first sentence>"
-#             marker per thinking block. Default.
+#             marker per thinking block (results and thinking at full only).
+#             Default.
 #   verbose = everything in normal + assistant text streamed as partial
 #             text_delta DataParts before the final task.complete
 
@@ -81,6 +85,8 @@ MIRROR_SESSIONS: bool = os.getenv("MIRROR", "true").strip().lower() in (
 #              never command lines, inputs, or outputs). Default.
 #   full     = trimmed raw transcript records, including tool inputs and
 #              results. Debug opt-in for your own agents only.
+# The same boundary applies to the live progress rows streamed to the chat
+# (streaming.StreamMapper), which the platform stores with the message.
 _VALID_MIRROR_LEVELS = {"messages", "full"}
 MIRROR_LEVEL: str = os.getenv("MIRROR_LEVEL", "messages").strip().lower()
 if MIRROR_LEVEL not in _VALID_MIRROR_LEVELS:

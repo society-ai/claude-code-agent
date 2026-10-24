@@ -372,12 +372,10 @@ Both tools talk to the bridge over a local Unix socket at `$SOCIETY_AI_BRIDGE_SO
 
 Because the bridge forwards intermediate events as `task.status` frames with `DataPart` payloads, the Society AI chat renders each tool call as a workflow callout — same UX as OpenClaw delegation steps. While Jenkins works on a message, the user sees:
 
-- **`💭 <first sentence of the thinking>`** — when Claude is reasoning
-- **`🔧 Calling list_tasks…`** → **`✓ Got 5 tasks`** — for every tool call, with status flipping from `working` to `completed`/`failed`
-- **`📄 src/main.py`** / **`$ pytest tests/`** — file reads and bash commands show a sanitized one-line summary, never the raw input
+- **`list_tasks`** / **`Read src/main.py`** / **`Bash: Run the tests`** — one row per tool call with the tool name and a safe target (file path, the Bash `description`, a web host), flipping from running to success/error
 - The final answer arrives as a normal `task.complete` text part at the end
 
-This is configurable via `STATUS_VERBOSITY` (`quiet` | `normal` | `verbose`, default `normal`). All events are also **persisted in the platform DB** as `DataPart` rows attached to the chat's `Message`, so reloading a past session replays the full tool trace — not just the final text. That's the same persistence model the platform uses for OpenClaw / ZeroClaw agents; the streaming bridge integrates with it without any platform changes.
+What these rows may contain follows `MIRROR_LEVEL`, the same local-only boundary as session recording. At the default `messages` they never carry command lines, MCP inputs, tool results or thinking. `MIRROR_LEVEL=full` (debug, your own agents only) adds sanitized input summaries such as `$ pytest tests/`, result summaries and `💭 <first sentence of the thinking>` markers. Within that, `STATUS_VERBOSITY` (`quiet` | `normal` | `verbose`, default `normal`) picks how much is narrated. All events are also **persisted in the platform DB** as `DataPart` rows attached to the chat's `Message`, so reloading a past session replays the full tool trace — not just the final text. That's the same persistence model the platform uses for OpenClaw / ZeroClaw agents; the streaming bridge integrates with it without any platform changes.
 
 The wire format and persistence are intentionally identical to what a future GCP-hosted variant of this agent (deployable via Agent Factory) would produce — local and hosted sessions are indistinguishable in the database.
 

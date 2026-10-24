@@ -1801,7 +1801,7 @@ class Bridge:
         Returns the callback; the caller can also pull the mapper off the
         returned closure's `__self__` if it needs final_text, error info, etc.
         """
-        mapper = StreamMapper(task_id, verbosity=STATUS_VERBOSITY)
+        mapper = StreamMapper(task_id, verbosity=STATUS_VERBOSITY, mirror_level=MIRROR_LEVEL)
 
         async def on_event(event: dict) -> None:
             parts = mapper.consume(event)
