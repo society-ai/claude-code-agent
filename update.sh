@@ -17,7 +17,8 @@
 #   1. Records the version you are on now (git commit + adapter version).
 #   2. Pulls the latest code (fast-forward only; refuses to touch a tree
 #      with local changes to tracked files).
-#   3. Installs dependencies, but only if requirements.txt changed.
+#   3. Installs dependencies, but only if requirements.txt or the channel
+#      server's package-lock.json changed.
 #   4. Restarts the bridge service and waits for it to register with the
 #      hub (up to a minute).
 #   5. On success, records the outcome. On any failure it puts the old
@@ -162,6 +163,11 @@ rollback() {
         ./venv/bin/pip install -r requirements.txt || \
             echo "    Warning: dependency reinstall failed; the bridge may still start fine."
     fi
+    if [ "$CHANNEL_DEPS_CHANGED" = "yes" ]; then
+        echo "    Reinstalling the previous channel server dependencies..."
+        (cd channel && npm ci --silent) || \
+            echo "    Warning: channel reinstall failed; sessions may fall back to the spawn path."
+    fi
 
     echo "    Restarting the bridge on the previous version..."
     snapshot_bridge_logs
@@ -195,6 +201,7 @@ FROM_SHA=""
 FROM_LABEL=""
 TO_LABEL=""
 REQS_CHANGED="no"
+CHANNEL_DEPS_CHANGED="no"
 
 step "Making sure no other update is running"
 # Personas share this folder, so two bridges approving an update at the
@@ -256,6 +263,16 @@ else
     echo "    requirements.txt changed; installing into the venv..."
     if ! ./venv/bin/pip install -r requirements.txt; then
         rollback "installing the new dependencies failed"
+    fi
+fi
+# The channel server (Node) only matters when npm is here and it was
+# installed before; setup.sh owns first installs.
+if [ -d channel/node_modules ] && command -v npm &>/dev/null \
+    && ! git diff --quiet "$FROM_SHA" "$TO_SHA" -- channel/package-lock.json; then
+    CHANNEL_DEPS_CHANGED="yes"
+    echo "    The channel server's package-lock.json changed; installing..."
+    if ! (cd channel && npm ci --silent); then
+        rollback "installing the new channel server dependencies failed"
     fi
 fi
 

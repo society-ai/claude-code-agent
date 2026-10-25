@@ -619,11 +619,14 @@ source venv/bin/activate
 pip install -q -r requirements.txt
 echo "  Dependencies installed"
 
-# Channel server deps (Node) — only needed for SESSION_MODE. Best-effort:
-# the bridge runs fine without them in the default spawn mode.
+# Channel server deps (Node) — needed for SESSION_MODE (the default).
+# Best-effort: without them the bridge falls back to the spawn path.
+# Reinstalled whenever the lockfile is newer than the install, so a re-run
+# after a pull picks up dependency fixes.
 if [ -d "channel" ] && command -v npm &>/dev/null; then
-    if [ ! -d "channel/node_modules" ]; then
-        (cd channel && npm install --silent >/dev/null 2>&1) \
+    if [ ! -f "channel/node_modules/.package-lock.json" ] \
+        || [ "channel/package-lock.json" -nt "channel/node_modules/.package-lock.json" ]; then
+        (cd channel && npm ci --silent >/dev/null 2>&1) \
             && echo "  Channel server deps installed (Node)" \
             || echo "  Note: channel deps not installed (SESSION_MODE only)"
     fi
