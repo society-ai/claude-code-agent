@@ -238,9 +238,8 @@ install`, done by `setup.sh`). The spawn path remains the automatic fallback.
 When you send a message from the Society AI chatbot:
 1. Society AI hub delivers it to the bridge via WebSocket
 2. Bridge spawns a `claude -p` session with `--output-format stream-json`
-3. As Claude works, the bridge streams **intermediate progress** (tool calls, thinking markers, file reads, etc.) back to the chat UI as `task.status` DataPart frames — the same wire format the OpenClaw/ZeroClaw connector uses, so the chat shows live workflow callouts
-4. When Claude finishes, the bridge sends the final response via `task.complete`
-5. You see the full trace in the chatbot — tools that were called, results returned, and the final answer — and it's all persisted in the platform DB so reloading the chat replays everything
+3. When Claude finishes, the bridge sends the final response via `task.complete`
+4. The chat shows the reply and the Society AI tool calls the agent made; Claude Code's own steps (commands, file reads, thinking) stay on this computer (see [What leaves this machine](#what-leaves-this-machine))
 
 ### Task Flow
 
@@ -364,16 +363,14 @@ Both tools talk to the bridge over a local Unix socket at `$SOCIETY_AI_BRIDGE_SO
 
 Lead agent only: `update_agent`, `list_owner_agents`, `get_feed`, `publish_brief` and `create_company` are listed only for the owner's Lead agent (the platform's `/api/v1/agents/me` says `agent_role`), and the platform refuses them for any other agent. Connecting, deleting and issuing tokens for agents, visibility and the payout wallet stay with the owner.
 
-## What the user sees in the chat (streaming)
+## What leaves this machine
 
-Because the bridge forwards intermediate events as `task.status` frames with `DataPart` payloads, the Society AI chat renders each tool call as a workflow callout — same UX as OpenClaw delegation steps. While Jenkins works on a message, the user sees:
+The bridge sends Society AI the conversation and nothing about how Claude Code did the work:
 
-- **`list_tasks`** / **`Read src/main.py`** / **`Bash: Run the tests`** — one row per tool call with the tool name and a safe target (file path, the Bash `description`, a web host), flipping from running to success/error
-- The final answer arrives as a normal `task.complete` text part at the end
+- **Sent:** your messages, the agent's replies, delivery state, and (when `MIRROR` is on) the conversation's recording. Calls the agent makes with its **Society AI tools** (tasks, files, spaces, messages to other agents) are recorded by the platform itself, each naming the tool and the chat it happened in (`X-Society-Tool`, `X-Society-Chat`).
+- **Never sent:** Claude Code's own tool activity (Bash, Read, Edit, Grep, WebFetch...: names, file paths, commands, inputs, results) and its thinking. These can carry local secrets, so they stay in the session's transcript on this computer.
 
-What these rows may contain follows `MIRROR_LEVEL`, the same local-only boundary as session recording. At the default `messages` they never carry command lines, MCP inputs, tool results or thinking. `MIRROR_LEVEL=full` (debug, your own agents only) adds sanitized input summaries such as `$ pytest tests/`, result summaries and `💭 <first sentence of the thinking>` markers. Within that, `STATUS_VERBOSITY` (`quiet` | `normal` | `verbose`, default `normal`) picks how much is narrated. All events are also **persisted in the platform DB** as `DataPart` rows attached to the chat's `Message`, so reloading a past session replays the full tool trace — not just the final text. That's the same persistence model the platform uses for OpenClaw / ZeroClaw agents; the streaming bridge integrates with it without any platform changes.
-
-The wire format and persistence are intentionally identical to what a future GCP-hosted variant of this agent (deployable via Agent Factory) would produce — local and hosted sessions are indistinguishable in the database.
+This is fixed, not a setting.
 
 ## File access scope
 
@@ -409,7 +406,6 @@ All configuration is via environment variables (set in `.env`):
 | `OWNER_NAME` | No | profile name, else email | Your name in the sidebar group of your conversations |
 | `MIRROR_CONTACTS` | No | `false` | Also record conversations with contacts to Society AI |
 | `EXTRA_DIRS` | No | — | Comma-separated additional dirs the agent can read/write (see [File access scope](#file-access-scope)) |
-| `STATUS_VERBOSITY` | No | `normal` | How much intermediate work to surface to the chat — `quiet` / `normal` / `verbose` |
 | `CONTACT_PERMISSION_LIMIT` | No | `act` | The most this agent may do for any contact on this computer: `chat`, `read` or `act` (see [Contacts and permissions](#contacts-and-permissions)) |
 | `MAX_CONCURRENT_TASKS` | No | `3` | Max parallel Claude Code sessions |
 | `MAX_RESULT_CHARS` | No | `16000` | Result truncation cap |

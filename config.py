@@ -11,7 +11,7 @@ import os
 import re
 import sys
 
-__version__ = "0.22.2"
+__version__ = "0.23.0"
 
 # -- Required / core ---------------------------------------------------------
 
@@ -30,22 +30,6 @@ SOCIETY_AI_BRIDGE_SOCKET: str = (
     os.getenv("SOCIETY_AI_BRIDGE_SOCKET", "").strip()
     or os.path.join(os.path.expanduser("~"), ".cache", "society-ai", "bridge.sock")
 )
-
-# -- Streaming + visibility --------------------------------------------------
-# Controls how much intermediate progress the bridge surfaces to the Society
-# AI chat UI while Claude Code is working. Values are validated below.
-# MIRROR_LEVEL bounds what any of these may contain: at "messages" (the
-# default) tool rows carry only the tool name and a safe target, with no
-# results and no thinking, whatever the verbosity.
-#   quiet   = no thinking markers, no text deltas; tool calls + results only
-#   normal  = tool calls, tool results, and a "Thinking: <first sentence>"
-#             marker per thinking block (results and thinking at full only).
-#             Default.
-#   verbose = everything in normal + assistant text streamed as partial
-#             text_delta DataParts before the final task.complete
-
-_VALID_STATUS_VERBOSITY = {"quiet", "normal", "verbose"}
-STATUS_VERBOSITY: str = os.getenv("STATUS_VERBOSITY", "normal").strip().lower()
 
 # -- Session mode (v0.7 execution model) -------------------------------------
 # When enabled, the bridge dispatches work into persistent interactive Claude
@@ -71,24 +55,10 @@ MIRROR_SESSIONS: bool = os.getenv("MIRROR", "true").strip().lower() in (
     "1", "true", "yes", "on",
 )
 
-# What gets mirrored. SECURITY BOUNDARY — local-only setting, the platform
-# can never raise it remotely:
-#   messages = conversation only: user/dispatch text, assistant text, and
-#              activity stubs (tool name + safe target like a file path —
-#              never command lines, inputs, or outputs). Default.
-#   full     = trimmed raw transcript records, including tool inputs and
-#              results. Debug opt-in for your own agents only.
-# The same boundary applies to the live progress rows streamed to the chat
-# (streaming.StreamMapper), which the platform stores with the message.
-_VALID_MIRROR_LEVELS = {"messages", "full"}
-MIRROR_LEVEL: str = os.getenv("MIRROR_LEVEL", "messages").strip().lower()
-if MIRROR_LEVEL not in _VALID_MIRROR_LEVELS:
-    print(
-        f"Error: MIRROR_LEVEL must be one of {sorted(_VALID_MIRROR_LEVELS)} "
-        f"(got {MIRROR_LEVEL!r})",
-        file=sys.stderr,
-    )
-    sys.exit(2)
+# What gets mirrored is fixed, not a setting: the conversation only. Claude
+# Code's own tool activity and thinking never leave the machine (see
+# transcript_shipper). Older installs may still have MIRROR_LEVEL /
+# STATUS_VERBOSITY in their env files; both are ignored.
 
 # -- Execution mode ----------------------------------------------------------
 
@@ -119,14 +89,6 @@ if EXECUTION_MODE not in _VALID_EXECUTION_MODES:
     print(
         f"Error: EXECUTION_MODE must be one of {sorted(_VALID_EXECUTION_MODES)} "
         f"(got {EXECUTION_MODE!r})",
-        file=sys.stderr,
-    )
-    sys.exit(2)
-
-if STATUS_VERBOSITY not in _VALID_STATUS_VERBOSITY:
-    print(
-        f"Error: STATUS_VERBOSITY must be one of {sorted(_VALID_STATUS_VERBOSITY)} "
-        f"(got {STATUS_VERBOSITY!r})",
         file=sys.stderr,
     )
     sys.exit(2)

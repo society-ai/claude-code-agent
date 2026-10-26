@@ -72,16 +72,10 @@ MACHINE_SCHEMA = [
     {"key": "SESSION_MODE", "label": "Persistent sessions", "type": "bool", "default": True,
      "help": "Keep a session per work item (the recorded workspace)."},
     {"key": "MIRROR", "label": "Record sessions to Society AI", "type": "bool", "default": True,
-     "help": "Ship session transcripts to the platform so you can review them."},
-    {"key": "MIRROR_LEVEL", "label": "Recording detail", "type": "enum",
-     "enum": ["messages", "full"], "default": "messages",
-     "help": "Covers recordings and the live progress shown in chat. messages = conversation + safe activity (recommended). full = includes tool inputs/outputs and thinking (local debug only)."},
+     "help": "Record the conversation (your messages and the agent's replies) on Society AI so you can review it. What Claude Code does on this machine (commands, files it reads or edits, its thinking) is never sent."},
     {"key": "EXECUTION_MODE", "label": "Where agents run", "type": "enum",
      "enum": ["standard", "secured"], "default": "standard",
      "help": "standard = directly on this machine, with the folder access you grant each agent. secured = an isolated sandbox that can't see any of your files — only Society AI tools and limited network (also turns off the per-agent folders above). Use it for work you don't want touching your machine."},
-    {"key": "STATUS_VERBOSITY", "label": "Progress detail in chat", "type": "enum",
-     "enum": ["quiet", "normal", "verbose"], "default": "normal",
-     "help": "How much an agent narrates while it works. quiet shows just the steps, verbose also streams its text. Tool output and thinking show only when Recording detail is full."},
     {"key": "IDLE_REAP_MINUTES", "label": "End idle sessions after (min)", "type": "int", "default": 15,
      "help": "An inactive session is wrapped up and recorded after this many minutes, freeing resources."},
     {"key": "MAX_CONCURRENT", "label": "Max open sessions", "type": "int", "default": 10,
@@ -680,10 +674,9 @@ function machineRow(f){
  else if(f.type==='enum'){ctrl=`<div class="seg" data-m="${f.key}" data-val="${esc(v)}">`+f.enum.map(o=>`<button class="${o===v?'on':''}" onclick="seg(this,'${o}')">${o}</button>`).join('')+`</div>`;}
  else if(f.type==='int'){ctrl=`<input type="number" data-m="${f.key}" value="${esc(v)}" min="0" style="width:78px">`;}
  else ctrl=`<input data-m="${f.key}" value="${esc(v)}" style="width:150px">`;
- const warn=(f.key==='MIRROR_LEVEL')?'<div class="h warn" data-fullwarn style="display:'+(String(v)==='full'?'block':'none')+'">⚠ full records tool inputs/outputs — local debug only</div>':'';
- return `<div class="set"><div class="txt"><div class="nme">${esc(f.label)}</div>${f.help?`<div class="h">${esc(f.help)}</div>`:''}${warn}</div><div class="ctrl">${ctrl}</div></div>`;
+ return `<div class="set"><div class="txt"><div class="nme">${esc(f.label)}</div>${f.help?`<div class="h">${esc(f.help)}</div>`:''}</div><div class="ctrl">${ctrl}</div></div>`;
 }
-function seg(btn,val){const seg=btn.closest('.seg');seg.dataset.val=val;[...seg.children].forEach(b=>b.classList.toggle('on',b===btn));const fw=seg.closest('.set').querySelector('[data-fullwarn]');if(fw)fw.style.display=(val==='full')?'block':'none';}
+function seg(btn,val){const seg=btn.closest('.seg');seg.dataset.val=val;[...seg.children].forEach(b=>b.classList.toggle('on',b===btn));}
 function collectMachine(){const u={};document.querySelectorAll('#mset [data-m]').forEach(el=>{const k=el.getAttribute('data-m');if(el.classList.contains('seg'))u[k]=el.dataset.val;else if(el.type==='checkbox')u[k]=el.checked;else u[k]=el.value;});return u;}
 async function saveMachine(restart){try{const r=await api('/api/machine/config',{updates:collectMachine()});toast(r.written.length?'Settings saved':'No changes');if(restart)await restartAll(true);}catch(e){if(e&&e.fields)toast(Object.values(e.fields)[0],true);else toast('Save failed',true);throw e;}}
 async function restartAll(skipSave){try{if(!skipSave)await saveMachine(true);for(const a of DATA.agents){if(a.installed)await api('/api/persona/'+a.id+'/restart',{});}toast('Restarting all agents…');closeSettings();setTimeout(load,1600);}catch(e){}}

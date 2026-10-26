@@ -12,15 +12,13 @@ notifications for unknown session ids are ignored — a machine owner's own
 desktop/terminal sessions are never mirrored unless a later opt-in
 (observe tier) registers them. MIRROR=false disables shipping entirely.
 
-WHAT ships is a security boundary (MIRROR_LEVEL, local-only):
-  messages (default) — the conversation: user/dispatch text, assistant
-      text, and per-tool "activity" stubs carrying only the tool name and
-      a safe target (file path, Bash description, host). Tool inputs,
-      command lines, tool results, attachments, and Claude Code internal
-      records NEVER leave the machine at this level — that's where
-      secrets live (env output, file contents, tokens in command lines).
-  full — trimmed raw records, including tool inputs/results. Debug
-      opt-in for mirroring your own agents only.
+WHAT ships is a security boundary: the conversation only, meaning
+user/dispatch text, assistant text and summaries. Claude Code's own tool
+activity (Bash, Read, Edit, Grep, WebFetch, ...: names, targets, inputs,
+results), thinking, attachments and internal records NEVER leave the
+machine; that's where secrets live (env output, file contents, tokens in
+command lines). Society AI tool calls are recorded by the platform itself
+when the society-ai MCP server makes them.
 
 Offsets (byte position + next seq per session) persist across bridge
 restarts in mirror_state.json next to the bridge socket, keeping seq
@@ -98,35 +96,9 @@ def _clip(s: Any, n: int = 200) -> str:
     return s[:n]
 
 
-def activity_target(name: str, inp: dict) -> str:
-    """The one safe, human-meaningful string for a tool call. Never the
-    Bash command line, never request bodies, never MCP payloads — those
-    can carry secrets inline."""
-    if not isinstance(inp, dict):
-        return ""
-    if name in ("Read", "Edit", "Write", "MultiEdit", "NotebookEdit"):
-        return _clip(inp.get("file_path"))
-    if name == "Bash":
-        return _clip(inp.get("description"))  # human label only, NEVER command
-    if name in ("Glob", "Grep"):
-        target = _clip(inp.get("pattern"), 80)
-        path = _clip(inp.get("path"), 100)
-        return f"{target} in {path}" if path else target
-    if name in ("WebFetch", "WebSearch"):
-        url = inp.get("url") or ""
-        m = re.match(r"^\w+://([^/?#]+)", url) if isinstance(url, str) else None
-        if m:
-            return m.group(1)  # host only — query strings can carry tokens
-        return _clip(inp.get("query"), 100)
-    if name in ("Task", "Agent"):
-        return _clip(inp.get("description"))
-    # MCP/platform tools and anything unknown: tool name alone is enough.
-    return ""
-
-
-def _messages_entries(record: dict) -> list[dict]:
+def _shippable_entries(record: dict) -> list[dict]:
     """Project one raw transcript record into zero or more shippable
-    entries at MIRROR_LEVEL=messages. Deterministic — same record always
+    entries. Deterministic — same record always
     yields the same entries in the same order."""
     rtype = record.get("type")
 
@@ -161,14 +133,8 @@ def _messages_entries(record: dict) -> list[dict]:
                         "entry_type": "assistant",
                         "content": {"text": _trim(b["text"])},
                     })
-                elif b.get("type") == "tool_use":
-                    name = str(b.get("name") or "tool")[:80]
-                    stub: dict = {"tool": name}
-                    target = activity_target(name, b.get("input") or {})
-                    if target:
-                        stub["target"] = target
-                    out.append({"entry_type": "activity", "content": stub})
-                # thinking blocks: internal reasoning, never shipped
+                # tool_use blocks (Claude Code's own tools) and thinking
+                # blocks never ship.
         elif isinstance(content, str) and content.strip():
             out.append({"entry_type": "assistant", "content": {"text": _trim(content)}})
         return out
@@ -182,10 +148,9 @@ def _messages_entries(record: dict) -> list[dict]:
 class TranscriptShipper:
     """Per-bridge shipper. One instance per persona/bridge process."""
 
-    def __init__(self, api_url: str, token: str, state_dir: str, level: str = "messages"):
+    def __init__(self, api_url: str, token: str, state_dir: str):
         self._api_url = api_url.rstrip("/")
         self._token = token
-        self._level = level if level in ("messages", "full") else "messages"
         self._machine = socket.gethostname()
         self._state_path = pathlib.Path(state_dir) / "mirror_state.json"
         # Fired (awaited) when the platform reports which chat a session
@@ -367,7 +332,7 @@ class TranscriptShipper:
         return entries, pos + len(complete), seq
 
     def _line_entries(self, raw: bytes) -> list[dict]:
-        """Project one transcript line into shippable entries (level-aware).
+        """Project one transcript line into shippable entries.
         Deterministic, so re-reads regenerate identical seq assignment."""
         try:
             record = json.loads(raw)
@@ -379,16 +344,7 @@ class TranscriptShipper:
         ts = record.get("timestamp")
         ts = ts[:64] if isinstance(ts, str) and ts else None
 
-        if self._level == "full":
-            entry: dict[str, Any] = {
-                "entry_type": str(record.get("type") or "unknown")[:32],
-                "content": _trim(record),
-            }
-            if ts:
-                entry["ts"] = ts
-            return [entry]
-
-        out = _messages_entries(record)
+        out = _shippable_entries(record)
         if ts:
             for e in out:
                 e["ts"] = ts

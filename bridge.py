@@ -52,13 +52,11 @@ from config import (
     API_HEADERS,
     EXECUTION_MODE,
     EXTRA_DIRS,
-    MIRROR_LEVEL,
     MIRROR_SESSIONS,
     SANDBOX_NAME,
     SANDBOX_TIMEOUT,
     SESSION_MODE,
     SOCIETY_AI_BRIDGE_SOCKET,
-    STATUS_VERBOSITY,
     __version__,
     ws_url,
 )
@@ -72,11 +70,10 @@ from contacts import (
     strip_private_blocks,
 )
 from dataclasses import replace
-from streaming import StreamMapper, _data_part
 import folders
 from attachments import FILES_DIRNAME, Attachment, fetch_all, parse_file_parts, prompt_block
 from chat_context import chat_headers, valid_chat_id, valid_tool_name
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Optional
 
 logging.basicConfig(
     level=logging.INFO,
@@ -387,7 +384,6 @@ Do the work, then report your results."""
 
 async def stream_claude_code(
     prompt: str,
-    on_event: "Callable[[dict], Awaitable[None]]",
     *,
     work_dir: str | None = None,
     extra_dirs: list[str] | None = None,
@@ -397,8 +393,9 @@ async def stream_claude_code(
     work_dir = work_dir or WORK_DIR
     if extra_dirs is None:
         extra_dirs = EXTRA_DIRS
-    """Spawn `claude -p --output-format stream-json` and forward each
-    parsed event to `on_event` as it arrives.
+    """Spawn `claude -p --output-format stream-json` and collect its reply.
+    Nothing about the run's own tool use or thinking is sent anywhere: the
+    chat gets the final text only.
 
     Returns (exit_code, accumulated_text, session_id, had_error).
     `accumulated_text` is the assistant's final response text — sourced
@@ -464,15 +461,6 @@ async def stream_claude_code(
         except json.JSONDecodeError:
             logger.debug("Non-JSON stream line: %s", line[:200])
             continue
-
-        # Surface to the bridge first — the caller's mapper builds DataParts
-        # and sends them onward as task.status frames.
-        try:
-            await on_event(event)
-        except Exception:
-            # Forwarding shouldn't kill the run; the final task.complete
-            # still goes out at the end.
-            logger.exception("on_event handler raised; continuing stream")
 
         etype = event.get("type")
         if etype == "system" and event.get("subtype") == "init":
@@ -752,13 +740,11 @@ class Bridge:
                     self.ctx.api_url,
                     self.ctx.token,
                     state_dir=self.ctx.state_dir,
-                    level=MIRROR_LEVEL,
                 )
                 self._session_mgr.on_reap = self._on_session_reap
                 self._shipper.on_chat_link = self._on_mirror_chat_link
                 logger.info(
-                    "Session mirroring enabled (level=%s; MIRROR=false to disable)",
-                    MIRROR_LEVEL,
+                    "Session mirroring enabled (conversation only; MIRROR=false to disable)"
                 )
 
         # Sandbox executor for secured mode
@@ -1808,24 +1794,6 @@ class Bridge:
             "Respond helpfully, with awareness of the prior exchange."
         )
 
-    async def _stream_to_status_updates(self, task_id: str) -> "Callable[[dict], Awaitable[None]]":
-        """Build an `on_event` callback for stream_claude_code that maps each
-        event to DataParts and ships them out as `task.status` frames.
-
-        Returns the callback; the caller can also pull the mapper off the
-        returned closure's `__self__` if it needs final_text, error info, etc.
-        """
-        mapper = StreamMapper(task_id, verbosity=STATUS_VERBOSITY, mirror_level=MIRROR_LEVEL)
-
-        async def on_event(event: dict) -> None:
-            parts = mapper.consume(event)
-            if parts:
-                await self._send_status_update(task_id, parts)
-
-        # Stash the mapper on the callback so callers can introspect.
-        on_event.__mapper__ = mapper  # type: ignore[attr-defined]
-        return on_event
-
     async def _execute_chat_task(
         self,
         task_id: str,
@@ -1875,13 +1843,11 @@ class Bridge:
             await self._send_task_complete(task_id, result_text, exit_code)
             return
 
-        on_event = await self._stream_to_status_updates(task_id)
         exit_code, output, _session, had_error = await stream_claude_code(
-            prompt, on_event, work_dir=self.ctx.work_dir, extra_dirs=self.ctx.extra_dirs,
+            prompt, work_dir=self.ctx.work_dir, extra_dirs=self.ctx.extra_dirs,
             chat_id=chat_id)
-        mapper: StreamMapper = on_event.__mapper__  # type: ignore[attr-defined]
 
-        result_text = (output or "").strip() or (mapper.final_text() or "I couldn't generate a response.")
+        result_text = (output or "").strip() or "I couldn't generate a response."
 
         if exit_code == 0 and not had_error:
             self._record_chat_turn(task_id, user_text, result_text)
@@ -1940,27 +1906,19 @@ class Bridge:
             result_text = (output or "").strip() or f"Task completed with exit code {exit_code}"
             await self._send_task_complete(task_id, result_text, exit_code)
         else:
-            on_event = await self._stream_to_status_updates(task_id)
             exit_code, output, _session, had_error = await stream_claude_code(
-            prompt, on_event, work_dir=self.ctx.work_dir, extra_dirs=self.ctx.extra_dirs)
-            mapper: StreamMapper = on_event.__mapper__  # type: ignore[attr-defined]
-            result_text = (
-                (output or "").strip()
-                or (mapper.final_text() or f"Task completed with exit code {exit_code}")
-            )
+                prompt, work_dir=self.ctx.work_dir, extra_dirs=self.ctx.extra_dirs)
+            result_text = (output or "").strip() or f"Task completed with exit code {exit_code}"
             await self._send_task_complete(
                 task_id, result_text, exit_code or (1 if had_error else 0),
             )
         logger.info("Task %s completed (exit=%d)", task.get("identifier", task_id), exit_code)
 
     async def _send_status_update(self, task_id: str, parts: list[dict]):
-        """Send a `task.status` JSON-RPC frame with intermediate DataParts.
-
-        Mirrors the OpenClaw connector's wire format: same method name, same
-        params shape, `final: false`, `state: "working"`. The hub forwards
-        these to the chat session via SSE and persists each part as a
-        `DataPart` row attached to the agent's `Message`, so reloading the
-        session later replays the full tool-call trace.
+        """Send a `task.status` JSON-RPC frame with intermediate DataParts
+        (today only the delivery state). Same wire format as the OpenClaw
+        connector: `final: false`, `state: "working"`; the hub forwards it
+        to the chat over SSE.
         """
         if not parts:
             return
@@ -2160,7 +2118,6 @@ class Bridge:
             "config": {
                 "session_mode": self._session_mode,
                 "mirror": MIRROR_SESSIONS,
-                "mirror_level": MIRROR_LEVEL,
                 "execution_mode": EXECUTION_MODE,
                 "work_dir": self.ctx.work_dir,
                 "extra_dirs": list(self.ctx.extra_dirs),
@@ -2903,6 +2860,12 @@ class Bridge:
 
 
 # -- Delivery ticks -------------------------------------------------------------
+
+def _data_part(component: str, part_id: str, payload: dict) -> dict:
+    """A DataPart in the nested shape the chat stream-transformer reads:
+    `{type: 'data', data: {component, id, payload}}`."""
+    return {"type": "data", "data": {"component": component, "id": part_id, "payload": payload}}
+
 
 def _owner_chat_id(metadata: dict) -> str | None:
     """The Society AI app chat a dispatch came from, if any (top-level, or
