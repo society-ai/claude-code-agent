@@ -45,6 +45,8 @@ _UUID_RE = re.compile(
 
 # A session's chat can be learned mid-session (its first recording links
 # it), so lookups are cached briefly rather than for the process lifetime.
+# Only found chats are cached: a session whose chat is learned later (its
+# recording links one) must not keep reusing an earlier miss.
 _CACHE_TTL_S = 10.0
 _cache: dict[str, tuple[float, str]] = {}
 
@@ -93,5 +95,6 @@ async def current_chat_id() -> str:
         chat = valid_chat_id((data or {}).get("chat_id")) if isinstance(data, dict) else ""
     except Exception:
         chat = ""
-    _cache[key] = (now, chat)
+    if chat:
+        _cache[key] = (now, chat)
     return chat

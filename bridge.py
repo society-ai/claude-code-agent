@@ -2577,6 +2577,9 @@ class Bridge:
                 permission=permission,
                 contact_label=sender.label if sender is not None and not sender.is_owner else "",
                 sender_group=sender.group if sender is not None and not sender.is_owner else "",
+                # The owner's chat this message came from is where the
+                # session's actions happen (System of Record).
+                chat_id=delivery_chat_id or "",
             )
         except Exception as e:
             logger.exception("Session launch failed for %s", work_item_key)
@@ -2585,11 +2588,6 @@ class Bridge:
                 task_id, f"Could not start a session: {type(e).__name__}: {e}", exit_code=1
             )
             return
-
-        # The owner's chat this message came from is where the session's
-        # actions happen (System of Record); its MCP server asks for it.
-        if delivery_chat_id:
-            mgr.set_chat(rec.work_item_key, delivery_chat_id)
 
         # Session-scoped standing context: the L1 platform protocol and the
         # standing blocks (identity, scope, activity). A fresh launch has no

@@ -72,6 +72,19 @@ class CurrentChat(unittest.TestCase):
             self.assertEqual(run(chat_context.current_chat_id()), CHAT)
         self.assertEqual(m.call_count, 1)
 
+    def test_a_miss_is_asked_again(self):
+        # A session's chat can be learned later (its recording links one);
+        # an earlier miss must not be reused.
+        os.environ["SOCIETY_AI_SESSION_KEY"] = "work-3"
+        answers = iter([{"chat_id": ""}, {"chat_id": CHAT}])
+
+        async def call(method, params, timeout=60.0):
+            return next(answers)
+
+        with mock.patch.object(chat_context.bridge_ipc, "call", side_effect=call):
+            self.assertEqual(run(chat_context.current_chat_id()), "")
+            self.assertEqual(run(chat_context.current_chat_id()), CHAT)
+
     def test_a_bridge_that_cannot_answer_means_no_chat(self):
         os.environ["SOCIETY_AI_SESSION_KEY"] = "work-2"
 
@@ -157,6 +170,21 @@ class SessionChat(unittest.TestCase):
         mgr.set_chat("work-1", CHAT)
         mgr.set_chat("work-1", OTHER_CHAT, only_if_empty=True)
         self.assertEqual(mgr.get("work-1").chat_id, CHAT)
+
+    def test_the_chat_is_recorded_before_the_session_launches(self):
+        # The session's MCP server calls the router while it starts, so the
+        # chat must already be on the record when the launch begins.
+        mgr = SessionManager(self.sock)
+        seen = {}
+
+        async def launch(rec, pol, resume=False):
+            seen["chat_at_launch"] = rec.chat_id
+            rec.state = "ready"
+
+        mgr._launch = launch
+        mgr._enforce_concurrency = mock.AsyncMock()
+        run(mgr.ensure_session("work-9", "jenkins", title="t", chat_id=CHAT))
+        self.assertEqual(seen["chat_at_launch"], CHAT)
 
     def test_it_survives_a_bridge_restart(self):
         mgr = self.manager_with()

@@ -268,9 +268,14 @@ class SessionManager:
         permission: Optional[str] = None,
         contact_label: str = "",
         sender_group: str = "",
+        chat_id: str = "",
     ) -> SessionRecord:
         """Return a live session for the work item, launching or resuming as
         needed. Concurrency-safe per work item.
+
+        `chat_id` is the owner's app Chat the message came from. It is
+        recorded before launch, so the session's MCP server finds it from
+        its first call to the router.
 
         `permission` is None for the owner and the contact level otherwise.
         A live session launched at a different level (the owner changed the
@@ -284,6 +289,7 @@ class SessionManager:
                 if rec.permission == permission:
                     rec.last_active = time.time()
                     rec.fresh_launch = False
+                    self.set_chat(work_item_key, chat_id)
                     return rec
                 logger.info("Permissions for %s changed (%s -> %s); relaunching",
                             work_item_key[:40], rec.permission, permission)
@@ -308,6 +314,8 @@ class SessionManager:
             rec.contact_label = contact_label
             if not rec.cwd:
                 rec.sender_group = sender_group
+            if chat_id:
+                rec.chat_id = chat_id
 
             resume = rec.has_run_once and self._has_history(rec)
             rec.fresh_launch = not resume
