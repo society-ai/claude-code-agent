@@ -27,6 +27,8 @@ from typing import Any, Optional
 
 import httpx
 
+from chat_context import chat_headers
+
 logger = logging.getLogger("attachments")
 
 MAX_FILE_BYTES = 50 * 1024 * 1024
@@ -93,12 +95,16 @@ def safe_filename(artifact_id: str, name: str) -> str:
     return f"{prefix}-{base}"
 
 
-async def file_info(client: httpx.AsyncClient, api_url: str, token: str, artifact_id: str) -> dict:
+async def file_info(
+    client: httpx.AsyncClient, api_url: str, token: str, artifact_id: str,
+    context_headers: Optional[dict[str, str]] = None,
+) -> dict:
     """GET /api/v1/files/{id}: name, mime_type, size and a fresh short link.
-    Raises PermissionError (no access or no such file) or RuntimeError."""
+    Raises PermissionError (no access or no such file) or RuntimeError.
+    `context_headers` carry the System of Record context (chat, tool)."""
     resp = await client.get(
         f"{api_url.rstrip('/')}/api/v1/files/{artifact_id}",
-        headers={"Authorization": f"Bearer {token}"},
+        headers={"Authorization": f"Bearer {token}", **(context_headers or {})},
     )
     if resp.status_code in (403, 404):
         raise PermissionError("not available to this agent")
@@ -137,7 +143,7 @@ async def download(client: httpx.AsyncClient, url: str, dest: pathlib.Path, max_
 
 async def fetch_all(
     client: httpx.AsyncClient, api_url: str, token: str,
-    attachments: list[Attachment], dest_dir: pathlib.Path,
+    attachments: list[Attachment], dest_dir: pathlib.Path, chat_id: str = "",
 ) -> list[Fetched]:
     """Download a message's files into dest_dir, within the per-file and
     per-message limits. One retry per file; a failure is reported, never
@@ -150,7 +156,7 @@ async def fetch_all(
         dest = dest_dir / safe_filename(att.artifact_id, att.name)
         for attempt in (1, 2):
             try:
-                info = await file_info(client, api_url, token, att.artifact_id)
+                info = await file_info(client, api_url, token, att.artifact_id, chat_headers(chat_id))
                 size = int(info.get("size") or 0)
                 if size > MAX_FILE_BYTES or size > budget:
                     result.size = size

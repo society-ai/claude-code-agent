@@ -17,6 +17,7 @@ from typing import Any
 import certifi
 import httpx
 
+import chat_context
 import identity
 from config import __version__
 
@@ -83,7 +84,9 @@ async def request(
 
     Base URL and auth headers resolve from the CURRENT session identity on
     every call (identity.current()), not from import-time constants — a
-    switch_agent rebind takes effect immediately.
+    switch_agent rebind takes effect immediately. Calls also carry the
+    System of Record context: the app Chat the session works in
+    (X-Society-Chat) and the tool making the call (X-Society-Tool).
     """
     ident = identity.current()
     if not ident.bound:
@@ -97,7 +100,10 @@ async def request(
         )
     base = (base_url or ident.api_url).rstrip("/")
     url = f"{base}{path}"
-    hdrs = headers if headers is not None else ident.headers()
+    hdrs = {
+        **(headers if headers is not None else ident.headers()),
+        **(await chat_context.request_headers()),
+    }
     try:
         c = client()
         if timeout is not None:

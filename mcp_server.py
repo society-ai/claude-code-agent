@@ -58,6 +58,7 @@ from mcp.server.fastmcp import Context, FastMCP
 import api
 import attachments
 import bridge_ipc
+import chat_context
 import identity
 
 # Session identity is a runtime binding (see identity.py) — resolve it at
@@ -213,7 +214,12 @@ class SocietyMCP(FastMCP):
                 f"{name} is only for your owner's Lead agent. Your owner can make an "
                 "agent their Lead in Society AI."
             )
-        return await super().call_tool(name, arguments)
+        # Router calls made for this tool name it (System of Record).
+        token = chat_context.current_tool.set(name)
+        try:
+            return await super().call_tool(name, arguments)
+        finally:
+            chat_context.current_tool.reset(token)
 
 
 mcp = SocietyMCP("society-ai", instructions="Society AI tools for Claude Code")
@@ -1006,6 +1012,13 @@ async def send_message(
     }
     if conversation_id:
         params["session_id"] = conversation_id
+    # System of Record context the hub binds for this send.
+    chat_id = await chat_context.current_chat_id()
+    if chat_id:
+        params["chat_id"] = chat_id
+    tool = chat_context.valid_tool_name(chat_context.current_tool.get())
+    if tool:
+        params["tool"] = tool
 
     # Allow a small buffer over the requested timeout for IPC overhead.
     data = await _ipc_call("send_message", params, timeout=timeout + 10)
@@ -1199,7 +1212,10 @@ async def get_file(artifact_id: str) -> str:
         return _result(_error(str(e)))
     ident = _ident()
     try:
-        info = await attachments.file_info(api.client(), ident.api_url, ident.token, artifact_id)
+        info = await attachments.file_info(
+            api.client(), ident.api_url, ident.token, artifact_id,
+            await chat_context.request_headers(),
+        )
     except PermissionError:
         return _result(_error("No such file, or this agent cannot open it.", status=404))
     except Exception as e:

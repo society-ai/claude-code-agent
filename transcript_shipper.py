@@ -43,6 +43,8 @@ from typing import Any, Optional
 
 import httpx
 
+from chat_context import chat_headers
+
 logger = logging.getLogger("transcript_shipper")
 
 # Server-side caps (mirror agent_router's SessionMirrorBatch limits).
@@ -207,11 +209,17 @@ class TranscriptShipper:
         work_item_kind: Optional[str] = None,
         work_item_id: Optional[str] = None,
         contact: Optional[dict] = None,
+        chat_id: str = "",
     ) -> None:
         """Mark a session as bridge-owned and shippable. Idempotent; metadata
-        refreshes on every call (a resume can update the title)."""
+        refreshes on every call (a resume can update the title).
+
+        `chat_id` is the app Chat the bridge knows the session works in, sent
+        with each batch until the platform reports the session's own chat."""
         rec = self._state.setdefault(session_id, {"pos": 0, "seq": 0})
         rec["cwd"] = cwd
+        if chat_id:
+            rec["dispatch_chat_id"] = chat_id
         # First title wins: later dispatches into the same session (trigger
         # echoes, follow-up turns) must not overwrite the human title.
         if title and not rec.get("title"):
@@ -408,7 +416,8 @@ class TranscriptShipper:
             )
         try:
             r = await self._client.post(
-                f"{self._api_url}/api/v1/session-mirror", json=body
+                f"{self._api_url}/api/v1/session-mirror", json=body,
+                headers=chat_headers(meta.get("chat_id") or meta.get("dispatch_chat_id")),
             )
             if r.status_code >= 400:
                 logger.warning(

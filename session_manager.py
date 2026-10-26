@@ -134,11 +134,14 @@ class SessionRecord:
                                        # transcripts by folder)
     sender_group: str = ""             # who the conversation is with: names its
                                        # sidebar group ("" = the owner)
+    chat_id: str = ""                  # the owner's app Chat this session works in
+                                       # (System of Record context); "" if none
 
 # Fields saved to disk; the rest is per-process runtime state.
 _REMEMBERED_FIELDS = (
     "work_item_key", "persona", "session_id", "tmux_name", "title", "last_active",
     "has_run_once", "background", "permission", "contact_label", "cwd", "sender_group",
+    "chat_id",
 )
 
 
@@ -203,6 +206,18 @@ class SessionManager:
 
     def get(self, work_item_key: str) -> Optional[SessionRecord]:
         return self._sessions.get(self.resolve(work_item_key))
+
+    def set_chat(self, work_item_key: str, chat_id: str, *, only_if_empty: bool = False) -> None:
+        """Record the app Chat a session works in. The owner's latest chat
+        message sets it; the chat its recording projects into fills it only
+        when nothing has (a task session has no chat of its own until then)."""
+        rec = self.get(work_item_key)
+        if rec is None or not chat_id or rec.chat_id == chat_id:
+            return
+        if only_if_empty and rec.chat_id:
+            return
+        rec.chat_id = chat_id
+        self._save_registry()
 
     def snapshot(self) -> list[dict]:
         """Read-only view of sessions for the local status panel.

@@ -75,6 +75,7 @@ from dataclasses import replace
 from streaming import StreamMapper, _data_part
 import folders
 from attachments import FILES_DIRNAME, Attachment, fetch_all, parse_file_parts, prompt_block
+from chat_context import chat_headers, valid_chat_id, valid_tool_name
 from typing import Any, Awaitable, Callable, Optional
 
 logging.basicConfig(
@@ -390,6 +391,7 @@ async def stream_claude_code(
     *,
     work_dir: str | None = None,
     extra_dirs: list[str] | None = None,
+    chat_id: str = "",
 ) -> tuple[int, str, str | None, bool]:
     # The calling bridge's dirs; fall back to the process globals.
     work_dir = work_dir or WORK_DIR
@@ -433,11 +435,17 @@ async def stream_claude_code(
     # a longer file blows it out entirely. Hitting the limit raises
     # LimitOverrunError mid-stream and the whole task fails. Bump it to 16
     # MiB so any reasonable single event fits in one readline().
+    # The owner's chat this run answers, for the society-ai MCP server to
+    # name on calls to the router (System of Record).
+    env = None
+    if valid_chat_id(chat_id):
+        env = {**os.environ, "SOCIETY_AI_CHAT_ID": valid_chat_id(chat_id)}
     process = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=work_dir,
+        env=env,
         limit=16 * 1024 * 1024,
     )
 
@@ -1120,6 +1128,13 @@ class Bridge:
             rpc_params["session_id"] = params["session_id"]
         if params.get("task_id"):
             rpc_params["task_id"] = params["task_id"]
+        # System of Record context the hub binds for this send.
+        chat_id = valid_chat_id(params.get("chat_id"))
+        if chat_id:
+            rpc_params["chat_id"] = chat_id
+        tool = valid_tool_name(params.get("tool"))
+        if tool:
+            rpc_params["tool"] = tool
 
         try:
             await self.send_rpc("agent.send_task", rpc_params, msg_id=req_id)
@@ -1368,6 +1383,7 @@ class Bridge:
                         await self._execute_chat_task(
                             task_id, user_text, agent_task_id=agent_task_id,
                             instructions_block=instructions_block,
+                            chat_id=_owner_chat_id(metadata) or "",
                         )
                 except Exception as e:
                     logger.exception("Task %s failed with unhandled exception", task_id)
@@ -1516,6 +1532,7 @@ class Bridge:
                     "Authorization": f"Bearer {self.ctx.token}",
                     "Content-Type": "application/json",
                     "User-Agent": f"claude-code-agent/{__version__}",
+                    **chat_headers(chat_id),
                 },
             )
             if resp.status_code < 400:
@@ -1815,6 +1832,7 @@ class Bridge:
         user_text: str,
         agent_task_id: str | None = None,
         instructions_block: str = "",
+        chat_id: str = "",
     ):
         """Handle a direct chat message OR a personal-task trigger.
 
@@ -1859,7 +1877,8 @@ class Bridge:
 
         on_event = await self._stream_to_status_updates(task_id)
         exit_code, output, _session, had_error = await stream_claude_code(
-            prompt, on_event, work_dir=self.ctx.work_dir, extra_dirs=self.ctx.extra_dirs)
+            prompt, on_event, work_dir=self.ctx.work_dir, extra_dirs=self.ctx.extra_dirs,
+            chat_id=chat_id)
         mapper: StreamMapper = on_event.__mapper__  # type: ignore[attr-defined]
 
         result_text = (output or "").strip() or (mapper.final_text() or "I couldn't generate a response.")
@@ -2040,6 +2059,7 @@ class Bridge:
         for rec in list(mgr._sessions.values()):
             if rec.session_id == session_id:
                 mgr.alias(chat_id, rec.work_item_key)
+                mgr.set_chat(rec.work_item_key, chat_id, only_if_empty=True)
                 logger.info(
                     "Chat %s aliased to session work item %s",
                     chat_id[:8], rec.work_item_key[:24],
@@ -2149,6 +2169,13 @@ class Bridge:
             "pending_session_tasks": len(getattr(self, "_pending_session_tasks", {}) or {}),
             "sessions": sessions,
         }
+
+    async def ipc_session_chat(self, params: dict) -> dict:
+        """The app Chat a session works in ("" if none), for its MCP server
+        to name on calls to the router (System of Record)."""
+        key = str(params.get("session_key") or "").strip()
+        rec = self._session_mgr.get(key) if self._session_mgr is not None and key else None
+        return {"chat_id": rec.chat_id if rec is not None else ""}
 
     async def ipc_reopen_session(self, params: dict) -> dict:
         """Relaunch a closed session with its history (and its Remote Control
@@ -2538,6 +2565,7 @@ class Bridge:
             fetch_task = asyncio.ensure_future(fetch_all(
                 _get_http_client(), self.ctx.api_url, self.ctx.token,
                 attachments, pathlib.Path(base) / FILES_DIRNAME,
+                chat_id=delivery_chat_id or (existing.chat_id if existing is not None else ""),
             ))
         # Ensure (launch or resume) the work item's session. Trigger-kind
         # work (wakes, schedules, status echoes) runs headless — no Remote
@@ -2557,6 +2585,11 @@ class Bridge:
                 task_id, f"Could not start a session: {type(e).__name__}: {e}", exit_code=1
             )
             return
+
+        # The owner's chat this message came from is where the session's
+        # actions happen (System of Record); its MCP server asks for it.
+        if delivery_chat_id:
+            mgr.set_chat(rec.work_item_key, delivery_chat_id)
 
         # Session-scoped standing context: the L1 platform protocol and the
         # standing blocks (identity, scope, activity). A fresh launch has no
@@ -2593,6 +2626,7 @@ class Bridge:
                     {"sender": sender.label, "permission": permission}
                     if sender is not None and not sender.is_owner else None
                 ),
+                chat_id=rec.chat_id,
             )
 
         if rec.state != "ready":
@@ -2978,6 +3012,7 @@ def main():
             "status": bridge.ipc_status,
             "reap_session": bridge.ipc_reap_session,
             "reopen_session": bridge.ipc_reopen_session,
+            "session_chat": bridge.ipc_session_chat,
         },
         path=ctx.socket,
     )
