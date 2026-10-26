@@ -77,6 +77,9 @@ def _notify_mirrors(hook_input: dict[str, Any], event: str = "stop") -> None:
     session_id = hook_input.get("session_id")
     if not session_id:
         return
+    # The Tracker agent's own model runs are never tracked (no loop).
+    if os.environ.get("SOCIETY_AI_TRACKER") == "1":
+        return
     frame = (json.dumps({
         "id": f"hook-{os.getpid()}",
         "method": "mirror_notify",

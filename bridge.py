@@ -57,6 +57,7 @@ from config import (
     SANDBOX_TIMEOUT,
     SESSION_MODE,
     SOCIETY_AI_BRIDGE_SOCKET,
+    TRACKING_ENABLED,
     __version__,
     ws_url,
 )
@@ -746,6 +747,18 @@ class Bridge:
                 logger.info(
                     "Session mirroring enabled (conversation only; MIRROR=false to disable)"
                 )
+
+        # Session Trackers: one bridge per machine (whoever holds the lock)
+        # keeps a Tracker for every Claude Code session here.
+        self._tracker = None
+        if TRACKING_ENABLED and self.ctx.token:
+            from hook_common import discover_personas
+            from session_tracker import SessionTrackerRunner
+            personas = discover_personas()
+            self._tracker = SessionTrackerRunner(
+                self.ctx.name, self.ctx.token, self.ctx.api_url,
+                default_agent=personas[0]["name"] if personas else self.ctx.name,
+            )
 
         # Sandbox executor for secured mode
         self._sandbox = None
@@ -2033,6 +2046,11 @@ class Bridge:
         if not session_id:
             return {"shipped": False}
 
+        # Session Trackers see every session's turns (only the machine's
+        # tracking bridge acts on them). Never blocks the hook.
+        if self._tracker is not None:
+            self._tracker.notify(params)
+
         # Hook traffic IS session activity. Locally-typed turns never pass
         # through a dispatch, and before this the idle reaper counted them
         # as silence — it once killed a session fifteen seconds after the
@@ -2725,6 +2743,9 @@ class Bridge:
         # forget — a failed post retries at the next start, never blocks boot).
         asyncio.ensure_future(self._report_update_outcome())
 
+        if self._tracker is not None:
+            asyncio.ensure_future(self._tracker.run())
+
         # Start sandbox in secured mode (hard fail if it can't start)
         if self._sandbox:
             try:
@@ -2856,6 +2877,8 @@ class Bridge:
         if not self.running:
             return
         self.running = False
+        if self._tracker is not None:
+            self._tracker.stop()
         logger.info("Shutting down...")
 
 

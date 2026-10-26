@@ -11,7 +11,7 @@ import os
 import re
 import sys
 
-__version__ = "0.23.0"
+__version__ = "0.24.0"
 
 # -- Required / core ---------------------------------------------------------
 
@@ -49,9 +49,19 @@ SESSION_MODE: bool = os.getenv("SESSION_MODE", "true").strip().lower() in (
 
 # Mirror session transcripts to Society AI (the recorded workspace). Only
 # sessions the bridge itself launches are shipped — never the machine
-# owner's own desktop/terminal sessions. Kill switch: MIRROR=false.
+# owner's own desktop/terminal sessions (those get a Tracker only, below).
+# Kill switch: MIRROR=false.
 # Only meaningful when SESSION_MODE is on.
 MIRROR_SESSIONS: bool = os.getenv("MIRROR", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+# Session Trackers: a short, current Tracker for every Claude Code session on
+# this machine (status, open questions, approvals, checklist, git loose ends),
+# written by the owner's hidden Tracker agent with a small model. Only the
+# Tracker leaves the machine, never the conversation. On unless TRACKING=false
+# here, MIRROR=false, or "Track my sessions" is off in the app.
+TRACKING_ENABLED: bool = MIRROR_SESSIONS and os.getenv("TRACKING", "true").strip().lower() in (
     "1", "true", "yes", "on",
 )
 

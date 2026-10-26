@@ -73,6 +73,8 @@ MACHINE_SCHEMA = [
      "help": "Keep a session per work item (the recorded workspace)."},
     {"key": "MIRROR", "label": "Record sessions to Society AI", "type": "bool", "default": True,
      "help": "Record the conversation (your messages and the agent's replies) on Society AI so you can review it. What Claude Code does on this machine (commands, files it reads or edits, its thinking) is never sent."},
+    {"key": "TRACKING", "label": "Track my sessions", "type": "bool", "default": True,
+     "help": "Keep a short tracker for every Claude Code session on this computer (status, open questions, approvals, checklist, unfinished work) on Society AI. A small model (Claude Haiku) runs here after each turn, using your Agent SDK credits. Only the tracker is sent, never the conversation. You can also turn it off in the app's Settings."},
     {"key": "EXECUTION_MODE", "label": "Where agents run", "type": "enum",
      "enum": ["standard", "secured"], "default": "standard",
      "help": "standard = directly on this machine, with the folder access you grant each agent. secured = an isolated sandbox that can't see any of your files — only Society AI tools and limited network (also turns off the per-agent folders above). Use it for work you don't want touching your machine."},

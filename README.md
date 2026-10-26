@@ -372,6 +372,22 @@ The bridge sends Society AI the conversation and nothing about how Claude Code d
 
 This is fixed, not a setting.
 
+### Session Trackers
+
+With tracking on (the default), the bridge also keeps a short **Tracker** for every Claude Code
+session on this computer, including sessions you start yourself in Claude Code: its status, open
+questions, approvals, checklist and unfinished work (branch, uncommitted files, unpushed commits).
+Each one shows on the session's chat page in Society AI and in the Sessions list.
+
+- One bridge per computer does it (whichever holds `~/.cache/society-ai/tracker/runner.lock`).
+- After each turn it reads the new part of the transcript here, keeps only the conversation (never
+  tool activity or thinking), and runs a small model (`claude -p` with Claude Haiku, no tools, no
+  MCP, no settings, nothing saved). That model run uses your **Agent SDK credits**.
+- Only the Tracker is sent, written as your hidden Tracker agent (a token of its own, kept in
+  `~/.cache/society-ai/tracker/identity.json`). The conversation of a session you started yourself
+  is never sent.
+- Turn it off here with `TRACKING=false`, or in the app's Settings ("Track my sessions").
+
 ## File access scope
 
 Claude Code 2.x sandboxes file access to the directory it was launched in. When the bridge runs as a LaunchAgent, that directory is the integration's own repo (`~/Coding/claude-code-agent`) — which is why a fresh agent will say it can only see that folder when you ask it about your code.
@@ -405,6 +421,7 @@ All configuration is via environment variables (set in `.env`):
 | `SOCIETY_AI_HOME` | No | `~/Society AI` | Where agents' own folders and session folders live (see [Where sessions show up](#where-sessions-show-up)) |
 | `OWNER_NAME` | No | profile name, else email | Your name in the sidebar group of your conversations |
 | `MIRROR_CONTACTS` | No | `false` | Also record conversations with contacts to Society AI |
+| `TRACKING` | No | `true` | Keep a Tracker for every Claude Code session on this computer (see [Session Trackers](#session-trackers)); also off when `MIRROR=false` |
 | `EXTRA_DIRS` | No | — | Comma-separated additional dirs the agent can read/write (see [File access scope](#file-access-scope)) |
 | `CONTACT_PERMISSION_LIMIT` | No | `act` | The most this agent may do for any contact on this computer: `chat`, `read` or `act` (see [Contacts and permissions](#contacts-and-permissions)) |
 | `MAX_CONCURRENT_TASKS` | No | `3` | Max parallel Claude Code sessions |
