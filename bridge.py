@@ -693,7 +693,7 @@ class Bridge:
         self._task_locks: dict[str, asyncio.Lock] = {}
 
         # Outbound JSON-RPC correlation tables, used by the IPC handlers
-        # for search_agents and delegate_task.
+        # for search_agents and send_message.
         # _pending_requests:    req_id -> Future, resolved when the hub
         #                       sends back a regular {"id": req_id, "result": ...}
         # _pending_delegations: req_id -> Future, resolved when the hub
@@ -761,7 +761,6 @@ class Bridge:
             except ImportError:
                 logger.error("EXECUTION_MODE=secured requires sandbox.py. Check your installation.")
                 sys.exit(1)
-            from config import ENABLE_AGENT_LIFECYCLE
             sandbox_env = {
                 "SOCIETY_AI_AUTH_TOKEN": self.ctx.token,
                 # Per-agent URL: the sandboxed session must hit the same
@@ -770,8 +769,6 @@ class Bridge:
                 "AGENT_NAME": self.ctx.name,
                 "COMPANY_ID": self.ctx.company_id,
             }
-            if ENABLE_AGENT_LIFECYCLE:
-                sandbox_env["ENABLE_AGENT_LIFECYCLE"] = "true"
             self._sandbox = SandboxManager(
                 work_dir=self.ctx.work_dir,
                 env_vars=sandbox_env,
@@ -1068,7 +1065,7 @@ class Bridge:
         finally:
             self._pending_requests.pop(req_id, None)
 
-    async def ipc_delegate_task(self, params: dict) -> dict:
+    async def ipc_send_message(self, params: dict) -> dict:
         """Run an `agent.send_task` over our WS connection and wait for
         the asynchronous `delegation.result` notification.
 
@@ -1087,16 +1084,16 @@ class Bridge:
         message = params.get("message")
         skill_id = (params.get("skill_id") or "").strip()
         if not agent_name:
-            return {"error": True, "message": "delegate_task requires 'agent_name'"}
+            return {"error": True, "message": "send_message requires 'agent_name'"}
         if not isinstance(message, str) or not message:
-            return {"error": True, "message": "delegate_task requires non-empty 'message'"}
+            return {"error": True, "message": "send_message requires non-empty 'message'"}
         if not skill_id:
             return {
                 "error": True,
                 "message": (
-                    "delegate_task requires 'skill_id' — the hub bills and routes "
-                    "by skill. Use search_agents first and pass the target's "
-                    "best_skill_id."
+                    "send_message requires 'skill_id' (the hub routes and bills "
+                    "by skill): 'chat' for a conversation, or a skill id from "
+                    "search_agents."
                 ),
             }
         timeout = int(params.get("timeout", 120))
@@ -2976,7 +2973,7 @@ def main():
     ipc = bridge_ipc.IPCServer(
         handlers={
             "search_agents": bridge.ipc_search_agents,
-            "delegate_task": bridge.ipc_delegate_task,
+            "send_message": bridge.ipc_send_message,
             "mirror_notify": bridge.ipc_mirror_notify,
             "status": bridge.ipc_status,
             "reap_session": bridge.ipc_reap_session,

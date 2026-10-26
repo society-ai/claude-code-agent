@@ -85,7 +85,6 @@ def main() -> None:
     repo_dir = os.path.dirname(os.path.abspath(__file__))
 
     auth_token = os.environ.get("SOCIETY_AI_AUTH_TOKEN", "").strip()
-    lifecycle_flag = os.environ.get("ENABLE_AGENT_LIFECYCLE", "").strip()
 
     # The registered entry no longer bakes the token (identity is a runtime
     # binding — see identity.py), but an empty token here still means
@@ -144,8 +143,6 @@ def main() -> None:
             "${SOCIETY_AI_BRIDGE_SOCKET:-}",
         ),
     ]
-    if lifecycle_flag:
-        env_pairs.append(_env_value_for_cli("ENABLE_AGENT_LIFECYCLE", lifecycle_flag))
 
     # Idempotency: removing first means re-running setup.sh after changing
     # AGENT_NAME / COMPANY_ID / API key picks up the new values. `claude mcp

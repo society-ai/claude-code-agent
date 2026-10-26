@@ -344,7 +344,7 @@ class SandboxManager:
         #
         # Note: in secured mode the bridge (host) and the MCP server
         # (sandbox) live in different filesystem namespaces, so the IPC
-        # socket is NOT reachable. search_agents / delegate_task will
+        # socket is NOT reachable. search_agents / send_message will
         # return an "IPC socket not found" error from inside the sandbox;
         # this is intentional. We point SOCIETY_AI_BRIDGE_SOCKET at a path
         # under /tmp so the error message names something coherent.
@@ -355,8 +355,6 @@ class SandboxManager:
             "COMPANY_ID": self._env_vars.get("COMPANY_ID", ""),
             "SOCIETY_AI_BRIDGE_SOCKET": "/tmp/society-ai-bridge.sock",
         }
-        if self._env_vars.get("ENABLE_AGENT_LIFECYCLE"):
-            env_block["ENABLE_AGENT_LIFECYCLE"] = self._env_vars["ENABLE_AGENT_LIFECYCLE"]
         settings = {
             "mcpServers": {
                 "society-ai": {

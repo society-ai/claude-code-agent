@@ -11,7 +11,7 @@ import os
 import re
 import sys
 
-__version__ = "0.21.3"
+__version__ = "0.22.0"
 
 # -- Required / core ---------------------------------------------------------
 
@@ -29,13 +29,6 @@ COMPANY_ID: str = os.getenv("COMPANY_ID", "").strip()
 SOCIETY_AI_BRIDGE_SOCKET: str = (
     os.getenv("SOCIETY_AI_BRIDGE_SOCKET", "").strip()
     or os.path.join(os.path.expanduser("~"), ".cache", "society-ai", "bridge.sock")
-)
-
-# Gate for high-power agent lifecycle tools (deploy/update/restart/delete).
-# Disabled by default — an LLM accidentally deploying or deleting agents is
-# a costly mistake to recover from. Set to "true" to enable.
-ENABLE_AGENT_LIFECYCLE: bool = os.getenv("ENABLE_AGENT_LIFECYCLE", "false").strip().lower() in (
-    "1", "true", "yes", "on",
 )
 
 # -- Streaming + visibility --------------------------------------------------

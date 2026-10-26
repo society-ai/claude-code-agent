@@ -2,41 +2,44 @@
 
 Tool surface (see README for full descriptions):
 
-  Core (existing):
-    get_company, list_tasks, get_task, update_task, send_inbox_item, list_inbox
+  Identity: switch_agent
 
-  Phase 1 — task / inbox CRUD gap closures:
-    create_task, review_task, reassign_task, get_my_tasks,
-    respond_to_inbox, dismiss_inbox
+  Tasks and inbox:
+    list_tasks, get_task, create_task, update_task, review_task, reassign_task,
+    send_inbox_item, list_inbox, respond_to_inbox (response="dismiss" dismisses)
 
-  Phase 2 — agent network (routed through the bridge daemon via IPC):
-    search_agents, delegate_task
+  Network (routed through the bridge daemon via IPC):
+    search_agents, send_message
 
-  Phase 3 — artifacts and knowledge base:
-    save_artifact, pin_artifact, list_pinned_artifacts, unpin_artifact,
-    list_kb_items
+  Home, chats and files:
+    post_feed, get_user_context, post_chat_message, get_chat_messages,
+    save_artifact, get_file, list_files, pin_artifact, list_pinned_artifacts,
+    unpin_artifact
 
-  Knowledge system — unified KB (memory|document|policy|process):
-    submit_knowledge, search_knowledge, read_kb_item, get_entity, kb_neighbors,
-    write_kb_item, update_kb_item, supersede_kb_item, upsert_entity, add_edge,
-    list_kb_submissions, resolve_kb_submission   [curator writes need knowledge:curate]
+  Knowledge base (memory|document|policy|process):
+    list_kb_items, submit_knowledge, search_knowledge, read_kb_item, get_entity,
+    kb_neighbors, write_kb_item, update_kb_item, supersede_kb_item, upsert_entity,
+    add_edge, list_kb_submissions, resolve_kb_submission
+    [curator writes need knowledge:curate]
 
-  Phase 4 — org context:
-    list_owner_agents, list_company_agents, list_departments, create_department, list_memberships,
-    list_spaces, create_space, get_space, update_space,
-    list_projects, create_project, get_project, update_project
+  Workspaces and companies:
+    get_company, list_company_agents, list_memberships, list_spaces, create_space,
+    get_space, update_space, list_projects, create_project, get_project,
+    update_project, list_companies, update_company, create_membership,
+    update_membership, remove_membership
 
-  Phase 4b — company management (agent orgs):
-    list_companies, create_company, update_company,
-    create_membership, update_membership, remove_membership
-    (no delete_company by design — archive via update_company(status="archived"))
+  Automation and company pages:
+    create_schedule, list_schedules, create_workflow, list_workflows,
+    start_workflow, register_nav_item, list_nav_items, create_dashboard,
+    list_dashboards, create_panel, update_panel
 
-  Phase 5 — automation and UI authoring:
-    create_schedule, list_schedules, create_workflow, list_workflows, start_workflow,
-    register_nav_item, list_nav_items, create_dashboard, list_dashboards,
-    create_panel, update_panel,
-    update_agent  (one tool: system/skills live, model/visibility, action=restart|delete),
-    deploy_agent  [gated on ENABLE_AGENT_LIFECYCLE; update_agent's restart/delete actions also gated]
+  Lead agent only (LEAD_ONLY_TOOLS: shown only to the owner's Lead agent; the
+  platform refuses them for any other agent):
+    list_owner_agents, update_agent, get_feed, publish_brief, create_company
+
+The platform decides what each call may do (agent_router/auth/agent_permissions.py:
+regular and Lead agent permission sets). Connecting, deleting and issuing tokens
+for agents stay with their owner.
 
 All tools return JSON strings. Errors (network, 4xx/5xx, validation) are
 encoded as {"error": true, ...} objects so the LLM can read and recover.
@@ -50,13 +53,12 @@ import re
 from typing import Any, Optional
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 import api
 import attachments
 import bridge_ipc
 import identity
-from config import ENABLE_AGENT_LIFECYCLE
 
 # Session identity is a runtime binding (see identity.py) — resolve it at
 # call time everywhere, never capture it in a module constant.
@@ -91,15 +93,7 @@ _VALID_REVIEW_DECISIONS = {"approve", "reject"}
 # pgmq trigger so the reviewer's runtime wakes up; 'user' is an inbox-only
 # notification handled by the web UI.
 _VALID_REVIEWER_TYPES = {"user", "agent"}
-_VALID_AGENT_LIFECYCLE_ROLES = {
-    "ceo", "coo", "cto", "cfo", "cmo", "department_head",
-    "team_lead", "individual_contributor",
-}
-_VALID_DEPLOY_MODES = {"serverless", "dedicated"}
-_VALID_HOSTINGS = {"cloud_run", "gce"}
-_VALID_AGENT_TYPES = {"openclaw", "zeroclaw"}
 _VALID_ACCESS_ROLES = {"admin", "member", "viewer"}
-_VALID_VISIBILITIES = {"private", "public"}
 _VALID_JOIN_POLICIES = {"open", "invite"}  # company teams (docs/design/teams.md)
 _VALID_AGENT_LEVELS = {"blocked", "chat", "read", "act"}
 # Company lifecycle states an agent may set. The DB also knows draft /
@@ -174,7 +168,55 @@ def _enum_check(value: Optional[str], allowed: set[str], name: str) -> Optional[
 
 # -- MCP server --------------------------------------------------------------
 
-mcp = FastMCP("society-ai", instructions="Society AI tools for Claude Code")
+# Tools only the owner's Lead agent may use. The platform enforces this on
+# every call (regular agents get 403); hiding them keeps a regular agent's
+# tool list to what it can actually do.
+LEAD_ONLY_TOOLS = frozenset({
+    "list_owner_agents", "update_agent", "get_feed", "publish_brief", "create_company",
+})
+
+# The bound agent's role on the platform ("lead" or "regular"), per agent name.
+# Read from /api/v1/agents/me; cleared when switch_agent changes the binding.
+_roles: dict[str, str] = {}
+
+
+async def _agent_role() -> str:
+    """The bound agent's role. "regular" when unbound or unknown (fails closed:
+    a Lead tool stays hidden, and the platform decides anyway)."""
+    ident = _ident()
+    if not ident.bound or not ident.name:
+        return "regular"
+    if ident.name in _roles:
+        return _roles[ident.name]
+    me = await api.get("/api/v1/agents/me")
+    if not isinstance(me, dict) or me.get("error"):
+        return "regular"  # not cached: a passing network error must not stick
+    role = "lead" if me.get("agent_role") == "lead" else "regular"
+    _roles[ident.name] = role
+    return role
+
+
+class SocietyMCP(FastMCP):
+    """FastMCP that shows the Lead-only tools only to the owner's Lead agent."""
+
+    async def list_tools(self):
+        tools = await super().list_tools()
+        if await _agent_role() == "lead":
+            return tools
+        return [t for t in tools if t.name not in LEAD_ONLY_TOOLS]
+
+    async def call_tool(self, name, arguments):
+        if name in LEAD_ONLY_TOOLS and await _agent_role() != "lead":
+            from mcp.server.fastmcp.exceptions import ToolError
+
+            raise ToolError(
+                f"{name} is only for your owner's Lead agent. Your owner can make an "
+                "agent their Lead in Society AI."
+            )
+        return await super().call_tool(name, arguments)
+
+
+mcp = SocietyMCP("society-ai", instructions="Society AI tools for Claude Code")
 
 
 # ==============================================================================
@@ -183,7 +225,7 @@ mcp = FastMCP("society-ai", instructions="Society AI tools for Claude Code")
 
 
 @mcp.tool()
-async def switch_agent(agent_name: str = "") -> str:
+async def switch_agent(agent_name: str = "", ctx: Optional[Context] = None) -> str:
     """Switch which Society AI agent this session acts as, or list the
     identities available on this machine.
 
@@ -243,6 +285,16 @@ async def switch_agent(agent_name: str = "") -> str:
     elif isinstance(check, dict) and check.get("status") == 404:
         check = await api.get("/api/v1/agent-tasks", params={"limit": 1})
     verified = not (isinstance(check, dict) and check.get("error"))
+    # A different agent may have a different role: refresh it and tell the
+    # client its tool list may have changed (Lead-only tools).
+    _roles.pop(new.name, None)
+    if isinstance(check, dict) and not check.get("error") and "agent_role" in check:
+        _roles[new.name] = "lead" if check.get("agent_role") == "lead" else "regular"
+    if ctx is not None:
+        try:
+            await ctx.session.send_tool_list_changed()
+        except Exception:
+            pass
     out: dict[str, Any] = {
         "switched_to": new.name,
         "display_name": new.display_name,
@@ -826,49 +878,18 @@ async def reassign_task(
 
 
 @mcp.tool()
-async def get_my_tasks(
-    company_id: Optional[str] = None,
-    status: Optional[str] = None,
-    limit: int = 50,
-) -> str:
-    """List tasks assigned to this agent (`AGENT_NAME`). Top-level route — works
-    in both personal and company scopes.
-
-    Args:
-        company_id: Optional company UUID to restrict to one company.
-        status: Filter by task status.
-        limit: Max results (1-200, default 50).
-    """
-    err = _enum_check(status, _VALID_TASK_STATUSES, "status")
-    if err:
-        return _result(err)
-    limit = max(1, min(200, int(limit)))
-    params: dict[str, Any] = {
-        "assigned_to_agent": _ident().name,
-        "limit": limit,
-    }
-    if status:
-        params["status"] = status
-    if company_id:
-        try:
-            _validate_uuid(company_id, "company_id")
-        except ValueError as e:
-            return _result(_error(str(e)))
-        params["company_id"] = company_id
-    return _result(await api.get("/api/v1/agent-tasks", params=params))
-
-
-@mcp.tool()
 async def respond_to_inbox(
     item_id: str,
     response: str,
     response_data: Optional[dict] = None,
 ) -> str:
-    """Respond to an inbox item — e.g. approve an approval-required request.
+    """Respond to an inbox item addressed to you, e.g. approve an
+    approval-required request, or dismiss it.
 
     Args:
         item_id: Inbox item UUID.
-        response: The textual response.
+        response: The textual response, or "dismiss" to mark it handled
+            without responding.
         response_data: Optional structured payload (kept arbitrary).
     """
     try:
@@ -877,6 +898,10 @@ async def respond_to_inbox(
         return _result(_error(str(e)))
     if not response or not response.strip():
         return _result(_error("response is required"))
+    if response.strip().lower() == "dismiss":
+        return _result(await api.post(f"/api/v1/inbox/{item_id}/dismiss", {
+            "dismissed_by_agent": _ident().name,
+        }))
     body: dict[str, Any] = {
         "response": response,
         "responded_by_agent": _ident().name,
@@ -884,18 +909,6 @@ async def respond_to_inbox(
     if response_data is not None:
         body["response_data"] = response_data
     return _result(await api.post(f"/api/v1/inbox/{item_id}/respond", body))
-
-
-@mcp.tool()
-async def dismiss_inbox(item_id: str) -> str:
-    """Dismiss an inbox item (mark as handled without sending a response)."""
-    try:
-        _validate_uuid(item_id, "item_id")
-    except ValueError as e:
-        return _result(_error(str(e)))
-    return _result(await api.post(f"/api/v1/inbox/{item_id}/dismiss", {
-        "dismissed_by_agent": _ident().name,
-    }))
 
 
 # ==============================================================================
@@ -940,59 +953,62 @@ async def search_agents(query: str, limit: int = 10) -> str:
 
 
 @mcp.tool()
-async def delegate_task(
-    agent_name: str,
+async def send_message(
+    to: str,
     message: str,
-    skill_id: Optional[str] = None,
-    session_id: Optional[str] = None,
+    skill_id: str = "chat",
+    conversation_id: Optional[str] = None,
     timeout: int = 120,
 ) -> str:
-    """Delegate a task to another Society AI agent and wait for the result.
+    """Send a message to another agent on Society AI and wait for its reply.
 
-    Requires the bridge daemon to be running. Uses the existing WebSocket
-    connection to send `agent.send_task` and correlates the asynchronous
-    `delegation.result` notification back to this caller. Billing (if any)
-    is on the agent owning this `SOCIETY_AI_AUTH_TOKEN`.
+    Any agent you may reach: your owner's agents, your contacts, and public
+    agents (find them with search_agents). A contact or one of your owner's
+    agents knows who you are; a public agent is a service that does not know
+    your owner, may charge per skill, and should get only what the message
+    needs. Never share your owner's private information with it.
+
+    Requires the bridge daemon to be running (it sends over its WebSocket
+    connection and waits for the reply). Billing, if any, is on your owner.
 
     Args:
-        agent_name: Target agent name (e.g. "research-bot").
-        message: The task / question to delegate.
-        skill_id: Skill to invoke on the target — REQUIRED by the hub
-            (it bills and routes by skill). Get it from search_agents:
-            each result carries `best_skill_id`.
-        session_id: Optional session UUID for multi-turn conversations.
-        timeout: How long to wait for the delegation result, in seconds.
+        to: The agent's handle (e.g. "research-bot").
+        message: What to say or ask.
+        skill_id: The skill to use on the other agent: "chat" (the default)
+            for a conversation, or a skill id from search_agents
+            (``best_skill_id``) for a specific, possibly paid, skill.
+        conversation_id: Continue an earlier conversation (the id a previous
+            send_message returned).
+        timeout: How long to wait for the reply, in seconds (5-600).
     """
-    if not agent_name or not agent_name.strip():
-        return _result(_error("agent_name is required"))
+    if not to or not to.strip():
+        return _result(_error("to is required"))
     if not message or not message.strip():
         return _result(_error("message is required"))
-    if skill_id:
-        # Skill ids are card-defined slugs ("chat", "code-review"), not
-        # UUIDs — keep the same shape rule as agent names.
-        if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$", skill_id.strip()):
-            return _result(_error(
-                f"skill_id must be a skill slug from the agent's card, got: {skill_id!r}"
-            ))
-    if session_id:
+    skill_id = (skill_id or "chat").strip()
+    # Skill ids are card-defined slugs ("chat", "code-review"), not UUIDs.
+    if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$", skill_id):
+        return _result(_error(
+            f"skill_id must be a skill slug from the agent's card, got: {skill_id!r}"
+        ))
+    if conversation_id:
         try:
-            _validate_uuid(session_id, "session_id")
+            _validate_uuid(conversation_id, "conversation_id")
         except ValueError as e:
             return _result(_error(str(e)))
     timeout = max(5, min(600, int(timeout)))
 
     params: dict[str, Any] = {
-        "agent_name": agent_name.strip(),
+        "agent_name": to.strip().lstrip("@"),
         "message": message,
+        "skill_id": skill_id,
         "timeout": timeout,
     }
-    if skill_id:
-        params["skill_id"] = skill_id
-    if session_id:
-        params["session_id"] = session_id
+    if conversation_id:
+        params["session_id"] = conversation_id
 
     # Allow a small buffer over the requested timeout for IPC overhead.
-    data = await _ipc_call("delegate_task", params, timeout=timeout + 10)
+    data = await _ipc_call("send_message", params, timeout=timeout + 10)
     return _result(data)
 
 
@@ -1711,7 +1727,7 @@ async def list_owner_agents(include_inactive: bool = False) -> str:
     is the tool that answers "what other agents does my owner have?".
 
     Returns a display projection only — never the siblings' system prompts.
-    Each entry carries the agent's configured skill ids for `delegate_task`;
+    Each entry carries the agent's configured skill ids for `send_message`;
     an empty `skills` list means the agent exposes only its factory-derived
     default skill, not that it is unreachable.
 
@@ -1746,68 +1762,6 @@ async def list_company_agents(company_id: Optional[str] = None) -> str:
     except ValueError as e:
         return _result(_error(str(e)))
     return _result(await api.get(f"/api/v1/companies/{cid}/agents"))
-
-
-@mcp.tool()
-async def list_departments(company_id: Optional[str] = None) -> str:
-    """List a company's departments (a department is a space with org-chart metadata)."""
-    try:
-        cid = _resolve_company_id(company_id)
-    except ValueError as e:
-        return _result(_error(str(e)))
-    return _result(await api.get(f"/api/v1/companies/{cid}/spaces"))
-
-
-@mcp.tool()
-async def create_department(
-    name: str,
-    company_id: Optional[str] = None,
-    description: Optional[str] = None,
-    dept_function: Optional[str] = None,
-    lead_agent_id: Optional[str] = None,
-    join_policy: Optional[str] = None,
-    agent_level: Optional[str] = None,
-) -> str:
-    """Create a department in a company. A company's departments are its
-    spaces (list them with list_spaces or list_departments).
-
-    Args:
-        name: Department name.
-        company_id: Company UUID.
-        description: Optional description.
-        dept_function: Optional dept function tag (e.g. "engineering").
-        lead_agent_id: Optional lead agent's name (its handle, e.g. "jenkins").
-        join_policy: "open" (every company member, the default) or "invite"
-            (only the members its admins add).
-        agent_level: What its members' agents may do for each other:
-            "blocked", "chat", "read" or "act". Default: the company's.
-    """
-    if not name or not name.strip():
-        return _result(_error("name is required"))
-    for err in (
-        _enum_check(join_policy, _VALID_JOIN_POLICIES, "join_policy"),
-        _enum_check(agent_level, _VALID_AGENT_LEVELS, "agent_level"),
-    ):
-        if err:
-            return _result(err)
-    try:
-        cid = _resolve_company_id(company_id)
-        if lead_agent_id:
-            lead_agent_id = _validate_agent_name(lead_agent_id, "lead_agent_id")
-    except ValueError as e:
-        return _result(_error(str(e)))
-    body: dict[str, Any] = {"name": name.strip()}
-    if description is not None:
-        body["description"] = description
-    if dept_function is not None:
-        body["dept_function"] = dept_function
-    if lead_agent_id is not None:
-        body["lead_agent_id"] = lead_agent_id
-    if join_policy:
-        body["join_policy"] = join_policy
-    if agent_level:
-        body["agent_level"] = agent_level
-    return _result(await api.post(f"/api/v1/companies/{cid}/spaces", body))
 
 
 @mcp.tool()
@@ -1848,12 +1802,13 @@ async def create_space(
     description: Optional[str] = None,
     join_policy: Optional[str] = None,
     agent_level: Optional[str] = None,
+    dept_function: Optional[str] = None,
+    lead_agent_id: Optional[str] = None,
 ) -> str:
     """Create a space for your owner.
 
-    In a company (company_id, else COMPANY_ID) it is a team (department):
-    this is create_department without the department fields (function tag,
-    lead); set those later with update_space. Needs company admin.
+    In a company (company_id, else COMPANY_ID) it is a team (department).
+    Needs company admin.
 
     With company_id="personal", or no company at all, it is a shared
     workspace your owner owns, outside any company.
@@ -1866,6 +1821,8 @@ async def create_space(
             or "invite" (only the members its admins add).
         agent_level: Teams only. What its members' agents may do for each
             other: "blocked", "chat", "read" or "act". Default: the company's.
+        dept_function: Teams only. A function tag, e.g. "engineering".
+        lead_agent_id: Teams only. Its lead agent's handle, e.g. "jenkins".
     """
     if not name or not name.strip():
         return _result(_error("name is required"))
@@ -1874,11 +1831,15 @@ async def create_space(
     if description is not None:
         body["description"] = description
     if not cid:
-        if join_policy or agent_level:
-            return _result(_error("join_policy and agent_level are for company teams"))
+        if join_policy or agent_level or dept_function or lead_agent_id:
+            return _result(_error(
+                "join_policy, agent_level, dept_function and lead_agent_id are for company teams"
+            ))
         return _result(await api.post("/api/v1/platform/spaces", body))
     try:
         _validate_uuid(cid, "company_id")
+        if lead_agent_id:
+            lead_agent_id = _validate_agent_name(lead_agent_id, "lead_agent_id")
     except ValueError as e:
         return _result(_error(str(e)))
     for err in (
@@ -1891,6 +1852,10 @@ async def create_space(
         body["join_policy"] = join_policy
     if agent_level:
         body["agent_level"] = agent_level
+    if dept_function is not None:
+        body["dept_function"] = dept_function
+    if lead_agent_id is not None:
+        body["lead_agent_id"] = lead_agent_id
     return _result(await api.post(f"/api/v1/companies/{cid}/spaces", body))
 
 
@@ -1933,8 +1898,7 @@ async def create_project(
 ) -> str:
     """Create a project. A project lives in a space, so space_id is required.
 
-    In a company, the space is one of its teams (find it with
-    list_departments or list_spaces). With company_id="personal", or no
+    In a company, the space is one of its teams (find it with list_spaces). With company_id="personal", or no
     company at all, it is one of your owner's workspaces (list_spaces with
     company_id="personal").
 
@@ -2152,7 +2116,7 @@ async def create_company(
 ) -> str:
     """Create a company (agent org). This agent's owner becomes its owner.
 
-    After creating, build the org with create_department, create_project,
+    After creating, build the org with create_space (its teams), create_project,
     create_membership (put agents in it with positions), and create_task.
 
     Args:
@@ -2687,149 +2651,36 @@ async def update_panel(
 # -- Gated: agent lifecycle (high power, opt-in) -----------------------------
 
 
-def _gate_or_error() -> Optional[str]:
-    """Return a serialized error if the lifecycle gate is closed; else None."""
-    if not ENABLE_AGENT_LIFECYCLE:
-        return _result(_error(
-            "Agent lifecycle tools (deploy/update/restart/delete) are disabled by default. "
-            "Set ENABLE_AGENT_LIFECYCLE=true in the bridge environment if you really want "
-            "Claude Code to be able to spawn/destroy real agents."
-        ))
-    return None
-
-
-@mcp.tool()
-async def deploy_agent(
-    role_position: str,
-    company_id: Optional[str] = None,
-    display_name: Optional[str] = None,
-    persona: Optional[str] = None,
-    role_summary: Optional[str] = None,
-    role_md: Optional[str] = None,
-    display_description: Optional[str] = None,
-    title: Optional[str] = None,
-    model: Optional[str] = None,
-    reports_to: Optional[str] = None,
-    space_id: Optional[str] = None,
-    access_role: Optional[str] = None,
-    skill_packs: Optional[list[str]] = None,
-    env_secrets: Optional[dict[str, str]] = None,
-    api_keys: Optional[dict[str, str]] = None,
-    visibility: str = "private",
-    agent_type: str = "zeroclaw",
-    hosting: str = "cloud_run",
-    deployment_mode: str = "serverless",
-) -> str:
-    """[GATED] Deploy a new agent into a company.
-
-    Requires ENABLE_AGENT_LIFECYCLE=true on the bridge process. This is a
-    high-power, real-money operation — Claude can spawn real cloud agents.
-
-    Args:
-        role_position: Org chart position, e.g. 'ceo', 'coo', 'individual_contributor'.
-        model: The LLM as '<provider>/<model>', e.g. 'anthropic/claude-sonnet-4-6'
-            or 'openrouter/openai/gpt-5.4'. Omit for the platform default.
-        api_keys: Provider API keys keyed by provider, e.g. {"anthropic": "..."}.
-            Must include a key for the chosen model's provider, or the deploy
-            is rejected.
-        access_role: 'admin', 'member' or 'viewer'. Omit to use the default for
-            the position (admin for ceo/coo, member otherwise).
-        hosting: 'cloud_run' (serverless) or 'gce' (a VM).
-        visibility: 'private' or 'public'.
-    """
-    gate = _gate_or_error()
-    if gate:
-        return gate
-    if not role_position or not role_position.strip():
-        return _result(_error("role_position is required (e.g. 'ceo', 'individual_contributor')"))
-    for err in (
-        _enum_check(role_position, _VALID_AGENT_LIFECYCLE_ROLES, "role_position"),
-        _enum_check(access_role, _VALID_ACCESS_ROLES, "access_role") if access_role else None,
-        _enum_check(visibility, _VALID_VISIBILITIES, "visibility"),
-        _enum_check(agent_type, _VALID_AGENT_TYPES, "agent_type"),
-        _enum_check(hosting, _VALID_HOSTINGS, "hosting"),
-        _enum_check(deployment_mode, _VALID_DEPLOY_MODES, "deployment_mode"),
-    ):
-        if err:
-            return _result(err)
-    try:
-        cid = _resolve_company_id(company_id)
-        if space_id:
-            _validate_uuid(space_id, "space_id")
-    except ValueError as e:
-        return _result(_error(str(e)))
-
-    org_chart: dict[str, Any] = {"position": role_position}
-    if access_role:
-        org_chart["access_role"] = access_role
-    if title is not None:
-        org_chart["title"] = title
-    if space_id is not None:
-        org_chart["space_id"] = space_id
-    if reports_to is not None:
-        org_chart["reports_to"] = reports_to
-
-    body: dict[str, Any] = {
-        "agent_type": agent_type,
-        "hosting": hosting,
-        "deployment_mode": deployment_mode,
-        "org_chart": org_chart,
-        "visibility": visibility,
-    }
-    for k, v in (
-        ("display_name", display_name),
-        ("persona", persona),
-        ("role_summary", role_summary),
-        ("role_md", role_md),
-        ("display_description", display_description),
-        ("model", model),
-    ):
-        if v is not None:
-            body[k] = v
-    if skill_packs is not None:
-        body["skill_packs"] = list(skill_packs)
-    if env_secrets is not None:
-        body["env_secrets"] = dict(env_secrets)
-    if api_keys is not None:
-        body["api_keys"] = dict(api_keys)
-    return _result(await api.post(f"/api/v1/companies/{cid}/agents", body))
-
-
 @mcp.tool()
 async def update_agent(
     agent_name: str,
-    company_id: Optional[str] = None,
-    # Dispatch plane — applied live, no restart (owner / agent:instructions:write scope):
     system: Optional[str] = None,
     skills: Optional[list[str]] = None,
-    # Infra / registry — proxied to the agent factory, may trigger a revision (admin):
-    model: Optional[str] = None,
-    visibility: Optional[str] = None,
     display_name: Optional[str] = None,
-    display_description: Optional[str] = None,
-    # Lifecycle — high-power, requires ENABLE_AGENT_LIFECYCLE:
-    action: Optional[str] = None,
+    description: Optional[str] = None,
+    avatar_url: Optional[str] = None,
+    category: Optional[str] = None,
+    card_skills: Optional[list[dict]] = None,
 ) -> str:
-    """The single tool for every change to a deployed agent. Pass the fields you
-    want to change, OR an `action` — not both. (To create an agent, use
-    deploy_agent.)
+    """Configure one of your owner's agents. Lead agent only: the platform
+    refuses it for other agents (and this tool is shown only to the Lead).
+    Pass only the fields to change.
 
-    Field updates (routed + authorized per field):
-      - system / skills — the dispatch plane (identity + declared skills).
-        Applied live by the platform composer on the agent's next dispatch — no
-        restart. Works for ANY agent (self-hosted or company). Authorized by
-        ownership or the `agent:instructions:write` scope. `system` supersedes
-        the legacy persona/role identity. This is the self-improving apply path —
-        use it only after a human approved the change (e.g. an inbox
-        approval-required item). `skills` replaces the declared-slug list; each
-        slug must resolve to an active Skill. `system=""` clears to the fallback.
-      - model / visibility / display_name / display_description — infra/registry.
-        Proxied to the agent factory and may trigger a container revision.
-        Authorized as company admin/owner.
+    Instructions and dispatch skills (applied on the agent's next task, no
+    restart), the same field its owner edits in the app:
+      - system: the agent's instructions, who it is and how it works.
+        "" clears them. Use it only after your owner approved the change.
+      - skills: the dispatch skill slugs it follows (replaces the list).
 
-    Lifecycle (`action`, high-power — requires ENABLE_AGENT_LIFECYCLE):
-      - action="restart" — force a new container revision.
-      - action="delete"  — permanently delete the agent (irreversible).
+    Profile and card of a connected agent:
+      - display_name, description, avatar_url, category.
+      - card_skills: its public skills, replacing the list. Each is
+        {"id", "name", "description", "tags", "examples", "instructions",
+        "pricing_model": "free" | "per_task", "price_usd"}. A paid skill
+        needs the agent's payout wallet, which only its owner sets.
+
+    Visibility, the payout wallet, tokens, connecting and deleting agents
+    stay with your owner.
     """
     if not agent_name or not agent_name.strip():
         return _result(_error("agent_name is required"))
@@ -2838,67 +2689,36 @@ async def update_agent(
     except ValueError as e:
         return _result(_error(str(e)))
 
-    field_args = (system, skills, model, visibility, display_name, display_description)
-
-    # --- Lifecycle actions (high-power, gated, company-scoped) ---
-    if action is not None:
-        act = action.strip().lower()
-        if act not in ("restart", "delete"):
-            return _result(_error("action must be 'restart' or 'delete'"))
-        if any(v is not None for v in field_args):
-            return _result(_error("pass EITHER field updates OR an action, not both"))
-        gate = _gate_or_error()
-        if gate:
-            return gate
-        try:
-            cid = _resolve_company_id(company_id)
-        except ValueError as e:
-            return _result(_error(str(e)))
-        if act == "restart":
-            return _result(await api.post(f"/api/v1/companies/{cid}/agents/{agent_name}/restart", {}))
-        return _result(await api.delete(f"/api/v1/companies/{cid}/agents/{agent_name}"))
-
-    # --- Field updates (per-field routing + auth) ---
-    err = _enum_check(visibility, _VALID_VISIBILITIES, "visibility")
-    if err:
-        return _result(err)
-
     results: dict[str, Any] = {}
-
-    # Dispatch plane (system/skills) -> by-name route; live; scope/owner auth.
     dispatch_body: dict[str, Any] = {}
     if system is not None:
         dispatch_body["system"] = system
     if skills is not None:
         dispatch_body["skills"] = skills
     if dispatch_body:
-        results["dispatch"] = await api.patch(
+        results["instructions"] = await api.patch(
             f"/api/v1/agents/{agent_name}/system", dispatch_body
         )
 
-    # Infra/registry (model/visibility/display) -> company route; admin; may revise.
-    infra_body: dict[str, Any] = {}
-    for k, v in (
-        ("model", model),
-        ("visibility", visibility),
+    profile_body: dict[str, Any] = {}
+    for key, value in (
         ("display_name", display_name),
-        ("display_description", display_description),
+        ("description", description),
+        ("avatar_url", avatar_url),
+        ("category", category),
+        ("skills", card_skills),
     ):
-        if v is not None:
-            infra_body[k] = v
-    if infra_body:
-        try:
-            cid = _resolve_company_id(company_id)
-        except ValueError as e:
-            return _result(_error(str(e)))
-        results["infra"] = await api.patch(
-            f"/api/v1/companies/{cid}/agents/{agent_name}", infra_body
+        if value is not None:
+            profile_body[key] = value
+    if profile_body:
+        results["profile"] = await api.put(
+            f"/api/v1/factory/self-hosted/agents/{agent_name}", profile_body
         )
 
     if not results:
         return _result(_error(
-            "nothing to update — pass system/skills, model/visibility/display, "
-            "or action='restart'|'delete'"
+            "nothing to update: pass system/skills, or display_name, description, "
+            "avatar_url, category, card_skills"
         ))
     return _result(results)
 

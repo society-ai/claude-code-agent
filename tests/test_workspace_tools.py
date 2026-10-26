@@ -59,7 +59,7 @@ class Tools(unittest.TestCase):
         self.assertEqual(self.calls[-1]["body"], {"name": "Launch", "space_id": SID})
 
     def test_leads_are_agent_names(self):
-        self.run_tool(mcp_server.create_department("Ops", lead_agent_id="jenkins"))
+        self.run_tool(mcp_server.create_space("Ops", lead_agent_id="jenkins"))
         self.assertEqual(self.calls[-1]["body"]["lead_agent_id"], "jenkins")
         self.run_tool(mcp_server.update_space(SID, lead_agent_id="searchpro"))
         self.assertEqual(self.calls[-1]["body"], {"lead_agent_id": "searchpro"})
@@ -71,8 +71,10 @@ class Tools(unittest.TestCase):
         self.run_tool(mcp_server.create_space("Research", description="d"))
         self.assertEqual((self.calls[-1]["path"], self.calls[-1]["body"]),
                          (f"/api/v1/companies/{CID}/spaces", {"name": "Research", "description": "d"}))
-        self.run_tool(mcp_server.create_department("Ops"))
-        self.assertEqual(self.calls[-1]["path"], f"/api/v1/companies/{CID}/spaces")
+        self.run_tool(mcp_server.create_space("Ops", dept_function="operations"))
+        self.assertEqual((self.calls[-1]["path"], self.calls[-1]["body"]),
+                         (f"/api/v1/companies/{CID}/spaces", {"name": "Ops", "dept_function": "operations"}))
+        self.assertFalse(hasattr(mcp_server, "create_department"))  # a team is a company space
 
     def test_workspace_board(self):
         self.run_tool(mcp_server.list_tasks(space_id=SID))
@@ -121,7 +123,7 @@ class Tools(unittest.TestCase):
         self.assertTrue(self.run_tool(mcp_server.update_space(SID, company_id="personal", lead_agent_id="jenkins")).get("error"))
 
     def test_team_settings(self):
-        self.run_tool(mcp_server.create_department("Legal", join_policy="invite", agent_level="read"))
+        self.run_tool(mcp_server.create_space("Legal", join_policy="invite", agent_level="read"))
         self.assertEqual(self.calls[-1]["body"], {"name": "Legal", "join_policy": "invite", "agent_level": "read"})
         self.run_tool(mcp_server.update_space(SID, agent_level="chat"))
         self.assertEqual(self.calls[-1]["body"], {"agent_level": "chat"})
