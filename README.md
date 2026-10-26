@@ -388,6 +388,21 @@ Each one shows on the session's chat page in Society AI and in the Sessions list
   is never sent.
 - Turn it off here with `TRACKING=false`, or in the app's Settings ("Track my sessions").
 
+**Replying from Society AI.** A session you started yourself in Claude Code has no Society AI
+channel, so a message you send from its chat page goes another way:
+
+- **Session open:** a relay (`claude -p` with Claude Haiku whose only tools are Claude Code's
+  ListAgents and SendMessage) finds the session by its exact name and sends your text unchanged.
+  It arrives as "Message from @Society AI" and the session answers as usual; the bridge reads the
+  answer from the transcript. If two open sessions share the name, nothing is sent.
+- **Session closed:** `claude -p --resume <id>` runs one turn in it, under the same id, in its own
+  folder and permission mode, and returns the answer. Never `--bg --resume`: a session that was
+  ever in the background keeps its options there, and any flag then starts a copy under a new id.
+
+Both run on your **Agent SDK credits**: the relay costs a fraction of a cent, a turn in a closed
+session costs what that turn costs on the session's model. The bridge's own agent settings are
+removed from that turn, so the session keeps its own identity.
+
 ## File access scope
 
 Claude Code 2.x sandboxes file access to the directory it was launched in. When the bridge runs as a LaunchAgent, that directory is the integration's own repo (`~/Coding/claude-code-agent`) — which is why a fresh agent will say it can only see that folder when you ask it about your code.

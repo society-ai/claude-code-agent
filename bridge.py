@@ -751,6 +751,9 @@ class Bridge:
         # Session Trackers: one bridge per machine (whoever holds the lock)
         # keeps a Tracker for every Claude Code session here.
         self._tracker = None
+        # claude session id -> set when that session's turn ends (Stop hook),
+        # for replies carried into sessions started in Claude Code.
+        self._direct_turn_events: dict[str, asyncio.Event] = {}
         if TRACKING_ENABLED and self.ctx.token:
             from hook_common import discover_personas
             from session_tracker import SessionTrackerRunner
@@ -2050,6 +2053,10 @@ class Bridge:
         # tracking bridge acts on them). Never blocks the hook.
         if self._tracker is not None:
             self._tracker.notify(params)
+        if str(params.get("event") or "stop") == "stop":
+            waiter = self._direct_turn_events.get(session_id)
+            if waiter is not None:
+                waiter.set()
 
         # Hook traffic IS session activity. Locally-typed turns never pass
         # through a dispatch, and before this the idle reaper counted them
@@ -2488,6 +2495,104 @@ class Bridge:
             )
         return False
 
+    async def _reply_into_direct_session(
+        self,
+        task_id: str,
+        session,
+        content: str,
+        delivery_chat_id: str | None,
+        timeout_s: float,
+        had_attachments: bool,
+    ) -> None:
+        """Carry the owner's message from a chat page into the session they
+        started in Claude Code, and return its reply (design D28, D29).
+
+        Running: the relay delivers it and the reply is read from the
+        transcript. Closed: `claude -p --resume` runs one turn in it under the
+        same id and returns the reply."""
+        import direct_reply as dr
+        import session_tracker as trk
+
+        def report(state: str) -> None:
+            if delivery_chat_id:
+                asyncio.ensure_future(self._report_delivery(delivery_chat_id, state))
+                asyncio.ensure_future(self._stream_delivery(task_id, state))
+
+        transcript = dr.transcript_of(session)
+        if not transcript.is_file():
+            report("unreachable")
+            await self._send_task_complete(
+                task_id, "This session is no longer on this computer.", exit_code=1)
+            return
+        if had_attachments:
+            content += "\n\n(Files attached in Society AI cannot reach a session started in Claude Code yet.)"
+
+        mode = dr.permission_mode(transcript)
+        live = trk.running_session(session.session_id)
+        event = self._direct_turn_events.setdefault(session.session_id, asyncio.Event())
+        try:
+            if live is None:
+                report("received")
+                text = await dr.ask_closed_session(session, content, mode, timeout_s)
+                await self._send_task_complete(
+                    task_id, text or "(no reply)", exit_code=0)
+                return
+            name = str(live.get("name") or "").strip()
+            if not name:
+                raise dr.DirectReplyError(
+                    "This session has no name Claude Code can address. Continue it in Claude Code.")
+            start = transcript.stat().st_size
+            event.clear()
+            msg_id = await dr.relay(name, content, mode)
+
+            deadline = asyncio.get_event_loop().time() + dr.DELIVERY_WAIT_S
+            after = None
+            while after is None and asyncio.get_event_loop().time() < deadline:
+                after = dr.find_delivered(transcript, start, msg_id)
+                if after is None:
+                    await asyncio.sleep(1.0)
+            if after is None:
+                report("received")
+                await self._send_task_complete(
+                    task_id,
+                    "Your message is waiting in Claude Code: the session asks you to accept "
+                    "messages from Society AI there. Open it and accept, or reply there.",
+                    exit_code=0,
+                )
+                return
+            report("received")
+
+            # The reply ends with the session's Stop hook; the final text is
+            # flushed a moment later, so read again shortly after.
+            loop = asyncio.get_event_loop()
+            deadline = loop.time() + timeout_s
+            text = ""
+            while loop.time() < deadline:
+                try:
+                    await asyncio.wait_for(event.wait(), timeout=min(5.0, deadline - loop.time()))
+                except asyncio.TimeoutError:
+                    continue
+                event.clear()
+                for delay in (2.0, 4.0):
+                    await asyncio.sleep(delay)
+                    text = dr.reply_after(transcript, after)
+                    if text:
+                        break
+                if text:
+                    break
+            if not text:
+                text = dr.reply_after(transcript, after)
+            await self._send_task_complete(
+                task_id,
+                text or "The session did not answer within the time limit. Continue it in Claude Code.",
+                exit_code=0 if text else 1,
+            )
+        except dr.DirectReplyError as e:
+            report("unreachable")
+            await self._send_task_complete(task_id, str(e), exit_code=1)
+        finally:
+            self._direct_turn_events.pop(session.session_id, None)
+
     async def _execute_via_session(
         self,
         task_id: str,
@@ -2510,6 +2615,17 @@ class Bridge:
         `permission` is None for the owner; for a contact it is the level
         the session is launched (or relaunched) with. `delivery_chat_id`
         names the owner's chat whose message gets delivery ticks."""
+        # A session the owner started in Claude Code itself: its chat page
+        # sends here, but it has no channel. The relay carries the message.
+        if kind == "chat" and (sender is None or sender.is_owner):
+            from direct_reply import direct_session_for_chat
+            direct = direct_session_for_chat(delivery_chat_id or work_item_key)
+            if direct is not None:
+                await self._reply_into_direct_session(
+                    task_id, direct, content, delivery_chat_id, timeout_s, bool(attachments),
+                )
+                return
+
         mgr = self._session_mgr
         hub = self._channel_hub
 

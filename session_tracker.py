@@ -158,6 +158,18 @@ def extract_segment(records: list[dict]) -> Segment:
         content = (r.get("message") or {}).get("content")
         ts = r.get("timestamp")
         if kind == "user":
+            origin = r.get("origin") or {}
+            if origin.get("kind") == "peer":
+                # A message from another local Claude session. One from the
+                # Society AI relay is the owner writing from the app.
+                text = _clean(str(origin.get("body") or ""))
+                if text:
+                    who = "USER" if origin.get("name") == "Society AI" else f"PEER {origin.get('name') or 'session'}"
+                    seg.turns.append((who, text))
+                    if who == "USER":
+                        seg.user_turns += 1
+                        seg.last_user_at = ts or seg.last_user_at
+                continue
             if isinstance(content, str):
                 texts = [content]
             elif isinstance(content, list):
@@ -562,7 +574,13 @@ class SessionTrackerRunner:
                 st["skip"] = True  # another user's session or agent: leave it alone
             logger.warning("Tracker register for %s returned %s", sid[:8], status)
             return False
-        st["tracker_id"] = data["tracker"]["id"]
+        tracker = data["tracker"]
+        st["tracker_id"] = tracker["id"]
+        # What the bridge needs to reply into this session from its chat page
+        # (direct_reply.py): any bridge on this machine reads it from here.
+        st["chat_id"] = tracker.get("chatId")
+        st["origin"] = tracker.get("origin")
+        st["cwd"] = job.get("cwd") or tracker.get("cwd")
         return True
 
     async def _process(self, sid: str, job: dict) -> None:
