@@ -13,13 +13,15 @@ How it works:
   (claude -p, Haiku, no tools, no MCP, no settings, no saved session) for a
   patch against the current Tracker. The prompt, schema and model come from
   the platform (runner-config), so behaviour changes without a release.
-- It writes as the owner's hidden Tracker agent, whose token it asks for once
-  per machine with this bridge's own agent token.
-- Sessions the user started directly in Claude Code are registered too, under
-  the agent bound to the session, else the machine's default agent (D19, D20).
+- Each session belongs to one agent on this machine: the persona whose bridge
+  started it, else the agent the session bound itself to, else the machine's
+  default agent (D19, D20). Its Tracker is written as that agent's owner's
+  hidden Tracker agent, whose token the runner asks for once, with that
+  persona's own agent token. So agents of different Society AI accounts on one
+  machine each get Trackers in their own account (D33).
 
-Off when TRACKING=false or MIRROR=false locally, or when the owner turned
-"Track my sessions" off in the app.
+Off when TRACKING=false or MIRROR=false locally. Each account's "Track my
+sessions" setting in the app decides for that account's sessions.
 """
 
 from __future__ import annotations
@@ -357,9 +359,12 @@ class SessionTrackerRunner:
         self._default_agent = default_agent or persona_name
         self._host = socket.gethostname().split(".")[0]
         self._lock_fd: Optional[int] = None
-        self._config: Optional[dict] = None
-        self._config_at = 0.0
-        self._identity: Optional[dict] = None
+        # agent -> (fetched at, runner-config of that agent's owner)
+        self._configs: dict[str, tuple[float, Optional[dict]]] = {}
+        # agent -> {api_url, agent_name, token} of its owner's Tracker agent
+        self._identities: dict[str, dict] = {}
+        # Sessions refused for this run (403); tried again after a restart.
+        self._refused: set[str] = set()
         self._pending: dict[str, dict] = {}
         self._wake = asyncio.Event()
         self._state: dict[str, Any] = {"sessions": {}}
@@ -367,10 +372,6 @@ class SessionTrackerRunner:
         self.running = True
 
     # -- hook events (any bridge; only the lock holder acts) --
-
-    @property
-    def active(self) -> bool:
-        return self._lock_fd is not None and bool(self._config and self._config.get("enabled"))
 
     def notify(self, params: dict) -> None:
         if self._lock_fd is None:
@@ -404,7 +405,6 @@ class SessionTrackerRunner:
         self._load_state()
         while self.running:
             try:
-                await self._refresh_config()
                 await self._drain()
             except Exception:
                 logger.exception("Session tracker loop error")
@@ -436,6 +436,13 @@ class SessionTrackerRunner:
         except (OSError, ValueError):
             self._state = {"sessions": {}}
         self._state.setdefault("sessions", {})
+        try:
+            self._identities = json.loads(self._identity_path().read_text())
+        except (OSError, ValueError):
+            self._identities = {}
+        # The single-account identity file of v0.24.0: its token is replaced
+        # by the per-agent ones above, so it is not left on disk.
+        (BASE_DIR / "identity.json").unlink(missing_ok=True)
 
     def _save_state(self) -> None:
         sessions = self._state["sessions"]
@@ -456,55 +463,82 @@ class SessionTrackerRunner:
             )
         return self._client
 
-    async def _refresh_config(self) -> None:
-        if self._config and time.monotonic() - self._config_at < CONFIG_REFRESH_S:
-            return
+    def _agent_token(self, agent: str) -> Optional[str]:
+        """The agent token of a persona on this machine, for the same platform."""
+        if agent == self._persona:
+            return self._persona_token
+        from hook_common import discover_personas
+        for p in discover_personas():
+            if p["name"] == agent and p["api_url"].rstrip("/") == self._api_url:
+                return p["token"]
+        return None
+
+    async def _config_for(self, agent: str) -> Optional[dict]:
+        """runner-config of the agent's owner: their setting, prompt and model."""
+        cached = self._configs.get(agent)
+        if cached and time.monotonic() - cached[0] < CONFIG_REFRESH_S:
+            return cached[1]
+        config = cached[1] if cached else None
+        token = self._agent_token(agent)
+        if token is None:
+            if cached is None:
+                logger.warning("No agent named %s on this machine: its sessions are not tracked", agent)
+            self._configs[agent] = (time.monotonic(), None)
+            return None
         try:
             r = await self._http().get(
                 "/api/v1/session-trackers/runner-config",
-                headers={"Authorization": f"Bearer {self._persona_token}"},
+                headers={"Authorization": f"Bearer {token}"},
             )
             if r.status_code == 200:
-                was = bool(self._config and self._config.get("enabled"))
-                self._config = r.json()
-                if was != bool(self._config.get("enabled")):
-                    logger.info("Session tracking is %s", "on" if self._config.get("enabled") else "off")
+                config = r.json()
+                was = cached and cached[1] and cached[1].get("enabled")
+                if cached is None or bool(was) != bool(config.get("enabled")):
+                    logger.info("Session tracking is %s for %s's account",
+                                "on" if config.get("enabled") else "off", agent)
             else:
-                logger.warning("runner-config returned %s", r.status_code)
+                logger.warning("runner-config for %s returned %s", agent, r.status_code)
         except httpx.HTTPError as e:
-            logger.warning("runner-config failed: %s", e)
-        self._config_at = time.monotonic()
+            logger.warning("runner-config for %s failed: %s", agent, e)
+        self._configs[agent] = (time.monotonic(), config)
+        return config
 
     def _identity_path(self) -> pathlib.Path:
-        return BASE_DIR / "identity.json"
+        return BASE_DIR / "identities.json"
 
-    async def _tracker_token(self) -> Optional[str]:
-        if self._identity is None:
-            try:
-                self._identity = json.loads(self._identity_path().read_text())
-            except (OSError, ValueError):
-                self._identity = None
-        if self._identity and self._identity.get("api_url") == self._api_url:
-            return self._identity.get("token")
-        r = await self._http().post(
-            "/api/v1/session-trackers/agent",
-            headers={"Authorization": f"Bearer {self._persona_token}"},
-            json={"host": self._host},
-        )
-        if r.status_code != 200:
-            logger.warning("Could not get the Tracker agent's token (%s)", r.status_code)
-            return None
-        body = r.json()
-        self._identity = {"api_url": self._api_url, "agent_name": body["agent_name"], "token": body["token"]}
+    def _save_identities(self) -> None:
         path = self._identity_path()
         fd = os.open(path.with_suffix(".tmp"), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f:
-            json.dump(self._identity, f)
+            json.dump(self._identities, f)
         os.replace(path.with_suffix(".tmp"), path)
-        return self._identity["token"]
 
-    async def _call(self, method: str, path: str, body: Optional[dict] = None) -> tuple[int, dict]:
-        token = await self._tracker_token()
+    async def _tracker_token(self, agent: str) -> Optional[str]:
+        """Token of the Tracker agent of the agent's owner, asked for once per agent."""
+        identity = self._identities.get(agent)
+        if identity and identity.get("api_url") == self._api_url:
+            return identity.get("token")
+        agent_token = self._agent_token(agent)
+        if agent_token is None:
+            return None
+        r = await self._http().post(
+            "/api/v1/session-trackers/agent",
+            headers={"Authorization": f"Bearer {agent_token}"},
+            json={"host": self._host},
+        )
+        if r.status_code != 200:
+            logger.warning("Could not get the Tracker agent's token for %s (%s)", agent, r.status_code)
+            return None
+        body = r.json()
+        self._identities[agent] = {
+            "api_url": self._api_url, "agent_name": body["agent_name"], "token": body["token"],
+        }
+        self._save_identities()
+        return body["token"]
+
+    async def _call(self, agent: str, method: str, path: str,
+                    body: Optional[dict] = None) -> tuple[int, dict]:
+        token = await self._tracker_token(agent)
         if not token:
             return 0, {}
         r = await self._http().request(
@@ -512,8 +546,8 @@ class SessionTrackerRunner:
         )
         if r.status_code == 401:
             # Revoked by the owner: forget it and ask again next time.
-            self._identity = None
-            self._identity_path().unlink(missing_ok=True)
+            self._identities.pop(agent, None)
+            self._save_identities()
         try:
             return r.status_code, r.json()
         except ValueError:
@@ -522,9 +556,6 @@ class SessionTrackerRunner:
     # -- jobs --
 
     async def _drain(self) -> None:
-        if not self.active:
-            self._pending.clear()
-            return
         now = time.monotonic()
         due = [sid for sid, p in self._pending.items() if p["due"] <= now]
         for sid in due:
@@ -545,15 +576,17 @@ class SessionTrackerRunner:
                 return path
         return None
 
-    async def _register(self, sid: str, job: dict, st: dict, first_prompt: Optional[str]) -> bool:
+    def _origin(self, sid: str) -> tuple[str, str]:
+        """(origin, agent) of a session: who started it and which agent it is."""
         live = running_session(sid)
         bridge_row = bridge_session(sid)
         if bridge_row or (live and str(live.get("tmux") or "").startswith("sai-")):
-            origin = "society_ai"
-            agent = (bridge_row or {}).get("persona") or self._default_agent
-        else:
-            origin = "direct"
-            agent = bound_agent((live or {}).get("pid")) or self._default_agent
+            return "society_ai", (bridge_row or {}).get("persona") or self._default_agent
+        return "direct", bound_agent((live or {}).get("pid")) or self._default_agent
+
+    async def _register(self, sid: str, job: dict, st: dict, first_prompt: Optional[str]) -> bool:
+        live = running_session(sid)
+        origin, agent = self._origin(sid)
         body: dict[str, Any] = {
             "runtime": "claude_code",
             "external_session_id": sid,
@@ -568,14 +601,18 @@ class SessionTrackerRunner:
         if first_prompt:
             body["title"] = first_prompt.splitlines()[0][:60]
         body = {k: v for k, v in body.items() if v is not None}
-        status, data = await self._call("POST", "/api/v1/session-trackers/register", body)
+        status, data = await self._call(agent, "POST", "/api/v1/session-trackers/register", body)
         if status not in (200, 201):
             if status == 403:
-                st["skip"] = True  # another user's session or agent: leave it alone
-            logger.warning("Tracker register for %s returned %s", sid[:8], status)
+                self._refused.add(sid)
+                logger.warning("Tracker register for %s as %s was refused; tried again after a restart",
+                               sid[:8], agent)
+            else:
+                logger.warning("Tracker register for %s returned %s", sid[:8], status)
             return False
         tracker = data["tracker"]
         st["tracker_id"] = tracker["id"]
+        st["agent"] = agent
         # What the bridge needs to reply into this session from its chat page
         # (direct_reply.py): any bridge on this machine reads it from here.
         st["chat_id"] = tracker.get("chatId")
@@ -585,9 +622,15 @@ class SessionTrackerRunner:
 
     async def _process(self, sid: str, job: dict) -> None:
         sessions = self._state["sessions"]
+        if sid in self._refused:
+            return
         st = sessions.setdefault(sid, {"cursor": 0, "tasks": {}})
         st["seen"] = time.time()
-        if st.get("skip"):
+        if "tracker_id" not in st or "agent" not in st:
+            st["agent"] = self._origin(sid)[1]
+        agent = st["agent"]
+        config = await self._config_for(agent)
+        if not config or not config.get("enabled"):
             return
         path = self._transcript(sid, job)
         if path is None:
@@ -631,21 +674,21 @@ class SessionTrackerRunner:
 
         patch: dict[str, Any] = {"facts": facts}
         if job["event"] == "stop" and seg.turns:
-            model_patch = await self._model_patch(st["tracker_id"], seg)
+            model_patch = await self._model_patch(agent, config, st["tracker_id"], seg)
             if model_patch:
                 patch.update(model_patch)
         if "base_version" not in patch:
             patch["no_change"] = True
 
-        status, data = await self._call("PATCH", f"/api/v1/session-trackers/{st['tracker_id']}", patch)
+        status, data = await self._call(agent, "PATCH", f"/api/v1/session-trackers/{st['tracker_id']}", patch)
         if status == 409:
             # Someone wrote first: redo the model part once against the new version.
-            model_patch = await self._model_patch(st["tracker_id"], seg) if seg.turns else None
+            model_patch = await self._model_patch(agent, config, st["tracker_id"], seg) if seg.turns else None
             patch = {"facts": facts, **(model_patch or {"no_change": True})}
-            status, data = await self._call("PATCH", f"/api/v1/session-trackers/{st['tracker_id']}", patch)
+            status, data = await self._call(agent, "PATCH", f"/api/v1/session-trackers/{st['tracker_id']}", patch)
         if status == 422:
             status, data = await self._call(
-                "PATCH", f"/api/v1/session-trackers/{st['tracker_id']}", {"facts": facts, "no_change": True},
+                agent, "PATCH", f"/api/v1/session-trackers/{st['tracker_id']}", {"facts": facts, "no_change": True},
             )
         if status == 404:
             # Deleted by the owner: next activity registers it as new (D23).
@@ -658,20 +701,20 @@ class SessionTrackerRunner:
             logger.warning("Tracker patch for %s returned %s", sid[:8], status)
         self._save_state()
 
-    async def _model_patch(self, tracker_id: str, seg: Segment) -> Optional[dict]:
-        status, data = await self._call("GET", f"/api/v1/session-trackers/{tracker_id}")
+    async def _model_patch(self, agent: str, config: dict, tracker_id: str,
+                           seg: Segment) -> Optional[dict]:
+        status, data = await self._call(agent, "GET", f"/api/v1/session-trackers/{tracker_id}")
         if status != 200:
             return None
         tracker = data.get("tracker") or {}
         block, short = render_tracker(tracker, data.get("items") or [])
         prompt_input = f"{block}\n\nNEWEST TURNS:\n{render_turns(seg.turns)}"
-        output = await self._run_model(prompt_input)
+        output = await self._run_model(config, prompt_input)
         if output is None:
             return None
         return build_patch(output, short, int(tracker.get("version", 0)))
 
-    async def _run_model(self, prompt_input: str) -> Optional[dict]:
-        cfg = self._config or {}
+    async def _run_model(self, cfg: dict, prompt_input: str) -> Optional[dict]:
         cmd = [
             "claude", "-p",
             "--model", str(cfg.get("model") or "haiku"),

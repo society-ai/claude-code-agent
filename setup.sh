@@ -420,6 +420,25 @@ if [ -n "$PERSONA" ]; then
 
     mkdir -p "$HOME/.cache/society-ai/$PERSONA"
 
+    # Agents of different Society AI accounts can run side by side on one
+    # macOS user, but they share it: say what that means, then carry on.
+    OTHER_ACCOUNT_AGENTS="$(venv/bin/python accounts.py "$ENV_FILE" 2>/dev/null | paste -sd, - | sed 's/,/, /g' || true)"
+    if [ -n "$OTHER_ACCOUNT_AGENTS" ]; then
+        DEFAULT_AGENT="$(grep -E '^AGENT_NAME=' .env | head -1 | cut -d= -f2- | tr -d '"' || true)"
+        echo ""
+        echo "  Note: '$PERSONA' belongs to a different Society AI account than"
+        echo "  $OTHER_ACCOUNT_AGENTS on this computer. That works, but both accounts"
+        echo "  share this macOS user:"
+        echo "    - one Claude Code login, so both accounts' agents use its"
+        echo "      credits (Session Trackers included)"
+        echo "    - one home folder, which agents of both accounts can read"
+        echo "    - one default agent ('$DEFAULT_AGENT') for the sessions you start"
+        echo "      yourself in Claude Code"
+        echo "  If this agent is for another person, set it up on their own"
+        echo "  macOS user instead."
+        echo ""
+    fi
+
     print_persona_summary() {
         echo "  - Its bridge runs as LaunchAgent io.societyai.claude-code-bridge.$PERSONA"
         echo "  - Sessions it spawns authenticate as '$PERSONA' (env expansion in"

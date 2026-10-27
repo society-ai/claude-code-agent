@@ -66,6 +66,15 @@ Flag semantics:
 
 Re-running is safe: an existing `.env` (or `.env.<persona>`) is left alone, unless you explicitly pass `--token`/`--url` for the same identity, in which case only those lines are updated in place after a timestamped `.bak-*` copy of the file is kept. A `.env` this script does not recognize (no `AGENT_NAME` line) aborts setup before anything is written.
 
+### Agents of different accounts on one computer
+
+Agents of different Society AI accounts can run on the same computer: each has its own key, so
+messages, tasks and Session Trackers go to the right account. But everything on one macOS user is
+shared, whatever the account: one Claude Code login and its credits, one home folder that every
+agent can read, and one default agent (the one in `.env`) for the sessions you start yourself in
+Claude Code. Setup prints a note when a new agent belongs to a different account than the agents
+already here. If the agent is for another person, set it up on their own macOS user.
+
 ### Setup (interactive)
 
 Run it with no flags to be prompted for your API key; the agent name defaults to a per-host `claude-code-<user>-<hostname>` so two laptops on the same account don't collide:
@@ -383,10 +392,12 @@ Each one shows on the session's chat page in Society AI and in the Sessions list
 - After each turn it reads the new part of the transcript here, keeps only the conversation (never
   tool activity or thinking), and runs a small model (`claude -p` with Claude Haiku, no tools, no
   MCP, no settings, nothing saved). That model run uses your **Agent SDK credits**.
-- Only the Tracker is sent, written as your hidden Tracker agent (a token of its own, kept in
-  `~/.cache/society-ai/tracker/identity.json`). The conversation of a session you started yourself
-  is never sent.
-- Turn it off here with `TRACKING=false`, or in the app's Settings ("Track my sessions").
+- Only the Tracker is sent, written as the hidden Tracker agent of the session's agent's account
+  (a token of its own per agent, kept in `~/.cache/society-ai/tracker/identities.json`), so agents
+  of different accounts on this computer each get Trackers in their own account. The conversation
+  of a session you started yourself is never sent.
+- Turn it off here with `TRACKING=false`, or in the app's Settings ("Track my sessions"), which
+  decides for that account's agents.
 
 **Replying from Society AI.** A session you started yourself in Claude Code has no Society AI
 channel, so a message you send from its chat page goes another way:
@@ -473,6 +484,7 @@ Earlier versions installed this text into `~/.claude/CLAUDE.md` between marker c
 claude-code-agent/
 ├── bridge.py               # WebSocket bridge daemon
 ├── bridge_ipc.py           # Unix-socket JSON-RPC for bridge ↔ MCP server
+├── accounts.py             # Which account each agent here belongs to (setup's note)
 ├── contacts.py             # Who sent a request, and what the agent may do for them
 ├── folders.py              # The Society AI folder: agent work folders, session groups
 ├── bridge_launcher.sh      # Wrapper used by the LaunchAgent (sources .env)

@@ -9,6 +9,9 @@
 - A full job: registers a new session (bridge vs direct origin), sends facts
   and the model's patch, keeps the cursor only on success, redoes the model
   part once on 409, and forgets a deleted session on 404.
+- Several accounts on one machine: each session is written as the Tracker
+  agent of its own agent's owner, under that owner's setting; a refused
+  session is tried again after a restart.
 """
 
 import asyncio
@@ -17,8 +20,11 @@ import os
 import pathlib
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
+
+import httpx
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -134,21 +140,26 @@ class TestRunner(unittest.TestCase):
         (base / "cache").mkdir()
         self.transcript = base / "s1.jsonl"
         write_transcript(self.transcript, TRANSCRIPT)
-        self.runner = st.SessionTrackerRunner("jenkins", "sai_persona", "https://api.test", default_agent="jenkins")
-        self.runner._lock_fd = 99
-        self.runner._config = {"enabled": True, "model": "haiku", "prompt": "p", "output_schema": {}}
+        self.runner = self.new_runner()
         self.calls = []
         self.responses = []
 
-        async def fake_call(method, path, body=None):
-            self.calls.append((method, path, body))
+    def new_runner(self):
+        runner = st.SessionTrackerRunner("jenkins", "sai_persona", "https://api.test", default_agent="jenkins")
+        runner._lock_fd = 99
+        config = {"enabled": True, "model": "haiku", "prompt": "p", "output_schema": {}}
+        runner._configs = {"jenkins": (time.monotonic(), config), "searchpro": (time.monotonic(), config)}
+
+        async def fake_call(agent, method, path, body=None):
+            self.calls.append((method, path, body, agent))
             return self.responses.pop(0)
 
-        self.runner._call = fake_call
-        self.runner._run_model = mock.AsyncMock(return_value={
+        runner._call = fake_call
+        runner._run_model = mock.AsyncMock(return_value={
             "set": {"status": "waiting_on_you"},
             "add_items": [{"kind": "approval", "text": "Commit the schema"}],
         })
+        return runner
 
     def tearDown(self):
         for p in self.patches:
@@ -176,12 +187,13 @@ class TestRunner(unittest.TestCase):
             (200, {"tracker": {**tracker, "version": 1}}),  # patch
         ]
         self.run_job()
-        method, path, body = self.calls[0]
+        method, path, body, agent = self.calls[0]
         self.assertEqual(path, "/api/v1/session-trackers/register")
         self.assertEqual(body["origin"], "direct")
         self.assertEqual(body["agent_name"], "jenkins")
         self.assertEqual(body["title"], "Design the tracker please")
-        _, ppath, patch = self.calls[2]
+        self.assertEqual(agent, "jenkins")
+        _, ppath, patch, _ = self.calls[2]
         self.assertEqual(ppath, "/api/v1/session-trackers/t1")
         self.assertEqual(patch["base_version"], 0)
         self.assertEqual(patch["set"], {"status": "waiting_on_you"})
@@ -191,17 +203,30 @@ class TestRunner(unittest.TestCase):
         self.assertEqual(state["tracker_id"], "t1")
         self.assertEqual(state["cursor"], self.transcript.stat().st_size)
 
-    def test_bridge_session_is_society_ai_under_its_persona(self):
+    def searchpro_session(self):
         (st.SOCIETY_CACHE / "searchpro").mkdir()
         (st.SOCIETY_CACHE / "searchpro" / "sessions.json").write_text(
             json.dumps({"sessions": [{"session_id": "s1", "persona": "searchpro"}]})
         )
+
+    def test_bridge_session_is_written_as_its_personas_owner(self):
+        self.searchpro_session()
         self.responses = [(201, {"tracker": {"id": "t1", "version": 0}}),
                           (200, {"tracker": {"id": "t1", "version": 0}, "items": []}),
                           (200, {})]
         self.run_job()
         self.assertEqual(self.calls[0][2]["origin"], "society_ai")
         self.assertEqual(self.calls[0][2]["agent_name"], "searchpro")
+        # Every call of this session goes as searchpro's owner's Tracker agent.
+        self.assertEqual({c[3] for c in self.calls}, {"searchpro"})
+        self.assertEqual(self.runner._state["sessions"]["s1"]["agent"], "searchpro")
+
+    def test_each_accounts_own_setting_decides(self):
+        self.searchpro_session()
+        self.runner._configs["searchpro"] = (time.monotonic(), {"enabled": False})
+        self.run_job()
+        self.assertEqual(self.calls, [])
+        self.assertNotIn("tracker_id", self.runner._state["sessions"]["s1"])
 
     def test_prompt_event_sends_facts_without_the_model(self):
         self.runner._state["sessions"]["s1"] = {"tracker_id": "t1", "cursor": 0, "tasks": {}}
@@ -231,13 +256,83 @@ class TestRunner(unittest.TestCase):
         self.run_job()
         self.assertNotIn("s1", self.runner._state["sessions"])
 
-    def test_another_users_session_is_skipped_after_403(self):
+    def test_a_refused_session_is_tried_again_after_a_restart(self):
         self.responses = [(403, {})]
         self.run_job()
-        self.assertTrue(self.runner._state["sessions"]["s1"]["skip"])
         self.calls.clear()
         self.run_job()
         self.assertEqual(self.calls, [])
+        self.runner._save_state()
+        self.runner = self.new_runner()
+        self.runner._load_state()
+        self.responses = [(201, {"tracker": {"id": "t1", "version": 0}}),
+                          (200, {"tracker": {"id": "t1", "version": 0}, "items": []}),
+                          (200, {})]
+        self.run_job()
+        self.assertEqual(self.calls[0][1], "/api/v1/session-trackers/register")
+        self.assertEqual(self.runner._state["sessions"]["s1"]["tracker_id"], "t1")
+
+
+class TestTrackerAgents(unittest.TestCase):
+    """One Tracker agent token per agent, asked for with that agent's own token."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.patch = mock.patch.object(st, "BASE_DIR", pathlib.Path(self.tmp.name))
+        self.patch.start()
+        self.requests = []
+        self.revoked = set()
+
+        def handler(request):
+            auth = request.headers["Authorization"].removeprefix("Bearer ")
+            self.requests.append((request.method, request.url.path, auth))
+            if request.url.path == "/api/v1/session-trackers/agent":
+                owner = {"sai_jenkins": "a", "sai_searchpro": "b"}[auth]
+                return httpx.Response(200, json={"agent_name": f"session-tracker-{owner}",
+                                                 "token": f"trk_{owner}_{len(self.requests)}"})
+            if auth in self.revoked:
+                return httpx.Response(401, json={})
+            return httpx.Response(200, json={"ok": auth})
+
+        self.runner = st.SessionTrackerRunner("jenkins", "sai_jenkins", "https://api.test")
+        self.runner._client = httpx.AsyncClient(base_url="https://api.test",
+                                                transport=httpx.MockTransport(handler))
+        personas = [{"name": "jenkins", "token": "sai_jenkins", "api_url": "https://api.test"},
+                    {"name": "searchpro", "token": "sai_searchpro", "api_url": "https://api.test/"}]
+        self.personas = mock.patch("hook_common.discover_personas", return_value=personas)
+        self.personas.start()
+
+    def tearDown(self):
+        self.personas.stop()
+        self.patch.stop()
+        self.tmp.cleanup()
+
+    def call(self, agent):
+        return asyncio.run(self.runner._call(agent, "GET", "/api/v1/session-trackers/t1"))
+
+    def test_each_agent_gets_its_owners_tracker_agent(self):
+        self.assertEqual(self.call("jenkins")[1], {"ok": "trk_a_1"})
+        self.assertEqual(self.call("searchpro")[1], {"ok": "trk_b_3"})
+        self.call("searchpro")
+        minted = [r[2] for r in self.requests if r[1].endswith("/agent")]
+        self.assertEqual(minted, ["sai_jenkins", "sai_searchpro"])
+        saved = json.loads((st.BASE_DIR / "identities.json").read_text())
+        self.assertEqual(saved["searchpro"]["agent_name"], "session-tracker-b")
+        self.assertEqual(os.stat(st.BASE_DIR / "identities.json").st_mode & 0o777, 0o600)
+
+    def test_a_revoked_token_is_replaced_for_that_agent_only(self):
+        self.call("jenkins")
+        self.call("searchpro")
+        self.revoked.add("trk_b_3")
+        self.assertEqual(self.call("searchpro")[0], 401)
+        self.assertNotIn("searchpro", self.runner._identities)
+        self.assertIn("jenkins", self.runner._identities)
+        self.assertEqual(self.call("searchpro")[0], 200)
+
+    def test_an_agent_not_on_this_machine_is_not_tracked(self):
+        self.assertEqual(self.call("someone-else"), (0, {}))
+        self.assertEqual(asyncio.run(self.runner._config_for("someone-else")), None)
+        self.assertEqual(self.requests, [])
 
 
 class TestHookGuard(unittest.TestCase):
