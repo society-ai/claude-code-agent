@@ -6,6 +6,8 @@
   agent's profile and card skills (factory); nothing hosted-era is left.
 - send_message replaces delegate_task: any reachable agent, "chat" by default.
 - respond_to_inbox(response="dismiss") dismisses.
+- Every agent reads session Trackers (the platform scopes them: the Lead all,
+  others their own); filters are checked before any call.
 """
 
 import asyncio
@@ -150,3 +152,39 @@ class DismissThroughRespond(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SessionTrackers(unittest.TestCase):
+    def _call(self, name, **kw):
+        get = mock.AsyncMock(return_value={"trackers": []})
+        with mock.patch.object(mcp_server.api, "get", new=get):
+            out = asyncio.run(getattr(mcp_server, name)(**kw))
+        return out, get
+
+    def test_every_agent_has_them(self):
+        names = LeadOnlyTools()._names("regular")
+        self.assertIn("list_session_trackers", names)
+        self.assertIn("get_session_tracker", names)
+
+    def test_list_passes_the_filters(self):
+        _, get = self._call(
+            "list_session_trackers", show="needs_you", agent="jenkins", started_in="claude_code",
+            loose_ends=True, query="push", limit=500,
+        )
+        get.assert_awaited_once_with("/api/v1/session-trackers", params={
+            "show": "needs_you", "limit": 100, "agent": "jenkins", "started_in": "claude_code",
+            "loose_ends": "true", "q": "push",
+        })
+
+    def test_bad_filters_never_call(self):
+        for kw in ({"show": "everything"}, {"status": "sleeping"}, {"started_in": "mars"}):
+            out, get = self._call("list_session_trackers", **kw)
+            self.assertTrue(parsed(out)["error"])
+            get.assert_not_awaited()
+
+    def test_get_one(self):
+        _, get = self._call("get_session_tracker", tracker_id=ITEM)
+        get.assert_awaited_once_with(f"/api/v1/session-trackers/{ITEM}")
+        out, get = self._call("get_session_tracker", tracker_id="TRK-1")
+        self.assertTrue(parsed(out)["error"])
+        get.assert_not_awaited()

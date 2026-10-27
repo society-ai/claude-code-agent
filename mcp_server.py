@@ -8,6 +8,10 @@ Tool surface (see README for full descriptions):
     list_tasks, get_task, create_task, update_task, review_task, reassign_task,
     send_inbox_item, list_inbox, respond_to_inbox (response="dismiss" dismisses)
 
+  Sessions (their Trackers; the Lead agent reads every session's, any other
+  agent only its own):
+    list_session_trackers, get_session_tracker
+
   Network (routed through the bridge daemon via IPC):
     search_agents, send_message
 
@@ -406,6 +410,86 @@ async def get_task(task_id: str) -> str:
     except ValueError as e:
         return _result(_error(str(e)))
     return _result(await api.get(f"/api/v1/agent-tasks/{task_id}"))
+
+
+_SESSION_SHOW = ("needs_you", "open", "all")
+_SESSION_STATUSES = frozenset({
+    "needs_you", "active", "idle", "waiting_on_you", "waiting_on_agent", "blocked", "done", "abandoned",
+})
+
+
+@mcp.tool()
+async def list_session_trackers(
+    show: str = "open",
+    status: Optional[str] = None,
+    agent: Optional[str] = None,
+    started_in: Optional[str] = None,
+    loose_ends: bool = False,
+    query: Optional[str] = None,
+    since: Optional[str] = None,
+    limit: int = 20,
+) -> str:
+    """List your user's sessions with their agents, from each session's Tracker:
+    what it is about, where it stands, what it waits on, and how many questions,
+    approvals and follow-ups are open. What needs your user comes first.
+
+    Your owner's Lead agent sees every session of every agent; any other agent
+    sees only its own sessions. Read one in full with get_session_tracker.
+
+    Args:
+        show: "needs_you" (waiting on your user), "open" (default: not done or
+            abandoned) or "all".
+        status: Comma-separated statuses instead of show: needs_you, active,
+            idle, waiting_on_you, waiting_on_agent, blocked, done, abandoned.
+        agent: Comma-separated agent names (the Lead only; others see their own).
+        started_in: "society_ai" or "claude_code" (started there directly).
+        loose_ends: Only sessions with uncommitted or unpushed work, or open
+            follow-ups.
+        query: Text in the session's title or state.
+        since: Only sessions active since this ISO time.
+        limit: 1-100, default 20.
+    """
+    if show not in _SESSION_SHOW:
+        return _result(_error(f"show must be one of: {', '.join(_SESSION_SHOW)}"))
+    statuses = [x.strip() for x in (status or "").split(",") if x.strip()]
+    unknown = [x for x in statuses if x not in _SESSION_STATUSES]
+    if unknown:
+        return _result(_error(f"unknown status: {', '.join(unknown)}"))
+    if started_in and started_in not in ("society_ai", "claude_code"):
+        return _result(_error("started_in must be society_ai or claude_code"))
+    params: dict[str, Any] = {"show": show, "limit": max(1, min(100, int(limit)))}
+    if statuses:
+        params["status"] = ",".join(statuses)
+    if agent:
+        params["agent"] = agent
+    if started_in:
+        params["started_in"] = started_in
+    if loose_ends:
+        params["loose_ends"] = "true"
+    if query:
+        params["q"] = query[:200]
+    if since:
+        params["since"] = since
+    return _result(await api.get("/api/v1/session-trackers", params=params))
+
+
+@mcp.tool()
+async def get_session_tracker(tracker_id: str) -> str:
+    """One session's Tracker in full: what it is about, where it stands and its
+    next step, its open questions, approvals and follow-ups, its whole
+    checklist, and unfinished work (branch, uncommitted files, unpushed
+    commits), with a link to its chat.
+
+    Your owner's Lead agent reads any session's; any other agent only its own.
+
+    Args:
+        tracker_id: The Tracker's id, from list_session_trackers.
+    """
+    try:
+        _validate_uuid(tracker_id, "tracker_id")
+    except ValueError as e:
+        return _result(_error(str(e)))
+    return _result(await api.get(f"/api/v1/session-trackers/{tracker_id}"))
 
 
 @mcp.tool()

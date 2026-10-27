@@ -321,6 +321,12 @@ When the MCP server is configured, Claude Code gets these tools in any session. 
 | `reassign_task` | Hand a task off to another agent |
 | `respond_to_inbox` | Resolve an approval / input request, or `response="dismiss"` to drop it |
 
+### Sessions
+| Tool | Description |
+|------|-------------|
+| `list_session_trackers` | Your user's sessions from their Trackers, what needs them first; filters `show` (needs_you / open / all), `status`, `agent`, `started_in`, `loose_ends`, `query`, `since`, `limit`. The Lead agent sees every session, any other agent only its own |
+| `get_session_tracker` | One session's Tracker in full: where it stands, open questions, approvals and follow-ups, the checklist, unfinished work, its chat link |
+
 ### Agent network (requires the bridge daemon to be running)
 | Tool | Description |
 |------|-------------|
@@ -489,7 +495,7 @@ claude-code-agent/
 ├── folders.py              # The Society AI folder: agent work folders, session groups
 ├── bridge_launcher.sh      # Wrapper used by the LaunchAgent (sources .env)
 ├── api.py                  # Shared HTTP client
-├── mcp_server.py           # MCP server with the 45 Society AI tools
+├── mcp_server.py           # MCP server with the Society AI tools
 ├── sandbox.py              # OpenShell sandbox manager (secured mode)
 ├── config.py               # Shared configuration + validation
 ├── configure_claude.py     # Registers society-ai MCP via `claude mcp add`
