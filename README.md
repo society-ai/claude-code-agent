@@ -383,8 +383,8 @@ This is fixed, not a setting.
 
 ### Session Trackers
 
-With tracking on (the default), the bridge also keeps a short **Tracker** for every Claude Code
-session on this computer, including sessions you start yourself in Claude Code: its status, open
+When you turn on **Track my sessions** in the app's Settings (off by default, with Claude Code
+ticked), the bridge also keeps a short **Tracker** for every Claude Code session on this computer, including sessions you start yourself in Claude Code: its status, open
 questions, approvals, checklist and unfinished work (branch, uncommitted files, unpushed commits).
 Each one shows on the session's chat page in Society AI and in the Sessions list.
 
@@ -396,8 +396,8 @@ Each one shows on the session's chat page in Society AI and in the Sessions list
   (a token of its own per agent, kept in `~/.cache/society-ai/tracker/identities.json`), so agents
   of different accounts on this computer each get Trackers in their own account. The conversation
   of a session you started yourself is never sent.
-- Turn it off here with `TRACKING=false`, or in the app's Settings ("Track my sessions"), which
-  decides for that account's agents.
+- Each account's setting decides for that account's agents. `TRACKING=false` here turns it off on
+  this computer whatever the setting says.
 
 **Replying from Society AI.** A session you started yourself in Claude Code has no Society AI
 channel, so a message you send from its chat page goes another way:
