@@ -6,7 +6,8 @@ Tool surface (see README for full descriptions):
 
   Tasks and inbox:
     list_tasks, get_task, create_task, update_task, review_task, reassign_task,
-    send_inbox_item, list_inbox, respond_to_inbox (response="dismiss" dismisses)
+    add_task_comment, send_inbox_item, list_inbox, respond_to_inbox
+    (response="dismiss" dismisses), add_inbox_note [Lead]
 
   Sessions (their Trackers; the Lead agent reads every session's, any other
   agent only its own):
@@ -182,6 +183,9 @@ TOOL_PERMISSIONS: dict[str, tuple[str, ...]] = {
     "search_agents": ("network.use",), "send_message": ("network.use",),
     "list_tasks": ("tasks.own",), "get_task": ("tasks.own",), "create_task": ("tasks.own",),
     "update_task": ("tasks.own",), "review_task": ("tasks.own",), "reassign_task": ("tasks.own",),
+    "add_task_comment": ("tasks.own",),
+    # The Lead's note on an inbox item: Lead-only like the brief.
+    "add_inbox_note": ("home.brief",),
     "list_session_trackers": ("sessions.own",), "get_session_tracker": ("sessions.own",),
     "send_inbox_item": ("inbox.use",), "list_inbox": ("inbox.use",), "respond_to_inbox": ("inbox.use",),
     "post_feed": ("home.post",), "get_feed": ("home.view",), "publish_brief": ("home.brief",),
@@ -530,6 +534,32 @@ async def get_session_tracker(tracker_id: str) -> str:
     except ValueError as e:
         return _result(_error(str(e)))
     return _result(await api.get(f"/api/v1/session-trackers/{tracker_id}"))
+
+
+@mcp.tool()
+async def add_task_comment(task_id: str, text: str, reply_to: Optional[str] = None) -> str:
+    """Comment on a task, or reply to one of its comments. Every comment reaches
+    the task's assigned agent, and a reply also reaches whoever wrote the
+    comment it answers. Comment only when you have something to add: an
+    answer, a decision, new information; never just to acknowledge or thank.
+
+    Args:
+        task_id: The task.
+        text: Your comment.
+        reply_to: The id of the comment you are answering (from get_task's comments).
+    """
+    try:
+        _validate_uuid(task_id, "task_id")
+        if reply_to:
+            _validate_uuid(reply_to, "reply_to")
+    except ValueError as e:
+        return _result(_error(str(e)))
+    if not text or not text.strip():
+        return _result(_error("text is required"))
+    body: dict[str, Any] = {"text": text.strip()}
+    if reply_to:
+        body["reply_to"] = reply_to
+    return _result(await api.post(f"/api/v1/agent-tasks/{task_id}/comments", body))
 
 
 @mcp.tool()
@@ -1005,6 +1035,25 @@ async def reassign_task(
     if reason is not None:
         body["reason"] = reason
     return _result(await api.post(f"/api/v1/agent-tasks/{task_id}/reassign", body))
+
+
+@mcp.tool()
+async def add_inbox_note(item_id: str, text: str) -> str:
+    """As your owner's Lead agent, add your read on an inbox item another agent
+    sent your owner: what it asks, what you would decide and why. One note per
+    item; a new note replaces yours. Your owner answers the item, not the note.
+
+    Args:
+        item_id: The inbox item (from list_inbox).
+        text: Your note.
+    """
+    try:
+        _validate_uuid(item_id, "item_id")
+    except ValueError as e:
+        return _result(_error(str(e)))
+    if not text or not text.strip():
+        return _result(_error("text is required"))
+    return _result(await api.put(f"/api/v1/inbox/{item_id}/note", {"text": text.strip()}))
 
 
 @mcp.tool()

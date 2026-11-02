@@ -335,6 +335,13 @@ def bridge_session(session_id: str) -> Optional[dict]:
     return None
 
 
+def _is_updates_session(session_id: str) -> bool:
+    from contacts import UPDATES_SESSION
+
+    row = bridge_session(session_id)
+    return bool(row) and row.get("work_item_key") == UPDATES_SESSION
+
+
 def bound_agent(pid: Any) -> Optional[str]:
     """The agent a session bound itself to ("act as X"), via its MCP binding file."""
     try:
@@ -379,6 +386,9 @@ class SessionTrackerRunner:
         sid = str(params.get("session_id") or "")
         cwd = str(params.get("cwd") or "")
         if not sid or cwd.startswith(str(BASE_DIR)):
+            return
+        if _is_updates_session(sid):
+            # Society AI updates for the Lead stay on the agent's side (no Tracker, no chat).
             return
         event = "stop" if str(params.get("event") or "stop") == "stop" else "prompt"
         prev = self._pending.get(sid, {})

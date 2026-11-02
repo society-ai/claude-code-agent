@@ -80,9 +80,17 @@ class Sender:
     # Names the sidebar group of this sender's conversations,
     # "Society-AI-<group>".
     group: str = ""
+    # A named long-lived session this sender always lands in ("updates": Society
+    # AI's updates for the owner's Lead agent). Never mirrored into a Society AI
+    # chat and never tracked; its replies go nowhere.
+    session: str = ""
 
 
 OWNER = Sender(is_owner=True)
+UPDATES_SESSION = "updates"
+# Society AI's updates for the owner's Lead agent (A2A docs/design/lead-agent-updates.md
+# §7.2): the owner's tools, because the Lead acts for its owner, in their own session.
+UPDATES = Sender(is_owner=True, label="Society AI updates", session=UPDATES_SESSION)
 
 
 def _safe_key_part(value: str) -> str:
@@ -107,6 +115,12 @@ def classify_sender(frame: Optional[dict], metadata: dict, owner_id: Optional[st
 
     if kind == "owner" and owner_match:
         return OWNER
+    # Society AI's updates for the owner's Lead: the router frames them from the
+    # platform into the "updates" session, for this owner only. Without the
+    # owner's user id they are a contact like any other unknown sender.
+    session = str(frame.get("session") or "") if isinstance(frame, dict) else ""
+    if kind == "platform" and owner_match and session == UPDATES_SESSION:
+        return UPDATES
 
     name = str(frm.get("name") or "").strip()
     if kind == "agent" and name:

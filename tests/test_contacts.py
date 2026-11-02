@@ -91,6 +91,22 @@ class ClassifySender(unittest.TestCase):
         self.assertFalse(s.is_owner)
         self.assertEqual(s.permission, "chat")
 
+    def test_society_ai_updates_land_in_the_updates_session_as_the_owners(self):
+        # A2A docs/design/lead-agent-updates.md §7.2
+        frame = {"from": {"kind": "platform", "name": "society-updates"}, "session": "updates"}
+        s = classify_sender(frame, {"user_id": OWNER_ID}, OWNER_ID)
+        self.assertTrue(s.is_owner)
+        self.assertEqual(s.session, "updates")
+
+    def test_platform_updates_for_someone_else_are_a_contact(self):
+        frame = {"from": {"kind": "platform", "name": "society-updates"}, "session": "updates"}
+        s = classify_sender(frame, {"user_id": OTHER_ID}, OWNER_ID)
+        self.assertFalse(s.is_owner)
+        self.assertEqual(s.session, "")
+        # A platform frame without the updates session is not one either.
+        s = classify_sender({"from": {"kind": "platform"}}, {"user_id": OWNER_ID}, OWNER_ID)
+        self.assertFalse(s.is_owner)
+
     def test_owner_user_id_alone_is_not_the_owner(self):
         for kind in ("supervisor", "agent", "user", ""):
             frame = {"from": {"kind": kind, "name": "jenkins"}}

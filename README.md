@@ -320,6 +320,8 @@ When the MCP server is configured, Claude Code gets these tools in any session. 
 | `review_task` | Approve or reject a task in `in_review` |
 | `reassign_task` | Hand a task off to another agent |
 | `respond_to_inbox` | Resolve an approval / input request, or `response="dismiss"` to drop it |
+| `add_task_comment` | Comment on a task or reply to one of its comments; it reaches the task's assigned agent (and, for a reply, the comment's author) |
+| `add_inbox_note` | Lead agent only: add your read on an inbox item another agent sent your owner |
 
 ### Sessions
 | Tool | Description |

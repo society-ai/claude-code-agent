@@ -1265,7 +1265,10 @@ class Bridge:
                         # v0.7: dispatch into a persistent per-work-item session.
                         # Stable key gives task rework continuity (resume same
                         # session); chat falls back to sessionId/chat/task_id.
-                        if sender.is_owner:
+                        if sender.session:
+                            # One long-lived session (Society AI updates for the Lead).
+                            work_item_key = sender.session
+                        elif sender.is_owner:
                             work_item_key = (
                                 agent_task_id
                                 or params.get("sessionId")
@@ -2698,6 +2701,9 @@ class Bridge:
         # never re-wake the orchestrator.
         is_contact = sender is not None and not sender.is_owner
         record = not is_contact or mgr.policy(self.ctx.name).mirror_contacts
+        if sender is not None and sender.session:
+            # Society AI updates stay on the agent's side: never a Society AI chat.
+            record = False
         if self._shipper is not None and record:
             if kind == "chat":
                 wi_kind = "chat"
@@ -2838,6 +2844,10 @@ class Bridge:
                         exit_code=1,
                     )
                     return
+            if sender is not None and sender.session:
+                # What the Lead writes in its updates session is for its own context;
+                # it acts through tools. Nothing of it goes back to Society AI.
+                text = "Handled in the updates session."
             await self._send_task_complete(task_id, text or "(no reply)", exit_code=0)
         finally:
             self._pending_session_tasks.pop(task_id, None)
