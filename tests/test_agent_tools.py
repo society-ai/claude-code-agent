@@ -1,7 +1,8 @@
 """The Lead agent's tools and the message tool.
 
-- Lead-only tools are listed only for the owner's Lead agent (the platform's
-  /api/v1/agents/me says agent_role), and refused locally for anyone else.
+- An agent sees only the tools its permissions allow (the platform's
+  /api/v1/agents/me says them: its preset with its owner's changes); other
+  tools are refused locally.
 - update_agent edits instructions and skills (router) and a connected
   agent's profile and card skills (factory); nothing hosted-era is left.
 - send_message replaces delegate_task: any reachable agent, "chat" by default.
@@ -33,43 +34,71 @@ def ident(name="jenkins", bound=True):
     return SimpleNamespace(api_url="https://api.test", token="t", company_id="", bound=bound, name=name, display_name="")
 
 
-class LeadOnlyTools(unittest.TestCase):
-    def setUp(self):
-        mcp_server._roles.clear()
+# The platform's presets (agent_router/iam/catalog.py), as /api/v1/agents/me reports them.
+REGULAR = [
+    "network.use", "inbox.use", "tasks.own", "tasks.contacts", "chats.own", "files.use", "home.profile",
+    "home.post", "sessions.own", "schedules.self", "workflows.view", "workflows.use", "knowledge.view",
+    "knowledge.submit", "companies.view", "companies.manage", "skills.view",
+]
+LEAD = REGULAR + [
+    "tasks.owner_agents", "tasks.board", "files.owner", "home.view", "home.brief", "sessions.all",
+    "schedules.owner_agents", "workflows.personal", "workspaces.view", "workspaces.manage", "knowledge.owner",
+    "companies.create", "agents.view", "agents.setup",
+]
+LEAD_TOOLS = {"list_owner_agents", "update_agent", "get_feed", "publish_brief", "create_company"}
 
-    def _names(self, role):
-        me = {"agent_name": "jenkins", "agent_role": role, "permissions": []}
+
+class ToolsFollowPermissions(unittest.TestCase):
+    def setUp(self):
+        mcp_server._permissions.clear()
+
+    def _names(self, permissions):
+        mcp_server._permissions.clear()
+        me = {"agent_name": "jenkins", "agent_role": "regular", "permissions": permissions}
         with mock.patch.object(mcp_server, "_ident", return_value=ident()), \
              mock.patch.object(mcp_server.api, "get", new=mock.AsyncMock(return_value=me)):
             return {t.name for t in asyncio.run(mcp_server.mcp.list_tools())}
 
     def test_lead_sees_lead_tools(self):
-        names = self._names("lead")
-        self.assertTrue(mcp_server.LEAD_ONLY_TOOLS <= names)
+        self.assertTrue(LEAD_TOOLS <= self._names(LEAD))
 
     def test_regular_agent_does_not(self):
-        names = self._names("regular")
-        self.assertFalse(mcp_server.LEAD_ONLY_TOOLS & names)
+        names = self._names(REGULAR)
+        self.assertFalse(LEAD_TOOLS & names)
         self.assertIn("list_tasks", names)
         self.assertIn("send_message", names)
+        # Curating knowledge is a permission its owner (or the Librarian template) adds.
+        self.assertNotIn("write_kb_item", names)
 
-    def test_unknown_role_hides_them_and_is_not_cached(self):
+    def test_the_owners_choices_add_and_remove(self):
+        names = self._names(REGULAR + ["agents.setup"])
+        self.assertIn("update_agent", names)
+        names = self._names([p for p in REGULAR if p != "tasks.own"])
+        self.assertNotIn("create_task", names)
+
+    def test_unknown_permissions_show_everything_and_are_not_cached(self):
         with mock.patch.object(mcp_server, "_ident", return_value=ident()), \
              mock.patch.object(mcp_server.api, "get", new=mock.AsyncMock(return_value={"error": True})):
             names = {t.name for t in asyncio.run(mcp_server.mcp.list_tools())}
-        self.assertFalse(mcp_server.LEAD_ONLY_TOOLS & names)
-        self.assertNotIn("jenkins", mcp_server._roles)
+        self.assertTrue(LEAD_TOOLS <= names)  # the platform decides
+        self.assertNotIn("jenkins", mcp_server._permissions)
 
-    def test_regular_agent_calling_a_lead_tool_is_refused(self):
-        mcp_server._roles["searchpro"] = "regular"
+    def test_calling_a_tool_it_may_not_use_is_refused(self):
+        mcp_server._permissions["searchpro"] = frozenset(REGULAR)
         from mcp.server.fastmcp.exceptions import ToolError
 
         with mock.patch.object(mcp_server, "_ident", return_value=ident("searchpro")):
             with self.assertRaises(ToolError):
                 asyncio.run(mcp_server.mcp.call_tool("get_feed", {}))
 
+    def test_every_tool_names_its_permission(self):
+        names = {t.name for t in asyncio.run(mcp_server.FastMCP.list_tools(mcp_server.mcp))}
+        unlisted = names - set(mcp_server.TOOL_PERMISSIONS) - {"switch_agent"}
+        self.assertEqual(unlisted, set(), "add these to TOOL_PERMISSIONS")
+        self.assertEqual(set(mcp_server.TOOL_PERMISSIONS) - names, set(), "stale TOOL_PERMISSIONS entries")
+
     def test_removed_tools_are_gone(self):
-        names = self._names("lead")
+        names = self._names(LEAD)
         for gone in ("deploy_agent", "delegate_task", "get_my_tasks", "dismiss_inbox",
                      "list_departments", "create_department"):
             self.assertNotIn(gone, names)
@@ -162,7 +191,7 @@ class SessionTrackers(unittest.TestCase):
         return out, get
 
     def test_every_agent_has_them(self):
-        names = LeadOnlyTools()._names("regular")
+        names = ToolsFollowPermissions()._names(REGULAR)
         self.assertIn("list_session_trackers", names)
         self.assertIn("get_session_tracker", names)
 

@@ -37,13 +37,13 @@ Tool surface (see README for full descriptions):
     start_workflow, register_nav_item, list_nav_items, create_dashboard,
     list_dashboards, create_panel, update_panel
 
-  Lead agent only (LEAD_ONLY_TOOLS: shown only to the owner's Lead agent; the
-  platform refuses them for any other agent):
+  Lead agent's by default (its owner can allow them to any agent):
     list_owner_agents, update_agent, get_feed, publish_brief, create_company
 
-The platform decides what each call may do (agent_router/auth/agent_permissions.py:
-regular and Lead agent permission sets). Connecting, deleting and issuing tokens
-for agents stay with their owner.
+An agent sees only the tools its permissions allow (TOOL_PERMISSIONS, from
+/api/v1/agents/me: its preset, Regular or Lead, with its owner's changes); the
+platform decides what each call may do (agent_router/iam). Connecting, deleting
+and issuing tokens for agents stay with their owner.
 
 All tools return JSON strings. Errors (network, 4xx/5xx, validation) are
 encoded as {"error": true, ...} objects so the LLM can read and recover.
@@ -173,50 +173,90 @@ def _enum_check(value: Optional[str], allowed: set[str], name: str) -> Optional[
 
 # -- MCP server --------------------------------------------------------------
 
-# Tools only the owner's Lead agent may use. The platform enforces this on
-# every call (regular agents get 403); hiding them keeps a regular agent's
-# tool list to what it can actually do.
-LEAD_ONLY_TOOLS = frozenset({
-    "list_owner_agents", "update_agent", "get_feed", "publish_brief", "create_company",
-})
+# The platform permission each tool needs (the permission of the router route it
+# calls, agent_router/iam on the platform; several: any of them). The platform
+# decides on every call; hiding the rest keeps an agent's tool list to what its
+# owner allows it (its preset, Regular or Lead, with the owner's changes). A
+# tool not listed here needs nothing.
+TOOL_PERMISSIONS: dict[str, tuple[str, ...]] = {
+    "search_agents": ("network.use",), "send_message": ("network.use",),
+    "list_tasks": ("tasks.own",), "get_task": ("tasks.own",), "create_task": ("tasks.own",),
+    "update_task": ("tasks.own",), "review_task": ("tasks.own",), "reassign_task": ("tasks.own",),
+    "list_session_trackers": ("sessions.own",), "get_session_tracker": ("sessions.own",),
+    "send_inbox_item": ("inbox.use",), "list_inbox": ("inbox.use",), "respond_to_inbox": ("inbox.use",),
+    "post_feed": ("home.post",), "get_feed": ("home.view",), "publish_brief": ("home.brief",),
+    "get_user_context": ("home.profile",),
+    "post_chat_message": ("chats.own",), "get_chat_messages": ("chats.own",),
+    "save_artifact": ("files.use",), "get_file": ("files.use",), "list_files": ("files.use",),
+    "pin_artifact": ("files.use",), "list_pinned_artifacts": ("files.use",), "unpin_artifact": ("files.use",),
+    "list_kb_items": ("knowledge.view",), "search_knowledge": ("knowledge.view",),
+    "read_kb_item": ("knowledge.view",), "get_entity": ("knowledge.view",), "kb_neighbors": ("knowledge.view",),
+    "submit_knowledge": ("knowledge.submit",),
+    "write_kb_item": ("knowledge.curate",), "update_kb_item": ("knowledge.curate",),
+    "supersede_kb_item": ("knowledge.curate",), "list_kb_submissions": ("knowledge.curate",),
+    "resolve_kb_submission": ("knowledge.curate",), "upsert_entity": ("knowledge.curate",),
+    "add_edge": ("knowledge.curate",),
+    "list_owner_agents": ("agents.view",), "update_agent": ("agents.setup",),
+    "get_company": ("companies.view",), "list_companies": ("companies.view",),
+    "list_company_agents": ("companies.view",), "list_memberships": ("companies.view",),
+    "list_nav_items": ("companies.view",), "list_dashboards": ("companies.view",),
+    "create_company": ("companies.create",),
+    "update_company": ("companies.manage",), "create_membership": ("companies.manage",),
+    "update_membership": ("companies.manage",), "remove_membership": ("companies.manage",),
+    "register_nav_item": ("companies.manage",), "create_dashboard": ("companies.manage",),
+    "create_panel": ("companies.manage",), "update_panel": ("companies.manage",),
+    "update_space": ("companies.manage",), "update_project": ("companies.manage",),
+    # A company's (companies.*) or the owner's own (workspaces.*), by the arguments.
+    "list_spaces": ("companies.view", "workspaces.view"), "get_space": ("companies.view", "workspaces.view"),
+    "list_projects": ("companies.view", "workspaces.view"), "get_project": ("companies.view", "workspaces.view"),
+    "create_space": ("companies.manage", "workspaces.manage"),
+    "create_project": ("companies.manage", "workspaces.manage"),
+    "create_schedule": ("schedules.self",), "list_schedules": ("schedules.self",),
+    "create_workflow": ("workflows.use",), "start_workflow": ("workflows.use",),
+    "list_workflows": ("workflows.view",),
+}
 
-# The bound agent's role on the platform ("lead" or "regular"), per agent name.
-# Read from /api/v1/agents/me; cleared when switch_agent changes the binding.
-_roles: dict[str, str] = {}
+# The bound agent's permissions on the platform, per agent name (None: not
+# known, so every tool is shown and the platform decides). Read from
+# /api/v1/agents/me; cleared when switch_agent changes the binding.
+_permissions: dict[str, frozenset] = {}
 
 
-async def _agent_role() -> str:
-    """The bound agent's role. "regular" when unbound or unknown (fails closed:
-    a Lead tool stays hidden, and the platform decides anyway)."""
+async def _agent_permissions() -> Optional[frozenset]:
+    """The bound agent's permissions, or None when unbound or not known yet."""
     ident = _ident()
     if not ident.bound or not ident.name:
-        return "regular"
-    if ident.name in _roles:
-        return _roles[ident.name]
+        return None
+    if ident.name in _permissions:
+        return _permissions[ident.name]
     me = await api.get("/api/v1/agents/me")
-    if not isinstance(me, dict) or me.get("error"):
-        return "regular"  # not cached: a passing network error must not stick
-    role = "lead" if me.get("agent_role") == "lead" else "regular"
-    _roles[ident.name] = role
-    return role
+    if not isinstance(me, dict) or me.get("error") or not isinstance(me.get("permissions"), list):
+        return None  # not cached: a passing network error must not stick
+    _permissions[ident.name] = frozenset(me["permissions"])
+    return _permissions[ident.name]
+
+
+def _allowed(tool: str, permissions: Optional[frozenset]) -> bool:
+    needed = TOOL_PERMISSIONS.get(tool)
+    return permissions is None or not needed or any(p in permissions for p in needed)
 
 
 class SocietyMCP(FastMCP):
-    """FastMCP that shows the Lead-only tools only to the owner's Lead agent."""
+    """FastMCP that shows an agent only the tools its permissions allow (TOOL_PERMISSIONS)."""
 
     async def list_tools(self):
         tools = await super().list_tools()
-        if await _agent_role() == "lead":
-            return tools
-        return [t for t in tools if t.name not in LEAD_ONLY_TOOLS]
+        permissions = await _agent_permissions()
+        return [t for t in tools if _allowed(t.name, permissions)]
 
     async def call_tool(self, name, arguments):
-        if name in LEAD_ONLY_TOOLS and await _agent_role() != "lead":
+        if not _allowed(name, await _agent_permissions()):
             from mcp.server.fastmcp.exceptions import ToolError
 
             raise ToolError(
-                f"{name} is only for your owner's Lead agent. Your owner can make an "
-                "agent their Lead in Society AI."
+                f"Your owner has not allowed you {name} yet. They decide what you may do in "
+                "Society AI, on your page (What it can do), or by making you their Lead agent; "
+                "it applies within a minute of switching agents, with nothing to reconnect."
             )
         # Router calls made for this tool name it (System of Record).
         token = chat_context.current_tool.set(name)
@@ -295,11 +335,11 @@ async def switch_agent(agent_name: str = "", ctx: Optional[Context] = None) -> s
     elif isinstance(check, dict) and check.get("status") == 404:
         check = await api.get("/api/v1/agent-tasks", params={"limit": 1})
     verified = not (isinstance(check, dict) and check.get("error"))
-    # A different agent may have a different role: refresh it and tell the
-    # client its tool list may have changed (Lead-only tools).
-    _roles.pop(new.name, None)
-    if isinstance(check, dict) and not check.get("error") and "agent_role" in check:
-        _roles[new.name] = "lead" if check.get("agent_role") == "lead" else "regular"
+    # A different agent may have different permissions: refresh them and tell
+    # the client its tool list may have changed.
+    _permissions.pop(new.name, None)
+    if isinstance(check, dict) and not check.get("error") and isinstance(check.get("permissions"), list):
+        _permissions[new.name] = frozenset(check["permissions"])
     if ctx is not None:
         try:
             await ctx.session.send_tool_list_changed()
